@@ -239,4 +239,104 @@ public class TransitDesignerTests
         Assert.That(paletteNames.Any(n => n.Contains("Orange")), Is.True);
         Assert.That(paletteNames.Any(n => n.Contains("Cyan")), Is.True);
     }
+
+    [Test]
+    public void RemoveRoute_DeallocatesVehicles_AndCleansOrphanedStopsWhilePreservingSharedStops()
+    {
+        int s1 = _grid.GetZoneId(2, 4);
+        int s2 = _grid.GetZoneId(4, 4);
+        int s3 = _grid.GetZoneId(6, 4);
+
+        var pathA = _roadGraph.GetShortestNodePath(s1, s3);
+        var routeA = _transitManager.CreateRoute("Route A", pathA, new HashSet<int> { s1, s2 }, Colors.Red, false, fleetSize: 3);
+
+        var pathB = _roadGraph.GetShortestNodePath(s2, s3);
+        var routeB = _transitManager.CreateRoute("Route B", pathB, new HashSet<int> { s2, s3 }, Colors.Blue, false, fleetSize: 2);
+
+        Assert.That(_transitManager.Routes.Count, Is.EqualTo(2));
+        Assert.That(_transitManager.Vehicles.Count, Is.EqualTo(5));
+        Assert.That(_transitManager.Stops.ContainsKey(s1), Is.True);
+        Assert.That(_transitManager.Stops.ContainsKey(s2), Is.True);
+        Assert.That(_transitManager.Stops.ContainsKey(s3), Is.True);
+
+        // Remove route A
+        bool removed = _transitManager.RemoveRoute(routeA.Id);
+        Assert.That(removed, Is.True);
+        Assert.That(_transitManager.Routes.Count, Is.EqualTo(1));
+
+        // Vehicles of route A must be gone, only route B vehicles remain
+        Assert.That(_transitManager.Vehicles.Count, Is.EqualTo(2));
+        Assert.That(_transitManager.Vehicles.All(v => v.RouteId == routeB.Id), Is.True);
+
+        // Stop s1 was only in route A -> orphaned, must be removed
+        Assert.That(_transitManager.Stops.ContainsKey(s1), Is.False);
+        // Stop s2 is shared with route B -> must be kept
+        Assert.That(_transitManager.Stops.ContainsKey(s2), Is.True);
+        // Stop s3 belongs to route B -> must be kept
+        Assert.That(_transitManager.Stops.ContainsKey(s3), Is.True);
+    }
+
+    [Test]
+    public void Route_FleetSizeAndTicketPrice_CanBeAdjusted()
+    {
+        int s1 = _grid.GetZoneId(2, 4);
+        int s2 = _grid.GetZoneId(6, 4);
+        var path = _roadGraph.GetShortestNodePath(s1, s2);
+        var route = _transitManager.CreateRoute("Adjustable Route", path, new HashSet<int> { s1, s2 }, Colors.Green, false, fleetSize: 2, ticketPrice: 10f);
+
+        Assert.That(route.FleetSize, Is.EqualTo(2));
+        Assert.That(_transitManager.Vehicles.Count(v => v.RouteId == route.Id), Is.EqualTo(2));
+
+        // Resize fleet to 5
+        bool fleetChanged = _transitManager.SetRouteFleetSize(route.Id, 5);
+        Assert.That(fleetChanged, Is.True);
+        Assert.That(route.FleetSize, Is.EqualTo(5));
+        Assert.That(_transitManager.Vehicles.Count(v => v.RouteId == route.Id), Is.EqualTo(5));
+
+        // Change ticket price
+        bool priceChanged = _transitManager.SetRouteTicketPrice(route.Id, 20f);
+        Assert.That(priceChanged, Is.True);
+        Assert.That(route.TicketPrice, Is.EqualTo(20f));
+    }
+
+    [Test]
+    public void DynamicTransitCoverage_ExpandsCoverageAndShiftsODModeSplit()
+    {
+        int zOrigin = _grid.GetZoneId(2, 4);
+        int zDest = _grid.GetZoneId(6, 4);
+
+        // Populate zones
+        _grid.GetZone(zOrigin).Population = 10000;
+        _grid.GetZone(zDest).Jobs = 8000;
+        _grid.GetZone(zDest).Type = ZoneType.Commercial;
+
+        var distMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+        var odMatrix = new ODMatrix(_grid.ZoneCount);
+
+        // Before transit route: 0 coverage, 100% car trips
+        var initialCovered = _transitManager.GetCoveredZoneIds(_grid);
+        Assert.That(initialCovered.Count, Is.EqualTo(0));
+
+        odMatrix.Recalculate(8f, _grid, distMatrix, hasTransit: false, coveredZoneIds: initialCovered);
+        Assert.That(odMatrix.Trips[zOrigin, zDest], Is.GreaterThan(0f));
+        Assert.That(odMatrix.TransitTrips[zOrigin, zDest], Is.EqualTo(0f));
+        Assert.That(odMatrix.CarTrips[zOrigin, zDest], Is.EqualTo(odMatrix.Trips[zOrigin, zDest]));
+
+        // Create route covering both origin and destination
+        var path = _roadGraph.GetShortestNodePath(zOrigin, zDest);
+        _transitManager.CreateRoute("Commute Express", path, new HashSet<int> { zOrigin, zDest }, Colors.Yellow, false, fleetSize: 4);
+
+        var coveredAfter = _transitManager.GetCoveredZoneIds(_grid, maxDistance: 3);
+        Assert.That(coveredAfter.Contains(zOrigin), Is.True);
+        Assert.That(coveredAfter.Contains(zDest), Is.True);
+
+        float coverageRatio = _transitManager.GetTransitCoverage(_grid);
+        Assert.That(coverageRatio, Is.GreaterThan(0f));
+
+        // Recalculate with covered zones: mode split shifts 40% to transit, 60% to car
+        odMatrix.Recalculate(8f, _grid, distMatrix, hasTransit: true, coveredZoneIds: coveredAfter);
+        float totalTrips = odMatrix.Trips[zOrigin, zDest];
+        Assert.That(odMatrix.TransitTrips[zOrigin, zDest], Is.EqualTo(totalTrips * 0.40f).Within(0.01f));
+        Assert.That(odMatrix.CarTrips[zOrigin, zDest], Is.EqualTo(totalTrips * 0.60f).Within(0.01f));
+    }
 }
