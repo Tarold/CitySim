@@ -191,18 +191,32 @@ public partial class CommuteOverlayRenderer : Node2D
 
     private void DrawDistrictLabels()
     {
+        if (_grid == null) return;
         float cellSize = _grid.CellSize;
+
+        int resPop = 0;
+        int comJobs = 0;
+        int indJobs = 0;
+
+        for (int i = 0; i < _grid.ZoneCount; i++)
+        {
+            var z = _grid.GetZone(i);
+            if (z == null) continue;
+            if (z.Type == ZoneType.Residential) resPop += z.Population;
+            else if (z.Type == ZoneType.Commercial) comJobs += z.Jobs;
+            else if (z.Type == ZoneType.Industrial) indJobs += z.Jobs;
+        }
         
         // West Sector Header
         Vector2 westPos = new Vector2(4.5f * cellSize, 1.2f * cellSize);
-        DrawString(ThemeDB.FallbackFont, westPos, "🏡 ЖИТЛОВИЙ СЕКТОР (1,008,000)", HorizontalAlignment.Center, -1, 14, new Color(0.4f, 0.9f, 0.5f, 0.9f));
+        DrawString(ThemeDB.FallbackFont, westPos, $"🏡 ЖИТЛОВИЙ СЕКТОР ({resPop:N0})", HorizontalAlignment.Center, -1, 14, new Color(0.4f, 0.9f, 0.5f, 0.9f));
 
         // Central Sector Header
         Vector2 centerPos = new Vector2(9.5f * cellSize, 3.2f * cellSize);
-        DrawString(ThemeDB.FallbackFont, centerPos, "🏢 ДІЛОВИЙ ЦЕНТР (216,000 ОФІСІВ)", HorizontalAlignment.Center, -1, 14, new Color(0.4f, 0.7f, 1f, 0.9f));
+        DrawString(ThemeDB.FallbackFont, centerPos, $"🏢 ДІЛОВИЙ ЦЕНТР ({comJobs:N0} ОФІСІВ)", HorizontalAlignment.Center, -1, 14, new Color(0.4f, 0.7f, 1f, 0.9f));
 
         // East Sector Header
         Vector2 eastPos = new Vector2(14.5f * cellSize, 1.8f * cellSize);
-        DrawString(ThemeDB.FallbackFont, eastPos, "🏭 ПРОМЗОНА (294,000 ЗАВОДІВ)", HorizontalAlignment.Center, -1, 14, new Color(1f, 0.75f, 0.2f, 0.9f));
+        DrawString(ThemeDB.FallbackFont, eastPos, $"🏭 ПРОМЗОНА ({indJobs:N0} ЗАВОДІВ)", HorizontalAlignment.Center, -1, 14, new Color(1f, 0.75f, 0.2f, 0.9f));
     }
 }

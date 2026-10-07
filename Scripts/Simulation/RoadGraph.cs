@@ -137,13 +137,21 @@ public class RoadGraph
         AdjacencyEdges[z2.Id].Add(e2.Id);
     }
 
+    private int GetMaxNodeIndex()
+    {
+        int maxId = 0;
+        foreach (var k in AdjacencyEdges.Keys) if (k >= maxId) maxId = k + 1;
+        foreach (var k in NodeMap.Keys) if (k >= maxId) maxId = k + 1;
+        return maxId;
+    }
+
     public float[] Dijkstra(int sourceNodeId)
     {
-        int maxId = AdjacencyEdges.Keys.Count > 0 ? AdjacencyEdges.Keys.Max() + 1 : 0;
+        int maxId = GetMaxNodeIndex();
         float[] dist = new float[maxId];
         Array.Fill(dist, float.MaxValue);
         
-        if (!AdjacencyEdges.ContainsKey(sourceNodeId)) return dist;
+        if (!AdjacencyEdges.ContainsKey(sourceNodeId) || sourceNodeId >= maxId) return dist;
 
         dist[sourceNodeId] = 0f;
         var pq = new PriorityQueue<int, float>();
@@ -199,7 +207,9 @@ public class RoadGraph
     {
         if (!AdjacencyEdges.ContainsKey(fromNodeId) || !AdjacencyEdges.ContainsKey(toNodeId)) return null;
 
-        int maxId = AdjacencyEdges.Keys.Max() + 1;
+        int maxId = GetMaxNodeIndex();
+        if (fromNodeId >= maxId || toNodeId >= maxId) return null;
+
         float[] dist = new float[maxId];
         int[] edgeTo = new int[maxId];
         Array.Fill(dist, float.MaxValue);
@@ -408,6 +418,96 @@ public class RoadGraph
             PathCache.Remove(key);
 
         return true;
+    }
+
+    /// <summary>
+    /// Ensures that a <see cref="RoadNode"/> exists for the given zone ID and world position.
+    /// Used when newly zoning an empty cell so road segments can be connected to it.
+    /// </summary>
+    public RoadNode EnsureNode(int zoneId, Vector2 worldPosition)
+    {
+        if (NodeMap.TryGetValue(zoneId, out var existing))
+        {
+            existing.WorldPosition = worldPosition;
+            if (!AdjacencyEdges.ContainsKey(zoneId))
+                AdjacencyEdges[zoneId] = new List<int>();
+            return existing;
+        }
+
+        var node = new RoadNode
+        {
+            Id = zoneId,
+            ZoneId = zoneId,
+            WorldPosition = worldPosition
+        };
+
+        Nodes.Add(node);
+        NodeMap[zoneId] = node;
+        if (!AdjacencyEdges.ContainsKey(zoneId))
+            AdjacencyEdges[zoneId] = new List<int>();
+
+        return node;
+    }
+
+    /// <summary>
+    /// Safely detaches and removes all road connections to and from the given zone node,
+    /// cleans up path caches, and removes the node from the active graph.
+    /// </summary>
+    /// <returns><c>true</c> if graph state was modified; <c>false</c> otherwise.</returns>
+    public bool DetachAndRemoveNode(int zoneId)
+    {
+        bool changed = false;
+
+        // 1. Remove all outgoing edges from this node
+        if (AdjacencyEdges.TryGetValue(zoneId, out var outgoingEdges))
+        {
+            var neighbors = new List<int>();
+            foreach (int eid in outgoingEdges)
+            {
+                if (eid >= 0 && eid < Edges.Count && Edges[eid].ToId != -1)
+                {
+                    neighbors.Add(Edges[eid].ToId);
+                }
+            }
+
+            foreach (int toId in neighbors)
+            {
+                if (RemoveRoadSegment(zoneId, toId))
+                    changed = true;
+            }
+        }
+
+        // 2. Also check for any remaining incoming edges from other nodes to this node
+        for (int i = 0; i < Edges.Count; i++)
+        {
+            var edge = Edges[i];
+            if (edge.ToId == zoneId && edge.FromId != -1)
+            {
+                if (RemoveRoadSegment(edge.FromId, zoneId))
+                    changed = true;
+            }
+        }
+
+        // 3. Remove node from graph structures
+        if (NodeMap.TryGetValue(zoneId, out var node))
+        {
+            Nodes.Remove(node);
+            NodeMap.Remove(zoneId);
+            AdjacencyEdges.Remove(zoneId);
+            changed = true;
+        }
+
+        // 4. Invalidate any remaining path cache keys referencing this zone
+        var keysToRemove = new List<(int, int)>();
+        foreach (var key in PathCache.Keys)
+        {
+            if (key.Item1 == zoneId || key.Item2 == zoneId)
+                keysToRemove.Add(key);
+        }
+        foreach (var key in keysToRemove)
+            PathCache.Remove(key);
+
+        return changed;
     }
 
     /// <summary>

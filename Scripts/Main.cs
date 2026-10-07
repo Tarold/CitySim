@@ -112,13 +112,16 @@ public partial class Main : Node2D
     {
         _currentMode = (InteractionMode)modeInt;
         CancelPendingOperation();
+        _previewRenderer.SetMode(_currentMode);
 
         if (_currentMode != InteractionMode.Inspect)
         {
             ClearInspectSelection();
+            UpdateHoverTarget();
         }
         else
         {
+            _previewRenderer.SetHoverZone(-1);
             _gameUI.SetToolHint("🔍 [Inspect] Click a zone on the map to view commute analytics.", new Color(0.4f, 0.8f, 1f));
         }
     }
@@ -248,7 +251,7 @@ public partial class Main : Node2D
             {
                 _camera.Position -= mm.Relative / _camera.Zoom;
             }
-            else if (_currentMode != InteractionMode.Inspect && _pendingStartZoneId != -1)
+            else if (_currentMode != InteractionMode.Inspect)
             {
                 UpdateHoverTarget();
             }
@@ -274,19 +277,14 @@ public partial class Main : Node2D
 
     private void HandleRightClick()
     {
+        CancelPendingOperation();
         if (_currentMode == InteractionMode.Inspect)
         {
             ClearInspectSelection();
         }
-        else if (_currentMode == InteractionMode.BuildRoad)
+        else
         {
-            CancelPendingOperation();
-            _gameUI.SetToolHint("🛣️ [Build Road] Click first cell, then adjacent cell to build road.", new Color(0.4f, 0.95f, 0.6f));
-        }
-        else if (_currentMode == InteractionMode.Demolish)
-        {
-            CancelPendingOperation();
-            _gameUI.SetToolHint("💥 [Demolish] Click first cell, then adjacent connected cell to demolish road.", new Color(1f, 0.5f, 0.4f));
+            _gameUI.SetInteractionMode(_currentMode);
         }
     }
 
@@ -296,17 +294,29 @@ public partial class Main : Node2D
         int gx = Mathf.FloorToInt(mouseWorld.X / _grid.CellSize);
         int gy = Mathf.FloorToInt(mouseWorld.Y / _grid.CellSize);
 
-        if (_currentMode == InteractionMode.Inspect)
+        switch (_currentMode)
         {
-            HandleInspectClick(gx, gy);
-        }
-        else if (_currentMode == InteractionMode.BuildRoad)
-        {
-            HandleBuildRoadClick(gx, gy);
-        }
-        else if (_currentMode == InteractionMode.Demolish)
-        {
-            HandleDemolishClick(gx, gy);
+            case InteractionMode.Inspect:
+                HandleInspectClick(gx, gy);
+                break;
+            case InteractionMode.BuildRoad:
+                HandleBuildRoadClick(gx, gy);
+                break;
+            case InteractionMode.Demolish:
+                HandleDemolishClick(gx, gy);
+                break;
+            case InteractionMode.ZoneResidential:
+                HandleZoneClick(gx, gy, ZoneType.Residential);
+                break;
+            case InteractionMode.ZoneCommercial:
+                HandleZoneClick(gx, gy, ZoneType.Commercial);
+                break;
+            case InteractionMode.ZoneIndustrial:
+                HandleZoneClick(gx, gy, ZoneType.Industrial);
+                break;
+            case InteractionMode.Dezone:
+                HandleDezoneClick(gx, gy);
+                break;
         }
     }
 
@@ -513,6 +523,83 @@ public partial class Main : Node2D
                 _gameUI.SetToolHint("⚠️ Failed to demolish road segment.", Colors.Coral);
             }
         }
+    }
+
+    private void HandleZoneClick(int gx, int gy, ZoneType type)
+    {
+        if (gx < 0 || gx >= _grid.Width || gy < 0 || gy >= _grid.Height)
+        {
+            return;
+        }
+
+        int zoneId = _grid.GetZoneId(gx, gy);
+        var zone = _grid.GetZone(zoneId);
+
+        if (zone != null && zone.Type == type)
+        {
+            _gameUI.SetToolHint($"ℹ️ Cell ({gx}, {gy}) is already zoned as {type}.", Colors.LightGray);
+            return;
+        }
+
+        bool changed = _grid.ZoneCell(zoneId, type);
+        if (changed)
+        {
+            _roadGraph.EnsureNode(zoneId, _grid.GetWorldCenter(zoneId));
+            _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+            RecalculateODMatrix();
+            _cityRenderer.Refresh();
+            _roadRenderer.Refresh();
+            _vehicleRenderer.QueueRedraw();
+
+            _gameUI.ShowCityOverview(_grid, _odMatrix);
+
+            string typeName = type switch
+            {
+                ZoneType.Residential => "Residential (🏡)",
+                ZoneType.Commercial  => "Commercial (🏢)",
+                ZoneType.Industrial  => "Industrial (🏭)",
+                _ => type.ToString()
+            };
+            _gameUI.SetToolHint($"✅ Designated cell ({gx}, {gy}) as {typeName}! Click more cells to expand.", new Color(0.3f, 1f, 0.5f));
+        }
+    }
+
+    private void HandleDezoneClick(int gx, int gy)
+    {
+        if (gx < 0 || gx >= _grid.Width || gy < 0 || gy >= _grid.Height)
+        {
+            return;
+        }
+
+        int zoneId = _grid.GetZoneId(gx, gy);
+        var zone = _grid.GetZone(zoneId);
+
+        if (zone == null || zone.Type == ZoneType.Empty)
+        {
+            _gameUI.SetToolHint($"ℹ️ Cell ({gx}, {gy}) is already empty terrain.", Colors.LightGray);
+            return;
+        }
+
+        if (_selectedZoneId == zoneId)
+        {
+            ClearInspectSelection();
+        }
+
+        // Safely detach all road edges and remove node from graph
+        _roadGraph.DetachAndRemoveNode(zoneId);
+        _grid.DezoneCell(zoneId);
+
+        _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+        _trafficLights.BuildIntersections(_roadGraph);
+        _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
+        RecalculateODMatrix();
+        _cityRenderer.Refresh();
+        _roadRenderer.Refresh();
+        _vehicleRenderer.QueueRedraw();
+
+        _gameUI.ShowCityOverview(_grid, _odMatrix);
+
+        _gameUI.SetToolHint($"🧹 Cleared cell ({gx}, {gy}) back to empty terrain.", new Color(1f, 0.7f, 0.4f));
     }
 
     private List<int> GetValidAdjacentTargets(InteractionMode mode, int zoneId)

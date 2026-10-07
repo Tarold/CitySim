@@ -52,6 +52,11 @@ public class CityGrid
         return new Vector2((zone.GridPos.X + 0.5f) * CellSize, (zone.GridPos.Y + 0.5f) * CellSize);
     }
 
+    public const int DefaultResidentialPopulation = 7000;
+    public const int DefaultCommercialJobs = 4500;
+    public const int DefaultCommercialCapacity = 3000;
+    public const int DefaultIndustrialJobs = 3800;
+
     public int TotalPopulation()
     {
         int total = 0;
@@ -60,6 +65,93 @@ public class CityGrid
             total += Zones[i].Population;
         }
         return total;
+    }
+
+    public int TotalJobs()
+    {
+        int total = 0;
+        for (int i = 0; i < Zones.Length; i++)
+        {
+            total += Zones[i].Jobs;
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// Designates a zone type for the specified grid cell coordinates and initializes baseline capacity metrics.
+    /// </summary>
+    public bool ZoneCell(int x, int y, ZoneType type, int population = DefaultResidentialPopulation, int jobs = -1, int commercialCap = -1)
+    {
+        if (x < 0 || x >= Width || y < 0 || y >= Height) return false;
+        return ZoneCell(GetZoneId(x, y), type, population, jobs, commercialCap);
+    }
+
+    /// <summary>
+    /// Designates a zone type for the specified zone ID and initializes baseline capacity metrics.
+    /// </summary>
+    public bool ZoneCell(int zoneId, ZoneType type, int population = DefaultResidentialPopulation, int jobs = -1, int commercialCap = -1)
+    {
+        if (zoneId < 0 || zoneId >= ZoneCount) return false;
+        var zone = Zones[zoneId];
+        if (zone == null) return false;
+
+        if (type == ZoneType.Empty)
+        {
+            return DezoneCell(zoneId);
+        }
+
+        zone.Type = type;
+        switch (type)
+        {
+            case ZoneType.Residential:
+                zone.Population = population > 0 ? population : DefaultResidentialPopulation;
+                zone.Jobs = 0;
+                zone.CommercialCap = 0;
+                break;
+            case ZoneType.Commercial:
+                zone.Population = 0;
+                zone.Jobs = jobs > 0 ? jobs : DefaultCommercialJobs;
+                zone.CommercialCap = commercialCap >= 0 ? commercialCap : DefaultCommercialCapacity;
+                break;
+            case ZoneType.Industrial:
+                zone.Population = 0;
+                zone.Jobs = jobs > 0 ? jobs : DefaultIndustrialJobs;
+                zone.CommercialCap = 0;
+                break;
+        }
+
+        if (!ActiveZoneIds.Contains(zoneId))
+        {
+            ActiveZoneIds.Add(zoneId);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Clears a grid cell back to empty terrain and resets all capacity metrics.
+    /// </summary>
+    public bool DezoneCell(int x, int y)
+    {
+        if (x < 0 || x >= Width || y < 0 || y >= Height) return false;
+        return DezoneCell(GetZoneId(x, y));
+    }
+
+    /// <summary>
+    /// Clears a zone ID back to empty terrain and resets all capacity metrics.
+    /// </summary>
+    public bool DezoneCell(int zoneId)
+    {
+        if (zoneId < 0 || zoneId >= ZoneCount) return false;
+        var zone = Zones[zoneId];
+        if (zone == null) return false;
+
+        zone.Type = ZoneType.Empty;
+        zone.Population = 0;
+        zone.Jobs = 0;
+        zone.CommercialCap = 0;
+        ActiveZoneIds.Remove(zoneId);
+        return true;
     }
 
     public void GenerateDefaultCity()

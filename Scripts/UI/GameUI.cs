@@ -15,7 +15,15 @@ public enum InteractionMode
     /// <summary>Click or drag between adjacent grid cells to construct road segments.</summary>
     BuildRoad,
     /// <summary>Click an existing road connection to tear it down.</summary>
-    Demolish
+    Demolish,
+    /// <summary>Designate empty or existing cells as Residential district.</summary>
+    ZoneResidential,
+    /// <summary>Designate empty or existing cells as Commercial district.</summary>
+    ZoneCommercial,
+    /// <summary>Designate empty or existing cells as Industrial district.</summary>
+    ZoneIndustrial,
+    /// <summary>Clear existing zoned cell back to empty terrain.</summary>
+    Dezone
 }
 
 public partial class GameUI : CanvasLayer
@@ -31,6 +39,10 @@ public partial class GameUI : CanvasLayer
     private Button _inspectBtn;
     private Button _buildRoadBtn;
     private Button _demolishBtn;
+    private Button _zoneResBtn;
+    private Button _zoneComBtn;
+    private Button _zoneIndBtn;
+    private Button _dezoneBtn;
     
     private Label _timeLabel;
     private Label _popLabel;
@@ -100,7 +112,7 @@ public partial class GameUI : CanvasLayer
         AddChild(topPanel);
 
         var topHBox = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.Center };
-        topHBox.AddThemeConstantOverride("separation", 18);
+        topHBox.AddThemeConstantOverride("separation", 10);
         topPanel.AddChild(topHBox);
 
         _timeLabel = new Label { Text = "Day 1 | 06:30", ThemeTypeVariation = "HeaderLarge" };
@@ -148,20 +160,66 @@ public partial class GameUI : CanvasLayer
         _inspectBtn = new Button
         {
             Text = "🔍 Inspect",
+            TooltipText = "Inspect Zone Analytics and Commute Paths",
             ToggleMode = true,
             ButtonPressed = true,
             ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(90, 36)
+            CustomMinimumSize = new Vector2(85, 36)
         };
         _inspectBtn.Pressed += () => SetInteractionMode(InteractionMode.Inspect);
         topHBox.AddChild(_inspectBtn);
 
-        _buildRoadBtn = new Button
+        _zoneResBtn = new Button
         {
-            Text = "🛣️ Build",
+            Text = "🏡 Res",
+            TooltipText = "Zone Residential District (Green)",
             ToggleMode = true,
             ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(80, 36)
+            CustomMinimumSize = new Vector2(72, 36)
+        };
+        _zoneResBtn.Pressed += () => SetInteractionMode(InteractionMode.ZoneResidential);
+        topHBox.AddChild(_zoneResBtn);
+
+        _zoneComBtn = new Button
+        {
+            Text = "🏢 Com",
+            TooltipText = "Zone Commercial District (Blue)",
+            ToggleMode = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(72, 36)
+        };
+        _zoneComBtn.Pressed += () => SetInteractionMode(InteractionMode.ZoneCommercial);
+        topHBox.AddChild(_zoneComBtn);
+
+        _zoneIndBtn = new Button
+        {
+            Text = "🏭 Ind",
+            TooltipText = "Zone Industrial District (Amber)",
+            ToggleMode = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(72, 36)
+        };
+        _zoneIndBtn.Pressed += () => SetInteractionMode(InteractionMode.ZoneIndustrial);
+        topHBox.AddChild(_zoneIndBtn);
+
+        _dezoneBtn = new Button
+        {
+            Text = "🧹 Dezone",
+            TooltipText = "Clear / Dezone Grid Tile to Empty Terrain",
+            ToggleMode = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(85, 36)
+        };
+        _dezoneBtn.Pressed += () => SetInteractionMode(InteractionMode.Dezone);
+        topHBox.AddChild(_dezoneBtn);
+
+        _buildRoadBtn = new Button
+        {
+            Text = "🛣️ Road",
+            TooltipText = "Construct Road Between Adjacent Cells",
+            ToggleMode = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(75, 36)
         };
         _buildRoadBtn.Pressed += () => SetInteractionMode(InteractionMode.BuildRoad);
         topHBox.AddChild(_buildRoadBtn);
@@ -169,9 +227,10 @@ public partial class GameUI : CanvasLayer
         _demolishBtn = new Button
         {
             Text = "💥 Demolish",
+            TooltipText = "Demolish Road Connection",
             ToggleMode = true,
             ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(100, 36)
+            CustomMinimumSize = new Vector2(92, 36)
         };
         _demolishBtn.Pressed += () => SetInteractionMode(InteractionMode.Demolish);
         topHBox.AddChild(_demolishBtn);
@@ -497,8 +556,10 @@ public partial class GameUI : CanvasLayer
         _infoTitleLabel.Text = "📊 Шляхи: Місто на 1M+";
         _infoTitleLabel.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.3f));
 
-        _infoStat1Label.Text = $"Населення: {grid.TotalPopulation():N0} (Західний сектор)";
-        _infoStat2Label.Text = $"Робочі місця: 510,000 (Центр + Схід)";
+        int totalPop = grid.TotalPopulation();
+        int totalJobs = grid.TotalJobs();
+        _infoStat1Label.Text = $"Населення: {totalPop:N0}";
+        _infoStat2Label.Text = $"Робочі місця: {totalJobs:N0}";
 
         _infoWorkplaceBreakdown.Text = 
             $"Структура зайнятості міста:\n" +
@@ -569,6 +630,10 @@ public partial class GameUI : CanvasLayer
         if (mode == InteractionMode.Inspect && _inspectBtn != null) _inspectBtn.ButtonPressed = true;
         else if (mode == InteractionMode.BuildRoad && _buildRoadBtn != null) _buildRoadBtn.ButtonPressed = true;
         else if (mode == InteractionMode.Demolish && _demolishBtn != null) _demolishBtn.ButtonPressed = true;
+        else if (mode == InteractionMode.ZoneResidential && _zoneResBtn != null) _zoneResBtn.ButtonPressed = true;
+        else if (mode == InteractionMode.ZoneCommercial && _zoneComBtn != null) _zoneComBtn.ButtonPressed = true;
+        else if (mode == InteractionMode.ZoneIndustrial && _zoneIndBtn != null) _zoneIndBtn.ButtonPressed = true;
+        else if (mode == InteractionMode.Dezone && _dezoneBtn != null) _dezoneBtn.ButtonPressed = true;
 
         UpdateDefaultHintForMode(mode);
         EmitSignal(SignalName.ModeChanged, (int)mode);
@@ -586,6 +651,18 @@ public partial class GameUI : CanvasLayer
                 break;
             case InteractionMode.Demolish:
                 SetToolHint("💥 [Demolish] Click first cell, then adjacent connected cell to demolish road.", new Color(1f, 0.5f, 0.4f));
+                break;
+            case InteractionMode.ZoneResidential:
+                SetToolHint("🏡 [Residential Zone] Click on any grid cell to designate Residential district.", new Color(0.35f, 0.95f, 0.5f));
+                break;
+            case InteractionMode.ZoneCommercial:
+                SetToolHint("🏢 [Commercial Zone] Click on any grid cell to designate Commercial district.", new Color(0.35f, 0.75f, 1.0f));
+                break;
+            case InteractionMode.ZoneIndustrial:
+                SetToolHint("🏭 [Industrial Zone] Click on any grid cell to designate Industrial district.", new Color(1.0f, 0.75f, 0.25f));
+                break;
+            case InteractionMode.Dezone:
+                SetToolHint("🧹 [Dezone] Click on any zoned cell to clear it back to Empty terrain.", new Color(1.0f, 0.45f, 0.45f));
                 break;
         }
     }

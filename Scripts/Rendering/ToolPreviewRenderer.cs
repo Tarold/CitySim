@@ -34,6 +34,26 @@ public partial class ToolPreviewRenderer : Node2D
     }
 
     /// <summary>
+    /// Sets the active interaction mode and clears any pending road targets.
+    /// </summary>
+    public void SetMode(InteractionMode mode)
+    {
+        Mode = mode;
+        StartZoneId = -1;
+        ValidTargetZoneIds.Clear();
+        QueueRedraw();
+    }
+
+    /// <summary>
+    /// Checks whether the specified mode is a zoning or dezoning interaction mode.
+    /// </summary>
+    public static bool IsZoningMode(InteractionMode mode) =>
+        mode == InteractionMode.ZoneResidential ||
+        mode == InteractionMode.ZoneCommercial ||
+        mode == InteractionMode.ZoneIndustrial ||
+        mode == InteractionMode.Dezone;
+
+    /// <summary>
     /// Configures the active preview for a tool operation.
     /// </summary>
     public void SetPreview(InteractionMode mode, int startZoneId, List<int> validTargets)
@@ -71,7 +91,7 @@ public partial class ToolPreviewRenderer : Node2D
 
     public override void _Process(double delta)
     {
-        if (StartZoneId != -1)
+        if (StartZoneId != -1 || (IsZoningMode(Mode) && HoverZoneId != -1))
         {
             _pulseTimer += (float)delta * 4f;
             QueueRedraw();
@@ -80,13 +100,82 @@ public partial class ToolPreviewRenderer : Node2D
 
     public override void _Draw()
     {
-        if (_grid == null || StartZoneId == -1 || Mode == InteractionMode.Inspect)
+        if (_grid == null || Mode == InteractionMode.Inspect)
             return;
 
         float cellSize = _grid.CellSize;
         float pulseWidth = 3.2f + Mathf.Sin(_pulseTimer) * 1.0f;
 
-        // 1. Draw Valid Target Cells Outlines
+        // 1. Zoning Modes Live Hover Preview (Residential, Commercial, Industrial, Dezone)
+        if (IsZoningMode(Mode))
+        {
+            if (HoverZoneId >= 0 && HoverZoneId < _grid.ZoneCount)
+            {
+                var hoverZone = _grid.GetZone(HoverZoneId);
+                if (hoverZone != null)
+                {
+                    Vector2 pos = new Vector2(hoverZone.GridPos.X * cellSize + 1, hoverZone.GridPos.Y * cellSize + 1);
+                    Vector2 size = new Vector2(cellSize - 2, cellSize - 2);
+                    Rect2 rect = new Rect2(pos, size);
+
+                    Color fillColor;
+                    Color borderColor;
+
+                    switch (Mode)
+                    {
+                        case InteractionMode.ZoneResidential:
+                            fillColor = new Color(0.18f, 0.75f, 0.32f, 0.35f);
+                            borderColor = new Color(0.25f, 1.0f, 0.45f, 0.95f);
+                            break;
+                        case InteractionMode.ZoneCommercial:
+                            fillColor = new Color(0.20f, 0.55f, 0.98f, 0.35f);
+                            borderColor = new Color(0.35f, 0.75f, 1.0f, 0.95f);
+                            break;
+                        case InteractionMode.ZoneIndustrial:
+                            fillColor = new Color(0.95f, 0.60f, 0.15f, 0.35f);
+                            borderColor = new Color(1.0f, 0.75f, 0.25f, 0.95f);
+                            break;
+                        case InteractionMode.Dezone:
+                        default:
+                            fillColor = new Color(0.95f, 0.20f, 0.20f, 0.35f);
+                            borderColor = new Color(1.0f, 0.35f, 0.35f, 0.95f);
+                            break;
+                    }
+
+                    // Fill highlight
+                    DrawRect(rect, fillColor, true);
+                    // Pulsing outline
+                    DrawRect(rect, borderColor, false, pulseWidth);
+
+                    // For Dezone mode: draw red X crosshair marker
+                    if (Mode == InteractionMode.Dezone)
+                    {
+                        Vector2 p1 = pos + new Vector2(12, 12);
+                        Vector2 p2 = pos + size - new Vector2(12, 12);
+                        Vector2 p3 = pos + new Vector2(size.X - 12, 12);
+                        Vector2 p4 = pos + new Vector2(12, size.Y - 12);
+                        DrawLine(p1, p2, Colors.White, 4.0f, true);
+                        DrawLine(p1, p2, new Color(1f, 0.25f, 0.25f, 0.95f), 2.2f, true);
+                        DrawLine(p3, p4, Colors.White, 4.0f, true);
+                        DrawLine(p3, p4, new Color(1f, 0.25f, 0.25f, 0.95f), 2.2f, true);
+                    }
+                    else
+                    {
+                        // Draw central '+' symbol indicating expansion
+                        Vector2 center = _grid.GetWorldCenter(HoverZoneId);
+                        DrawLine(center + new Vector2(-7, 0), center + new Vector2(7, 0), Colors.White, 2.5f, true);
+                        DrawLine(center + new Vector2(0, -7), center + new Vector2(0, 7), Colors.White, 2.5f, true);
+                    }
+                }
+            }
+            return;
+        }
+
+        // 2. Road Building & Demolition Previews (Requires StartZoneId)
+        if (StartZoneId == -1)
+            return;
+
+        // Draw Valid Target Cells Outlines
         Color targetOutlineColor = (Mode == InteractionMode.BuildRoad)
             ? new Color(0.2f, 0.85f, 1f, 0.65f)
             : new Color(1f, 0.4f, 0.3f, 0.65f);

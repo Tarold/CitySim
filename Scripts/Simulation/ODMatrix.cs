@@ -110,6 +110,11 @@ public class ODMatrix
         float demandMult = GetDemandMultiplier(hour);
         float dirBias = GetDirectionalBias(hour);
 
+        Array.Clear(Trips, 0, Trips.Length);
+        Array.Clear(CarTrips, 0, CarTrips.Length);
+        Array.Clear(TransitTrips, 0, TransitTrips.Length);
+        TotalTrips = 0f;
+
         // 1. Calculate raw gravity attraction only for active populated zones
         float rawTotalScore = 0f;
         var activeIds = grid.ActiveZoneIds;
