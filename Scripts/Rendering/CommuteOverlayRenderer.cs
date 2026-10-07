@@ -1,0 +1,208 @@
+using Godot;
+using System.Collections.Generic;
+using CitySim.Simulation;
+
+namespace CitySim.Rendering;
+
+public class CommuteTarget
+{
+    public int ZoneId;
+    public Vector2 Position;
+    public float Volume;
+    public ZoneType Type;
+    public float TravelTime;
+    public List<int> EdgePath = new List<int>();
+}
+
+public partial class CommuteOverlayRenderer : Node2D
+{
+    private CityGrid _grid;
+    private ODMatrix _odMatrix;
+    private RoadGraph _graph;
+    private float _pulseTime = 0f;
+
+    public int SelectedZoneId = -1;
+    public List<CommuteTarget> Targets = new List<CommuteTarget>();
+
+    public void Initialize(CityGrid grid, ODMatrix od, RoadGraph graph)
+    {
+        _grid = grid;
+        _odMatrix = od;
+        _graph = graph;
+    }
+
+    public void SelectZone(int zoneId, float[,] distances, RoadGraph graph)
+    {
+        _graph = graph;
+        SelectedZoneId = zoneId;
+        Targets.Clear();
+
+        if (zoneId < 0 || zoneId >= _grid.ZoneCount)
+        {
+            QueueRedraw();
+            return;
+        }
+
+        var sourceZone = _grid.GetZone(zoneId);
+        if (sourceZone == null || sourceZone.Type == ZoneType.Empty)
+        {
+            SelectedZoneId = -1;
+            QueueRedraw();
+            return;
+        }
+
+        // 1. If residential: trace path to workplaces (Commercial offices / Industrial factories)
+        if (sourceZone.Type == ZoneType.Residential)
+        {
+            for (int j = 0; j < _grid.ZoneCount; j++)
+            {
+                if (zoneId == j) continue;
+                var dest = _grid.GetZone(j);
+                if (dest == null || dest.Type == ZoneType.Empty) continue;
+
+                float trips = _odMatrix.Trips[zoneId, j];
+                if (trips > 0.05f)
+                {
+                    List<int> edgePath = null;
+                    if (graph.PathCache.TryGetValue((zoneId, j), out var path))
+                    {
+                        edgePath = path;
+                    }
+
+                    Targets.Add(new CommuteTarget
+                    {
+                        ZoneId = j,
+                        Position = _grid.GetWorldCenter(j),
+                        Volume = trips,
+                        Type = dest.Type,
+                        TravelTime = distances[zoneId, j],
+                        EdgePath = edgePath != null ? new List<int>(edgePath) : new List<int>()
+                    });
+                }
+            }
+        }
+        // 2. If workplace: trace feeder paths from worker homes (Residential)
+        else if (sourceZone.Type == ZoneType.Commercial || sourceZone.Type == ZoneType.Industrial)
+        {
+            for (int i = 0; i < _grid.ZoneCount; i++)
+            {
+                if (zoneId == i) continue;
+                var origin = _grid.GetZone(i);
+                if (origin == null || origin.Type != ZoneType.Residential) continue;
+
+                float trips = _odMatrix.Trips[i, zoneId];
+                if (trips > 0.05f)
+                {
+                    List<int> edgePath = null;
+                    if (graph.PathCache.TryGetValue((i, zoneId), out var path))
+                    {
+                        edgePath = path;
+                    }
+
+                    Targets.Add(new CommuteTarget
+                    {
+                        ZoneId = i,
+                        Position = _grid.GetWorldCenter(i),
+                        Volume = trips,
+                        Type = origin.Type,
+                        TravelTime = distances[i, zoneId],
+                        EdgePath = edgePath != null ? new List<int>(edgePath) : new List<int>()
+                    });
+                }
+            }
+        }
+
+        // Sort by commuter volume descending and keep top 8 most prominent paths
+        Targets.Sort((a, b) => b.Volume.CompareTo(a.Volume));
+        if (Targets.Count > 8) Targets.RemoveRange(8, Targets.Count - 8);
+
+        QueueRedraw();
+    }
+
+    public override void _Process(double delta)
+    {
+        _pulseTime += (float)delta * 3f;
+        if (SelectedZoneId != -1) QueueRedraw();
+    }
+
+    public override void _Draw()
+    {
+        if (_grid == null || _graph == null) return;
+
+        // 1. Draw Sector District Headers on the map
+        DrawDistrictLabels();
+
+        // 2. Draw Road Paths if a zone is selected
+        if (SelectedZoneId != -1 && Targets.Count > 0)
+        {
+            var sourceZone = _grid.GetZone(SelectedZoneId);
+            Vector2 fromPos = _grid.GetWorldCenter(SelectedZoneId);
+
+            // Glowing golden halo at the selected building
+            float pulse = 18f + Mathf.Sin(_pulseTime * 2f) * 3f;
+            DrawArc(fromPos, pulse, 0, Mathf.Tau, 24, Colors.Gold, 2.8f, true);
+            DrawCircle(fromPos, 4f, Colors.Gold);
+
+            float maxVol = Targets[0].Volume;
+
+            foreach (var target in Targets)
+            {
+                float relativeWeight = Mathf.Clamp(target.Volume / Mathf.Max(maxVol, 0.01f), 0.2f, 1.0f);
+                float lineWidth = 2.5f + relativeWeight * 4.0f;
+
+                Color pathGlowColor = target.Type switch
+                {
+                    ZoneType.Commercial => new Color(0.15f, 0.70f, 1.0f, 0.85f), // Glowing Cyan to downtown offices
+                    ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.85f), // Glowing Amber to factories
+                    _ => new Color(0.35f, 0.95f, 0.45f, 0.85f)                   // Lime Green to residences
+                };
+
+                // A. Draw the EXACT road street path edges
+                if (target.EdgePath != null && target.EdgePath.Count > 0)
+                {
+                    foreach (var edgeId in target.EdgePath)
+                    {
+                        if (edgeId >= 0 && edgeId < _graph.Edges.Count)
+                        {
+                            var edge = _graph.Edges[edgeId];
+                            var fn = _graph.GetNode(edge.FromId);
+                            var tn = _graph.GetNode(edge.ToId);
+                            if (fn != null && tn != null)
+                            {
+                                // Draw high-visibility illuminated street corridor
+                                DrawLine(fn.WorldPosition, tn.WorldPosition, pathGlowColor, lineWidth, true);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Fallback direct ray if path cache doesn't have intermediate nodes
+                    DrawLine(fromPos, target.Position, pathGlowColor, lineWidth, true);
+                }
+
+                // B. Draw destination pin badge
+                DrawCircle(target.Position, 6.5f + relativeWeight * 2f, pathGlowColor);
+                DrawArc(target.Position, 7f + relativeWeight * 2f, 0, Mathf.Tau, 16, Colors.White, 1.4f, true);
+                DrawCircle(target.Position, 2.5f, Colors.White);
+            }
+        }
+    }
+
+    private void DrawDistrictLabels()
+    {
+        float cellSize = _grid.CellSize;
+        
+        // West Sector Header
+        Vector2 westPos = new Vector2(4.5f * cellSize, 1.2f * cellSize);
+        DrawString(ThemeDB.FallbackFont, westPos, "🏡 ЖИТЛОВИЙ СЕКТОР (1,008,000)", HorizontalAlignment.Center, -1, 14, new Color(0.4f, 0.9f, 0.5f, 0.9f));
+
+        // Central Sector Header
+        Vector2 centerPos = new Vector2(9.5f * cellSize, 3.2f * cellSize);
+        DrawString(ThemeDB.FallbackFont, centerPos, "🏢 ДІЛОВИЙ ЦЕНТР (216,000 ОФІСІВ)", HorizontalAlignment.Center, -1, 14, new Color(0.4f, 0.7f, 1f, 0.9f));
+
+        // East Sector Header
+        Vector2 eastPos = new Vector2(14.5f * cellSize, 1.8f * cellSize);
+        DrawString(ThemeDB.FallbackFont, eastPos, "🏭 ПРОМЗОНА (294,000 ЗАВОДІВ)", HorizontalAlignment.Center, -1, 14, new Color(1f, 0.75f, 0.2f, 0.9f));
+    }
+}

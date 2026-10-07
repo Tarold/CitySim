@@ -1,0 +1,26 @@
+# Godot 4+
+.godot/
+
+# Godot 3 / general Godot cache (if applicable)
+.import/
+export.cfg
+export_presets.cfg
+
+# Mono / .NET build artifacts
+.mono/
+bin/
+obj/
+*.csproj.old
+
+# IDE & Editor files
+.vs/
+.vscode/
+.idea/
+*.user
+*.userprefs
+*.suo
+*.sln.docstates
+
+# OS generated files
+.DS_Store
+Thumbs.db
