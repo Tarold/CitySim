@@ -91,6 +91,7 @@ public partial class VehicleRenderer : Node2D
             {
                 if (car.EdgeId < 0 || car.EdgeId >= _graph.Edges.Count) continue;
                 var edge = _graph.Edges[car.EdgeId];
+                if (edge.FromId == -1 || edge.ToId == -1) continue;
                 var fromNode = _graph.GetNode(edge.FromId);
                 var toNode = _graph.GetNode(edge.ToId);
                 if (fromNode == null || toNode == null) continue;

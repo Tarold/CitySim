@@ -5,11 +5,32 @@ using CitySim.Simulation;
 
 namespace CitySim.UI;
 
+/// <summary>
+/// Determines how mouse clicks on the game map are interpreted.
+/// </summary>
+public enum InteractionMode
+{
+    /// <summary>Click zones to inspect commuters, mode split, and analytics.</summary>
+    Inspect,
+    /// <summary>Click or drag between adjacent grid cells to construct road segments.</summary>
+    BuildRoad,
+    /// <summary>Click an existing road connection to tear it down.</summary>
+    Demolish
+}
+
 public partial class GameUI : CanvasLayer
 {
     [Signal] public delegate void SpeedChangedEventHandler(float speed);
     [Signal] public delegate void HeatmapToggledEventHandler(bool enabled);
     [Signal] public delegate void CommuteInfographicsToggledEventHandler(bool enabled);
+    [Signal] public delegate void ModeChangedEventHandler(int mode);
+
+    /// <summary>The currently active interaction mode.</summary>
+    public InteractionMode CurrentMode { get; private set; } = InteractionMode.Inspect;
+
+    private Button _inspectBtn;
+    private Button _buildRoadBtn;
+    private Button _demolishBtn;
     
     private Label _timeLabel;
     private Label _popLabel;
@@ -20,6 +41,9 @@ public partial class GameUI : CanvasLayer
     private Label _coverageLabel;
     private Label _demandLabel;
     private Label _biasLabel;
+
+    private PanelContainer _toolHintPanel;
+    private Label _toolHintLabel;
 
     // Infographic side panel
     private PanelContainer _infoPanel;
@@ -114,6 +138,81 @@ public partial class GameUI : CanvasLayer
             EmitSignal(SignalName.CommuteInfographicsToggled, pressed);
         };
         topHBox.AddChild(infoBtn);
+
+        // ---- Interaction Mode Buttons (mutually exclusive via ButtonGroup) ----
+        var modeSpacer = new VSeparator();
+        topHBox.AddChild(modeSpacer);
+
+        var modeGroup = new ButtonGroup();
+
+        _inspectBtn = new Button
+        {
+            Text = "🔍 Inspect",
+            ToggleMode = true,
+            ButtonPressed = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(90, 36)
+        };
+        _inspectBtn.Pressed += () => SetInteractionMode(InteractionMode.Inspect);
+        topHBox.AddChild(_inspectBtn);
+
+        _buildRoadBtn = new Button
+        {
+            Text = "🛣️ Build",
+            ToggleMode = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(80, 36)
+        };
+        _buildRoadBtn.Pressed += () => SetInteractionMode(InteractionMode.BuildRoad);
+        topHBox.AddChild(_buildRoadBtn);
+
+        _demolishBtn = new Button
+        {
+            Text = "💥 Demolish",
+            ToggleMode = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(100, 36)
+        };
+        _demolishBtn.Pressed += () => SetInteractionMode(InteractionMode.Demolish);
+        topHBox.AddChild(_demolishBtn);
+
+        // Tool Instructions Banner (Centered beneath Top Panel)
+        _toolHintPanel = new PanelContainer();
+        _toolHintPanel.AnchorLeft = 0.5f;
+        _toolHintPanel.AnchorRight = 0.5f;
+        _toolHintPanel.OffsetLeft = -320;
+        _toolHintPanel.OffsetRight = 320;
+        _toolHintPanel.OffsetTop = 58;
+        _toolHintPanel.OffsetBottom = 92;
+
+        var hintStyle = new StyleBoxFlat
+        {
+            BgColor = new Color(0.04f, 0.05f, 0.08f, 0.90f),
+            CornerRadiusTopLeft = 6,
+            CornerRadiusTopRight = 6,
+            CornerRadiusBottomLeft = 6,
+            CornerRadiusBottomRight = 6,
+            ContentMarginLeft = 14,
+            ContentMarginRight = 14,
+            ContentMarginTop = 6,
+            ContentMarginBottom = 6,
+            BorderWidthLeft = 1,
+            BorderWidthRight = 1,
+            BorderWidthTop = 1,
+            BorderWidthBottom = 1,
+            BorderColor = new Color(0.25f, 0.35f, 0.50f, 0.6f)
+        };
+        _toolHintPanel.AddThemeStyleboxOverride("panel", hintStyle);
+        AddChild(_toolHintPanel);
+
+        _toolHintLabel = new Label
+        {
+            Text = "🔍 [Inspect] Click a zone on the map to view commute analytics.",
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        _toolHintLabel.AddThemeColorOverride("font_color", new Color(0.4f, 0.8f, 1f));
+        _toolHintPanel.AddChild(_toolHintLabel);
 
         // =========================================================================
         // BOTTOM-LEFT STATS PANEL
@@ -446,6 +545,48 @@ public partial class GameUI : CanvasLayer
         if (_transitViewContainer.Visible)
         {
             UpdateTransitRoutesView();
+        }
+    }
+
+    /// <summary>
+    /// Updates the tool instruction / hint text displayed in the HUD banner.
+    /// </summary>
+    public void SetToolHint(string hint, Color? color = null)
+    {
+        if (_toolHintLabel != null)
+        {
+            _toolHintLabel.Text = hint;
+            _toolHintLabel.AddThemeColorOverride("font_color", color ?? new Color(0.9f, 0.95f, 1.0f));
+        }
+    }
+
+    /// <summary>
+    /// Sets the active interaction mode, updates button toggle state, and emits <see cref="ModeChanged"/>.
+    /// </summary>
+    public void SetInteractionMode(InteractionMode mode)
+    {
+        CurrentMode = mode;
+        if (mode == InteractionMode.Inspect && _inspectBtn != null) _inspectBtn.ButtonPressed = true;
+        else if (mode == InteractionMode.BuildRoad && _buildRoadBtn != null) _buildRoadBtn.ButtonPressed = true;
+        else if (mode == InteractionMode.Demolish && _demolishBtn != null) _demolishBtn.ButtonPressed = true;
+
+        UpdateDefaultHintForMode(mode);
+        EmitSignal(SignalName.ModeChanged, (int)mode);
+    }
+
+    private void UpdateDefaultHintForMode(InteractionMode mode)
+    {
+        switch (mode)
+        {
+            case InteractionMode.Inspect:
+                SetToolHint("🔍 [Inspect] Click a zone on the map to view commute analytics.", new Color(0.4f, 0.8f, 1f));
+                break;
+            case InteractionMode.BuildRoad:
+                SetToolHint("🛣️ [Build Road] Click first cell, then adjacent cell to build road.", new Color(0.4f, 0.95f, 0.6f));
+                break;
+            case InteractionMode.Demolish:
+                SetToolHint("💥 [Demolish] Click first cell, then adjacent connected cell to demolish road.", new Color(1f, 0.5f, 0.4f));
+                break;
         }
     }
 }

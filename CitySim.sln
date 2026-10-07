@@ -5,6 +5,8 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CitySim", "CitySim.csproj", "{A1B8A135-CE98-49EC-9E7A-B903D815C51F}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests", "Tests\Tests.csproj", "{C805F853-972A-40C5-9F93-61BFBC34097C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -18,5 +20,9 @@ Global
 		{A1B8A135-CE98-49EC-9E7A-B903D815C51F}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A1B8A135-CE98-49EC-9E7A-B903D815C51F}.Release|Any CPU.ActiveCfg = Debug|Any CPU
 		{A1B8A135-CE98-49EC-9E7A-B903D815C51F}.Release|Any CPU.Build.0 = Debug|Any CPU
+		{C805F853-972A-40C5-9F93-61BFBC34097C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C805F853-972A-40C5-9F93-61BFBC34097C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C805F853-972A-40C5-9F93-61BFBC34097C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C805F853-972A-40C5-9F93-61BFBC34097C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

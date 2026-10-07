@@ -43,7 +43,9 @@ public class TrafficEngine
         float maxVol = 0f;
         for (int i = 0; i < graph.Edges.Count; i++)
         {
-            float v = graph.Edges[i].CurrentVolume;
+            var edge = graph.Edges[i];
+            if (edge.FromId == -1 || edge.ToId == -1) continue;
+            float v = edge.CurrentVolume;
             if (v > maxVol) maxVol = v;
         }
         return maxVol;
@@ -56,6 +58,7 @@ public class TrafficEngine
         for (int i = 0; i < graph.Edges.Count; i++)
         {
             var edge = graph.Edges[i];
+            if (edge.FromId == -1 || edge.ToId == -1) continue;
             if (edge.CurrentVolume > 0f)
             {
                 totalRatio += edge.GetCongestionRatio();

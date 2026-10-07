@@ -19,6 +19,11 @@ public partial class CityRenderer : Node2D
         SelectedZoneId = zoneId;
         QueueRedraw();
     }
+
+    public void Refresh()
+    {
+        QueueRedraw();
+    }
     
     public override void _Draw()
     {

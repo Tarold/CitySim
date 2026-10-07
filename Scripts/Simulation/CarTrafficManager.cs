@@ -57,9 +57,29 @@ public class CarTrafficManager
         _busyEdgeIds.Clear();
         for (int i = 0; i < graph.Edges.Count; i++)
         {
-            if (graph.Edges[i].CurrentVolume > 10f)
+            var edge = graph.Edges[i];
+            if (edge.FromId != -1 && edge.ToId != -1 && edge.CurrentVolume > 10f)
             {
                 _busyEdgeIds.Add(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Respawns or cleans any cars referencing demolished or invalidated edges.
+    /// </summary>
+    public void HandleInvalidatedEdges(RoadGraph graph)
+    {
+        _busyEdgeIds.RemoveAll(eid => eid < 0 || eid >= graph.Edges.Count || 
+                                     graph.Edges[eid].FromId == -1 || graph.Edges[eid].ToId == -1);
+
+        for (int i = 0; i < Cars.Count; i++)
+        {
+            var car = Cars[i];
+            if (car.EdgeId < 0 || car.EdgeId >= graph.Edges.Count ||
+                graph.Edges[car.EdgeId].FromId == -1 || graph.Edges[car.EdgeId].ToId == -1)
+            {
+                RespawnCar(car, graph);
             }
         }
     }
@@ -80,6 +100,12 @@ public class CarTrafficManager
             }
 
             var edge = graph.Edges[car.EdgeId];
+            if (edge.FromId == -1 || edge.ToId == -1)
+            {
+                RespawnCar(car, graph);
+                continue;
+            }
+
             var fromNode = graph.GetNode(edge.FromId);
             var toNode = graph.GetNode(edge.ToId);
             if (fromNode == null || toNode == null)
@@ -135,7 +161,9 @@ public class CarTrafficManager
             for (int i = 0; i < nextEdgeIds.Count; i++)
             {
                 int candidateId = nextEdgeIds[i];
+                if (candidateId < 0 || candidateId >= graph.Edges.Count) continue;
                 var candidate = graph.Edges[candidateId];
+                if (candidate.FromId == -1 || candidate.ToId == -1) continue; // Skip invalidated edges
                 if (candidate.ToId == currentEdge.FromId) continue; // Avoid 180 u-turn
 
                 if (candidate.CurrentVolume > bestVol)
@@ -158,14 +186,42 @@ public class CarTrafficManager
 
     private void RespawnCar(VisualCar car, RoadGraph graph)
     {
-        if (_busyEdgeIds.Count > 0)
+        // Try busy edges first
+        int attempts = 0;
+        while (_busyEdgeIds.Count > 0 && attempts < 10)
         {
-            car.EdgeId = _busyEdgeIds[_random.Next(_busyEdgeIds.Count)];
+            int candidate = _busyEdgeIds[_random.Next(_busyEdgeIds.Count)];
+            if (candidate >= 0 && candidate < graph.Edges.Count &&
+                graph.Edges[candidate].FromId != -1 && graph.Edges[candidate].ToId != -1)
+            {
+                car.EdgeId = candidate;
+                car.Progress = (float)_random.NextDouble() * 0.3f;
+                car.IsStopped = false;
+                return;
+            }
+            _busyEdgeIds.Remove(candidate);
+            attempts++;
+        }
+
+        // Fallback: pick any valid active edge in graph
+        var validEdgeIds = new List<int>();
+        for (int i = 0; i < graph.Edges.Count; i++)
+        {
+            if (graph.Edges[i].FromId != -1 && graph.Edges[i].ToId != -1)
+            {
+                validEdgeIds.Add(i);
+            }
+        }
+
+        if (validEdgeIds.Count > 0)
+        {
+            car.EdgeId = validEdgeIds[_random.Next(validEdgeIds.Count)];
         }
         else
         {
-            car.EdgeId = _random.Next(graph.Edges.Count);
+            car.EdgeId = -1;
         }
+
         car.Progress = (float)_random.NextDouble() * 0.3f;
         car.IsStopped = false;
     }
