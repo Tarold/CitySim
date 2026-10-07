@@ -331,4 +331,49 @@ public class ZoningAndExpansionTests
         lights.BuildIntersections(_roadGraph);
         Assert.DoesNotThrow(() => carMgr.Update(0.1f, 1.0f, _roadGraph, lights));
     }
+
+    [Test]
+    public void Rezone_ConnectedCell_UpdatesODTripsDirectionAndDemand()
+    {
+        int rId = _grid.GetZoneId(3, 3);
+        int cId = _grid.GetZoneId(3, 4);
+
+        _grid.ZoneCell(3, 3, ZoneType.Residential);
+        _grid.ZoneCell(3, 4, ZoneType.Commercial);
+
+        _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
+        _roadGraph.EnsureNode(cId, _grid.GetWorldCenter(cId));
+        _roadGraph.AddRoadSegment(rId, cId);
+
+        var distances = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+        var odMatrix = new ODMatrix(_grid.ZoneCount);
+        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false);
+
+        float initialTrips = odMatrix.Trips[rId, cId];
+        Assert.That(initialTrips, Is.GreaterThan(0f));
+
+        // Rezone commercial to industrial
+        _grid.ZoneCell(3, 4, ZoneType.Industrial);
+        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false);
+
+        Assert.That(_grid.GetZone(cId).Type, Is.EqualTo(ZoneType.Industrial));
+        Assert.That(odMatrix.Trips[rId, cId], Is.GreaterThan(0f));
+    }
+
+    [Test]
+    public void RoadGraph_DetachIsolatedNode_ReturnsTrueAndRemovesNode()
+    {
+        int zId = _grid.GetZoneId(0, 0);
+        _roadGraph.EnsureNode(zId, _grid.GetWorldCenter(zId));
+
+        Assert.That(_roadGraph.GetNode(zId), Is.Not.Null);
+
+        bool removed = _roadGraph.DetachAndRemoveNode(zId);
+
+        Assert.That(removed, Is.True);
+        Assert.That(_roadGraph.GetNode(zId), Is.Null);
+        Assert.That(_roadGraph.NodeMap.ContainsKey(zId), Is.False);
+        Assert.That(_roadGraph.AdjacencyEdges.ContainsKey(zId), Is.False);
+    }
 }
+
