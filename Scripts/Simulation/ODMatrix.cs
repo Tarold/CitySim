@@ -1,5 +1,6 @@
 using Godot;
 using System;
+using System.Collections.Generic;
 
 namespace CitySim.Simulation;
 
@@ -104,7 +105,7 @@ public class ODMatrix
         };
     }
 
-    public void Recalculate(float hour, CityGrid grid, float[,] distances, bool hasTransit)
+    public void Recalculate(float hour, CityGrid grid, float[,] distances, bool hasTransit, HashSet<int> coveredZoneIds = null)
     {
         CurrentHour = hour;
         float demandMult = GetDemandMultiplier(hour);
@@ -175,7 +176,28 @@ public class ODMatrix
                 float finalTrips = score * normalizationScale;
                 Trips[i, j] = finalTrips;
 
-                if (hasTransit)
+                if (coveredZoneIds != null && coveredZoneIds.Count > 0)
+                {
+                    bool originCovered = coveredZoneIds.Contains(i);
+                    bool destCovered = coveredZoneIds.Contains(j);
+
+                    if (originCovered && destCovered)
+                    {
+                        TransitTrips[i, j] = finalTrips * 0.40f;
+                        CarTrips[i, j] = finalTrips * 0.60f;
+                    }
+                    else if (originCovered || destCovered)
+                    {
+                        TransitTrips[i, j] = finalTrips * 0.15f;
+                        CarTrips[i, j] = finalTrips * 0.85f;
+                    }
+                    else
+                    {
+                        TransitTrips[i, j] = 0f;
+                        CarTrips[i, j] = finalTrips;
+                    }
+                }
+                else if (hasTransit)
                 {
                     TransitTrips[i, j] = finalTrips * 0.35f;
                     CarTrips[i, j] = finalTrips * 0.65f;

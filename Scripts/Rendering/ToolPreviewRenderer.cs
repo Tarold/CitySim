@@ -11,7 +11,14 @@ namespace CitySim.Rendering;
 public partial class ToolPreviewRenderer : Node2D
 {
     private CityGrid _grid;
+    private RoadGraph _roadGraph;
     private float _pulseTimer = 0f;
+
+    // Transit route designer draft state
+    private List<int> _draftTransitStops = new List<int>();
+    private List<int> _draftTransitPath = new List<int>();
+    private Color _draftRouteColor = new Color(0.65f, 0.25f, 0.95f);
+    private bool _draftIsLoop = false;
 
     /// <summary>Active tool mode for preview rendering.</summary>
     public InteractionMode Mode { get; private set; } = InteractionMode.Inspect;
@@ -26,11 +33,43 @@ public partial class ToolPreviewRenderer : Node2D
     public List<int> ValidTargetZoneIds { get; private set; } = new List<int>();
 
     /// <summary>
-    /// Initializes the preview renderer with the city grid.
+    /// Initializes the preview renderer with the city grid and road graph.
     /// </summary>
-    public void Initialize(CityGrid grid)
+    public void Initialize(CityGrid grid, RoadGraph roadGraph = null)
     {
         _grid = grid;
+        _roadGraph = roadGraph;
+    }
+
+    /// <summary>
+    /// Updates the road graph reference used for route path previews.
+    /// </summary>
+    public void SetRoadGraph(RoadGraph roadGraph)
+    {
+        _roadGraph = roadGraph;
+    }
+
+    /// <summary>
+    /// Updates the draft transit route stops and path for live rendering.
+    /// </summary>
+    public void SetTransitDraft(List<int> stops, List<int> path, Color color, bool isLoop)
+    {
+        _draftTransitStops = stops != null ? new List<int>(stops) : new List<int>();
+        _draftTransitPath = path != null ? new List<int>(path) : new List<int>();
+        _draftRouteColor = color;
+        _draftIsLoop = isLoop;
+        QueueRedraw();
+    }
+
+    /// <summary>
+    /// Clears the active draft transit route.
+    /// </summary>
+    public void ClearTransitDraft()
+    {
+        _draftTransitStops.Clear();
+        _draftTransitPath.Clear();
+        _draftIsLoop = false;
+        QueueRedraw();
     }
 
     /// <summary>
@@ -41,6 +80,7 @@ public partial class ToolPreviewRenderer : Node2D
         Mode = mode;
         StartZoneId = -1;
         ValidTargetZoneIds.Clear();
+        ClearTransitDraft();
         QueueRedraw();
     }
 
@@ -86,12 +126,13 @@ public partial class ToolPreviewRenderer : Node2D
         StartZoneId = -1;
         HoverZoneId = -1;
         ValidTargetZoneIds.Clear();
+        ClearTransitDraft();
         QueueRedraw();
     }
 
     public override void _Process(double delta)
     {
-        if (StartZoneId != -1 || (IsZoningMode(Mode) && HoverZoneId != -1))
+        if (StartZoneId != -1 || (IsZoningMode(Mode) && HoverZoneId != -1) || Mode == InteractionMode.CreateTransitRoute)
         {
             _pulseTimer += (float)delta * 4f;
             QueueRedraw();
@@ -171,7 +212,101 @@ public partial class ToolPreviewRenderer : Node2D
             return;
         }
 
-        // 2. Road Building & Demolition Previews (Requires StartZoneId)
+        // 2. Transit Route Designer Live Preview
+        if (Mode == InteractionMode.CreateTransitRoute)
+        {
+            // 2a. Draw draft route path corridor
+            if (_draftTransitPath.Count > 1 && _roadGraph != null)
+            {
+                for (int i = 0; i < _draftTransitPath.Count - 1; i++)
+                {
+                    var n1 = _roadGraph.GetNode(_draftTransitPath[i]);
+                    var n2 = _roadGraph.GetNode(_draftTransitPath[i + 1]);
+                    if (n1 != null && n2 != null)
+                    {
+                        DrawLine(n1.WorldPosition, n2.WorldPosition, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.85f), 5.5f, true);
+                        DrawLine(n1.WorldPosition, n2.WorldPosition, Colors.White, 2.0f, true);
+                    }
+                }
+
+                if (_draftIsLoop && _draftTransitPath.Count > 2)
+                {
+                    var first = _roadGraph.GetNode(_draftTransitPath[0]);
+                    var last = _roadGraph.GetNode(_draftTransitPath[_draftTransitPath.Count - 1]);
+                    if (first != null && last != null)
+                    {
+                        DrawLine(last.WorldPosition, first.WorldPosition, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.85f), 5.5f, true);
+                        DrawLine(last.WorldPosition, first.WorldPosition, Colors.White, 2.0f, true);
+                    }
+                }
+            }
+
+            // 2b. Draw hover target indicator over valid road node
+            if (HoverZoneId != -1 && _roadGraph != null && _roadGraph.NodeMap.ContainsKey(HoverZoneId))
+            {
+                var hoverNode = _roadGraph.GetNode(HoverZoneId);
+                if (hoverNode != null)
+                {
+                    Vector2 hoverPos = hoverNode.WorldPosition;
+                    float ringRadius = 10f + Mathf.Sin(_pulseTimer) * 2.5f;
+
+                    // Pulsing hover target circle
+                    DrawArc(hoverPos, ringRadius, 0, Mathf.Tau, 24, _draftRouteColor, 2.5f, true);
+                    DrawCircle(hoverPos, 4.0f, Colors.White);
+
+                    // If we have an existing stop, draw a faint connector line to hovered node
+                    if (_draftTransitStops.Count > 0 && !_draftIsLoop)
+                    {
+                        int lastStopId = _draftTransitStops[_draftTransitStops.Count - 1];
+                        if (lastStopId != HoverZoneId)
+                        {
+                            var lastNode = _roadGraph.GetNode(lastStopId);
+                            if (lastNode != null)
+                            {
+                                DrawLine(lastNode.WorldPosition, hoverPos, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.40f), 2.2f, true);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2c. Draw draft stop markers
+            if (_roadGraph != null)
+            {
+                for (int s = 0; s < _draftTransitStops.Count; s++)
+                {
+                    int stopId = _draftTransitStops[s];
+                    var stopNode = _roadGraph.GetNode(stopId);
+                    if (stopNode != null)
+                    {
+                        Vector2 sPos = stopNode.WorldPosition;
+                        DrawCircle(sPos, 8.5f, _draftRouteColor);
+                        DrawArc(sPos, 8.5f, 0, Mathf.Tau, 20, Colors.White, 2.0f, true);
+
+                        if (s == 0)
+                        {
+                            // Gold origin station ring
+                            DrawArc(sPos, 12.5f, 0, Mathf.Tau, 20, Colors.Gold, 2.2f, true);
+                        }
+
+                        // Stop number
+                        DrawString(
+                            ThemeDB.FallbackFont,
+                            sPos + new Vector2(-4, 4),
+                            (s + 1).ToString(),
+                            HorizontalAlignment.Center,
+                            -1,
+                            10,
+                            Colors.White
+                        );
+                    }
+                }
+            }
+
+            return;
+        }
+
+        // 3. Road Building & Demolition Previews (Requires StartZoneId)
         if (StartZoneId == -1)
             return;
 

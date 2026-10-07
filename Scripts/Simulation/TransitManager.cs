@@ -102,6 +102,11 @@ public class TransitManager
     public Dictionary<int, TransitStop> Stops = new Dictionary<int, TransitStop>();
 
     private Random _random = new Random(123);
+    private int _nextRouteId = 0;
+    private int _nextVehicleId = 0;
+
+    /// <summary>Next available route ID counter.</summary>
+    public int NextRouteId => _nextRouteId;
 
     public void CreateDefaultRoutes(CityGrid grid, RoadGraph graph)
     {
@@ -109,15 +114,15 @@ public class TransitManager
         Vehicles.Clear();
         Stops.Clear();
 
-        int routeIdCounter = 0;
-        int vehicleIdCounter = 0;
+        _nextRouteId = 0;
+        _nextVehicleId = 0;
 
         // =========================================================================
         // ROUTE 1: Trans-City Trunk (Blue Line) - Connects West Homes to East Factories
         // =========================================================================
         var r1 = new TransitRoute
         {
-            Id = routeIdCounter++,
+            Id = _nextRouteId++,
             Name = "Trans-City Express",
             RouteColor = new Color(0.20f, 0.55f, 0.98f),
             FrequencyMinutes = 3.5f,
@@ -150,7 +155,7 @@ public class TransitManager
             r1.AverageOccupancy = 72f;
 
             Routes.Add(r1);
-            DeployLineVehicles(r1, 6, ref vehicleIdCounter);
+            DeployLineVehicles(r1, 6);
         }
 
         // =========================================================================
@@ -158,7 +163,7 @@ public class TransitManager
         // =========================================================================
         var r2 = new TransitRoute
         {
-            Id = routeIdCounter++,
+            Id = _nextRouteId++,
             Name = "West Suburb Feeder",
             RouteColor = new Color(0.95f, 0.22f, 0.22f),
             FrequencyMinutes = 4f,
@@ -190,7 +195,7 @@ public class TransitManager
             r2.AverageOccupancy = 64f;
 
             Routes.Add(r2);
-            DeployLineVehicles(r2, 4, ref vehicleIdCounter);
+            DeployLineVehicles(r2, 4);
         }
 
         // =========================================================================
@@ -198,7 +203,7 @@ public class TransitManager
         // =========================================================================
         var r3 = new TransitRoute
         {
-            Id = routeIdCounter++,
+            Id = _nextRouteId++,
             Name = "Industrial-Downtown Ring",
             RouteColor = new Color(0.18f, 0.88f, 0.38f),
             FrequencyMinutes = 5f,
@@ -240,7 +245,7 @@ public class TransitManager
             r3.AverageOccupancy = 68f;
 
             Routes.Add(r3);
-            DeployLoopVehicles(r3, 6, ref vehicleIdCounter);
+            DeployLoopVehicles(r3, 6);
         }
     }
 
@@ -253,21 +258,144 @@ public class TransitManager
         }
     }
 
-    private void RegisterStop(int nodeId, int zoneId, string name)
+    /// <summary>
+    /// Registers a designated transit stop at the specified road node with an initial passenger queue.
+    /// </summary>
+    public TransitStop RegisterStop(int nodeId, int zoneId, string name)
     {
-        if (!Stops.ContainsKey(nodeId))
+        if (!Stops.TryGetValue(nodeId, out var stop))
         {
-            Stops[nodeId] = new TransitStop
+            stop = new TransitStop
             {
                 NodeId = nodeId,
                 ZoneId = zoneId,
                 WaitingPassengers = 15f + (float)_random.NextDouble() * 20f,
                 Name = name
             };
+            Stops[nodeId] = stop;
+        }
+        return stop;
+    }
+
+    /// <summary>
+    /// Creates, registers, and deploys a new transit route with its initial vehicle fleet.
+    /// </summary>
+    public TransitRoute CreateRoute(
+        string name,
+        List<int> pathNodeIds,
+        IEnumerable<int> stopNodeIds,
+        Color color,
+        bool isLoop,
+        int fleetSize = 4,
+        float ticketPrice = 12f)
+    {
+        if (pathNodeIds == null || pathNodeIds.Count < 2)
+            throw new ArgumentException("A transit route must have at least 2 path nodes.");
+
+        int routeId = _nextRouteId++;
+        var route = new TransitRoute
+        {
+            Id = routeId,
+            Name = string.IsNullOrWhiteSpace(name) ? $"Line {routeId + 1} - Express" : name,
+            PathNodeIds = new List<int>(pathNodeIds),
+            StopNodeIds = new HashSet<int>(stopNodeIds ?? Enumerable.Empty<int>()),
+            RouteColor = color,
+            IsLoop = isLoop,
+            TicketPrice = ticketPrice,
+            FleetSize = fleetSize,
+            RoundTripTimeMinutes = isLoop ? Mathf.Max(20f, pathNodeIds.Count * 2.0f) : Mathf.Max(20f, pathNodeIds.Count * 2.5f),
+            FrequencyMinutes = Mathf.Max(2.5f, 30f / Mathf.Max(fleetSize, 1)),
+            DailyPassengers = 0f,
+            DailyRevenue = 0f,
+            DailyOperatingCost = 0f,
+            AverageOccupancy = 50f
+        };
+
+        // Ensure all stops are registered
+        foreach (int stopNode in route.StopNodeIds)
+        {
+            RegisterStop(stopNode, stopNode, $"Station ({stopNode})");
+        }
+
+        Routes.Add(route);
+        DeployRouteVehicles(route, fleetSize);
+
+        return route;
+    }
+
+    /// <summary>
+    /// Safely removes an existing route, deallocates its assigned vehicles, and cleans up orphaned stops.
+    /// </summary>
+    public bool RemoveRoute(int routeId)
+    {
+        var route = Routes.FirstOrDefault(r => r.Id == routeId);
+        if (route == null) return false;
+
+        Vehicles.RemoveAll(v => v.RouteId == routeId);
+        Routes.Remove(route);
+
+        // Clean up orphaned stops
+        var activeStopNodes = new HashSet<int>();
+        foreach (var r in Routes)
+        {
+            foreach (var s in r.StopNodeIds)
+            {
+                activeStopNodes.Add(s);
+            }
+        }
+
+        var orphanedKeys = Stops.Keys.Where(k => !activeStopNodes.Contains(k)).ToList();
+        foreach (var k in orphanedKeys)
+        {
+            Stops.Remove(k);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Deploys a fleet of vehicles evenly spaced across the specified route.
+    /// </summary>
+    public void DeployRouteVehicles(TransitRoute route, int count)
+    {
+        if (route == null) return;
+        Vehicles.RemoveAll(v => v.RouteId == route.Id);
+        route.FleetSize = count;
+        if (count <= 0 || route.PathNodeIds.Count < 2) return;
+
+        if (route.IsLoop)
+        {
+            DeployLoopVehicles(route, count);
+        }
+        else
+        {
+            DeployLineVehicles(route, count);
         }
     }
 
-    private void DeployLineVehicles(TransitRoute route, int count, ref int vehicleIdCounter)
+    /// <summary>
+    /// Adjusts the fleet size for an existing route and redeploys its vehicles.
+    /// </summary>
+    public bool SetRouteFleetSize(int routeId, int count)
+    {
+        var route = Routes.FirstOrDefault(r => r.Id == routeId);
+        if (route == null) return false;
+        DeployRouteVehicles(route, Mathf.Max(0, count));
+        return true;
+    }
+
+    /// <summary>
+    /// Adjusts the ticket price for an existing route.
+    /// </summary>
+    public bool SetRouteTicketPrice(int routeId, float price)
+    {
+        var route = Routes.FirstOrDefault(r => r.Id == routeId);
+        if (route == null) return false;
+        route.TicketPrice = Mathf.Max(1f, price);
+        return true;
+    }
+
+    private void DeployLineVehicles(TransitRoute route, int count)
     {
         int totalNodes = route.PathNodeIds.Count;
         for (int i = 0; i < count; i++)
@@ -283,7 +411,7 @@ public class TransitManager
 
             Vehicles.Add(new TransitVehicle
             {
-                Id = vehicleIdCounter++,
+                Id = _nextVehicleId++,
                 RouteId = route.Id,
                 CurrentPathIndex = startIdx,
                 ProgressToNext = 0.05f,
@@ -296,7 +424,7 @@ public class TransitManager
         }
     }
 
-    private void DeployLoopVehicles(TransitRoute route, int count, ref int vehicleIdCounter)
+    private void DeployLoopVehicles(TransitRoute route, int count)
     {
         int totalNodes = route.PathNodeIds.Count;
         float spacing = (float)totalNodes / count;
@@ -306,7 +434,7 @@ public class TransitManager
             int idx = Mathf.FloorToInt(i * spacing) % totalNodes;
             Vehicles.Add(new TransitVehicle
             {
-                Id = vehicleIdCounter++,
+                Id = _nextVehicleId++,
                 RouteId = route.Id,
                 CurrentPathIndex = idx,
                 ProgressToNext = 0.05f,
@@ -472,5 +600,37 @@ public class TransitManager
 
         if (residentialZones == 0) return 0f;
         return (float)coveredResidentialZones / residentialZones;
+    }
+
+    /// <summary>
+    /// Returns the set of all zone IDs within walking distance (Manhattan distance <= maxDistance)
+    /// of any active transit stop.
+    /// </summary>
+    public HashSet<int> GetCoveredZoneIds(CityGrid grid, int maxDistance = 3)
+    {
+        var covered = new HashSet<int>();
+        if (Stops.Count == 0 || grid == null) return covered;
+
+        var activeZoneIds = grid.ActiveZoneIds;
+        for (int i = 0; i < activeZoneIds.Count; i++)
+        {
+            int zoneId = activeZoneIds[i];
+            var zone = grid.GetZone(zoneId);
+            if (zone == null || zone.Type == ZoneType.Empty) continue;
+
+            foreach (var stop in Stops.Values)
+            {
+                var stopZone = grid.GetZone(stop.ZoneId);
+                if (stopZone == null) continue;
+
+                int dist = Mathf.Abs(zone.GridPos.X - stopZone.GridPos.X) + Mathf.Abs(zone.GridPos.Y - stopZone.GridPos.Y);
+                if (dist <= maxDistance)
+                {
+                    covered.Add(zoneId);
+                    break;
+                }
+            }
+        }
+        return covered;
     }
 }

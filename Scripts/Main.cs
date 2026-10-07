@@ -36,6 +36,11 @@ public partial class Main : Node2D
     private int _selectedZoneId = -1;
     private InteractionMode _currentMode = InteractionMode.Inspect;
     private int _pendingStartZoneId = -1;
+
+    // Transit Route Designer draft state
+    private List<int> _draftTransitStops = new List<int>();
+    private List<int> _draftTransitPath = new List<int>();
+    private bool _draftIsLoop = false;
     
     public override void _Ready()
     {
@@ -83,7 +88,7 @@ public partial class Main : Node2D
 
         _previewRenderer = new ToolPreviewRenderer();
         AddChild(_previewRenderer);
-        _previewRenderer.Initialize(_grid);
+        _previewRenderer.Initialize(_grid, _roadGraph);
         
         _gameUI = new GameUI();
         AddChild(_gameUI);
@@ -103,6 +108,9 @@ public partial class Main : Node2D
         };
 
         _gameUI.ModeChanged += OnInteractionModeChanged;
+        _gameUI.RouteLaunchRequested += OnRouteLaunchRequested;
+        _gameUI.RouteCancelRequested += OnRouteCancelRequested;
+        _gameUI.RouteDeleted += OnRouteDeleted;
         
         RecalculateODMatrix();
         _gameUI.ShowCityOverview(_grid, _odMatrix);
@@ -137,12 +145,23 @@ public partial class Main : Node2D
     private void CancelPendingOperation()
     {
         _pendingStartZoneId = -1;
+        CancelTransitDraft();
         _previewRenderer.ClearPreview();
+    }
+
+    private void CancelTransitDraft()
+    {
+        _draftTransitStops.Clear();
+        _draftTransitPath.Clear();
+        _draftIsLoop = false;
+        _previewRenderer?.ClearTransitDraft();
+        _gameUI?.UpdateRouteDesignerStatus(0, 0, false);
     }
     
     private void RecalculateODMatrix()
     {
-        _odMatrix.Recalculate(_gameHour, _grid, _distanceMatrix, _transitManager.Routes.Count > 0);
+        var coveredZones = _transitManager.GetCoveredZoneIds(_grid);
+        _odMatrix.Recalculate(_gameHour, _grid, _distanceMatrix, _transitManager.Routes.Count > 0, coveredZones);
         _trafficEngine.AssignFlows(_odMatrix, _roadGraph, _grid);
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
         _carTrafficManager.RefreshBusyEdges(_roadGraph);
@@ -277,6 +296,20 @@ public partial class Main : Node2D
 
     private void HandleRightClick()
     {
+        if (_currentMode == InteractionMode.CreateTransitRoute)
+        {
+            if (_draftTransitStops.Count > 0)
+            {
+                CancelTransitDraft();
+                _gameUI.SetToolHint("🚌 [Transit Designer] Чернетку маршруту скинуто. Клікніть першу зупинку.", new Color(1f, 0.8f, 0.4f));
+            }
+            else
+            {
+                _gameUI.SetInteractionMode(InteractionMode.Inspect);
+            }
+            return;
+        }
+
         CancelPendingOperation();
         if (_currentMode == InteractionMode.Inspect)
         {
@@ -316,6 +349,9 @@ public partial class Main : Node2D
                 break;
             case InteractionMode.Dezone:
                 HandleDezoneClick(gx, gy);
+                break;
+            case InteractionMode.CreateTransitRoute:
+                HandleCreateTransitRouteClick(gx, gy);
                 break;
         }
     }
@@ -636,5 +672,126 @@ public partial class Main : Node2D
         }
 
         return list;
+    }
+
+    private void HandleCreateTransitRouteClick(int gx, int gy)
+    {
+        if (gx < 0 || gx >= _grid.Width || gy < 0 || gy >= _grid.Height)
+        {
+            return;
+        }
+
+        int zoneId = _grid.GetZoneId(gx, gy);
+        if (!_roadGraph.NodeMap.ContainsKey(zoneId))
+        {
+            _gameUI.SetToolHint("⚠️ Click a road intersection/node to add a transit stop.", Colors.Coral);
+            return;
+        }
+
+        if (_draftTransitStops.Count == 0)
+        {
+            // First stop: Route origin
+            _draftTransitStops.Add(zoneId);
+            _draftTransitPath.Add(zoneId);
+            _draftIsLoop = false;
+            _previewRenderer.SetTransitDraft(_draftTransitStops, _draftTransitPath, _gameUI.CurrentRouteDesignerColor, _draftIsLoop);
+            _gameUI.UpdateRouteDesignerStatus(_draftTransitStops.Count, _draftTransitPath.Count, _draftIsLoop);
+            _gameUI.SetToolHint($"🚏 Origin stop set at ({gx}, {gy}). Click the next road intersection.", new Color(0.2f, 1f, 0.7f));
+        }
+        else
+        {
+            int lastStop = _draftTransitStops[_draftTransitStops.Count - 1];
+            if (zoneId == lastStop)
+            {
+                _gameUI.SetToolHint("ℹ️ This node is already the current stop. Click a different road intersection.", Colors.LightGray);
+                return;
+            }
+
+            // Loop closure check: clicking back on origin stop
+            if (zoneId == _draftTransitStops[0] && _draftTransitStops.Count >= 2)
+            {
+                var loopPath = _roadGraph.GetShortestNodePath(lastStop, zoneId);
+                if (loopPath == null || loopPath.Count < 2)
+                {
+                    _gameUI.SetToolHint("⚠️ No road path found to close loop back to start.", Colors.Coral);
+                    return;
+                }
+
+                // Append intermediate nodes (skip start node which is lastStop and end node which is origin)
+                for (int i = 1; i < loopPath.Count - 1; i++)
+                {
+                    _draftTransitPath.Add(loopPath[i]);
+                }
+                _draftIsLoop = true;
+                _previewRenderer.SetTransitDraft(_draftTransitStops, _draftTransitPath, _gameUI.CurrentRouteDesignerColor, _draftIsLoop);
+                _gameUI.UpdateRouteDesignerStatus(_draftTransitStops.Count, _draftTransitPath.Count, _draftIsLoop);
+                _gameUI.SetToolHint("🔄 Closed-loop route ready! Click 'Запустити кільце' to deploy buses.", new Color(0.3f, 1f, 0.5f));
+                return;
+            }
+
+            // Normal next stop along shortest path
+            var segPath = _roadGraph.GetShortestNodePath(lastStop, zoneId);
+            if (segPath == null || segPath.Count < 2)
+            {
+                _gameUI.SetToolHint($"⚠️ No road path found connecting to ({gx}, {gy}). Choose a connected intersection.", Colors.Coral);
+                return;
+            }
+
+            for (int i = 1; i < segPath.Count; i++)
+            {
+                _draftTransitPath.Add(segPath[i]);
+            }
+            _draftTransitStops.Add(zoneId);
+            _draftIsLoop = false;
+            _previewRenderer.SetTransitDraft(_draftTransitStops, _draftTransitPath, _gameUI.CurrentRouteDesignerColor, _draftIsLoop);
+            _gameUI.UpdateRouteDesignerStatus(_draftTransitStops.Count, _draftTransitPath.Count, _draftIsLoop);
+            _gameUI.SetToolHint($"🚏 Stop {_draftTransitStops.Count} added! Click more stops, click start to loop, or click 'Запустити маршрут'.", new Color(0.2f, 1f, 0.7f));
+        }
+    }
+
+    private void OnRouteLaunchRequested(string routeName, Color color)
+    {
+        if (_draftTransitStops.Count < 2 || _draftTransitPath.Count < 2)
+        {
+            _gameUI.SetToolHint("⚠️ At least 2 stops are required to launch a transit route.", Colors.Coral);
+            return;
+        }
+
+        var newRoute = _transitManager.CreateRoute(
+            routeName,
+            _draftTransitPath,
+            _draftTransitStops,
+            color,
+            _draftIsLoop,
+            fleetSize: 4,
+            ticketPrice: 12f
+        );
+
+        CancelTransitDraft();
+        _gameUI.SetInteractionMode(InteractionMode.Inspect);
+        RecalculateODMatrix();
+        _gameUI.UpdateTransitRoutesView();
+        _vehicleRenderer.QueueRedraw();
+        _roadRenderer.Refresh();
+
+        _gameUI.SetToolHint($"🎉 Route '{newRoute.Name}' launched with {newRoute.FleetSize} buses! Transit coverage updated.", new Color(0.3f, 1f, 0.5f));
+    }
+
+    private void OnRouteCancelRequested()
+    {
+        CancelTransitDraft();
+    }
+
+    private void OnRouteDeleted(int routeId)
+    {
+        bool removed = _transitManager.RemoveRoute(routeId);
+        if (removed)
+        {
+            RecalculateODMatrix();
+            _gameUI.UpdateTransitRoutesView();
+            _vehicleRenderer.QueueRedraw();
+            _roadRenderer.Refresh();
+            _gameUI.SetToolHint("🗑️ Route deleted and fleet decommissioned.", new Color(1f, 0.6f, 0.4f));
+        }
     }
 }

@@ -255,6 +255,33 @@ public class RoadGraph
         return path;
     }
 
+    /// <summary>
+    /// Finds the shortest road path between two nodes and returns the sequential list of node IDs.
+    /// If both nodes are the same, returns a single-element list. If no path exists, returns null.
+    /// </summary>
+    public List<int> GetShortestNodePath(int fromNodeId, int toNodeId)
+    {
+        if (!NodeMap.ContainsKey(fromNodeId) || !NodeMap.ContainsKey(toNodeId)) return null;
+        if (fromNodeId == toNodeId) return new List<int> { fromNodeId };
+
+        var edgePath = GetShortestPath(fromNodeId, toNodeId);
+        if (edgePath == null || edgePath.Count == 0) return null;
+
+        var nodePath = new List<int> { fromNodeId };
+        foreach (int eid in edgePath)
+        {
+            if (eid >= 0 && eid < Edges.Count && Edges[eid].ToId != -1)
+            {
+                nodePath.Add(Edges[eid].ToId);
+            }
+            else
+            {
+                return null;
+            }
+        }
+        return nodePath;
+    }
+
     public void BuildPathCache(int zoneCount)
     {
         PathCache.Clear();

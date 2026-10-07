@@ -23,7 +23,9 @@ public enum InteractionMode
     /// <summary>Designate empty or existing cells as Industrial district.</summary>
     ZoneIndustrial,
     /// <summary>Clear existing zoned cell back to empty terrain.</summary>
-    Dezone
+    Dezone,
+    /// <summary>Design and construct a new public transit route with custom stops.</summary>
+    CreateTransitRoute
 }
 
 public partial class GameUI : CanvasLayer
@@ -32,9 +34,22 @@ public partial class GameUI : CanvasLayer
     [Signal] public delegate void HeatmapToggledEventHandler(bool enabled);
     [Signal] public delegate void CommuteInfographicsToggledEventHandler(bool enabled);
     [Signal] public delegate void ModeChangedEventHandler(int mode);
+    [Signal] public delegate void RouteLaunchRequestedEventHandler(string routeName, Color routeColor);
+    [Signal] public delegate void RouteCancelRequestedEventHandler();
+    [Signal] public delegate void RouteDeletedEventHandler(int routeId);
 
     /// <summary>The currently active interaction mode.</summary>
     public InteractionMode CurrentMode { get; private set; } = InteractionMode.Inspect;
+
+    public static readonly (string Name, Color Color)[] RouteColorPalette = new[]
+    {
+        ("🟣 Purple", new Color(0.65f, 0.25f, 0.95f)),
+        ("🟠 Orange", new Color(1.0f, 0.55f, 0.1f)),
+        ("🔷 Cyan", new Color(0.1f, 0.85f, 0.95f)),
+        ("🌸 Magenta", new Color(0.95f, 0.2f, 0.65f)),
+        ("🟡 Amber", new Color(1.0f, 0.8f, 0.15f)),
+        ("🟢 Lime", new Color(0.45f, 0.85f, 0.2f))
+    };
 
     private Button _inspectBtn;
     private Button _buildRoadBtn;
@@ -43,6 +58,7 @@ public partial class GameUI : CanvasLayer
     private Button _zoneComBtn;
     private Button _zoneIndBtn;
     private Button _dezoneBtn;
+    private Button _createRouteBtn;
     
     private Label _timeLabel;
     private Label _popLabel;
@@ -56,6 +72,14 @@ public partial class GameUI : CanvasLayer
 
     private PanelContainer _toolHintPanel;
     private Label _toolHintLabel;
+
+    // Transit Route Designer Panel & Controls
+    private PanelContainer _routeDesignerPanel;
+    private LineEdit _routeNameEdit;
+    private OptionButton _routeColorOption;
+    private Label _routeDesignerStatsLabel;
+    private Button _launchRouteBtn;
+    private Button _cancelRouteBtn;
 
     // Infographic side panel
     private PanelContainer _infoPanel;
@@ -73,14 +97,24 @@ public partial class GameUI : CanvasLayer
     private Label _infoTopDestinations;
     private Label _infoHint;
 
-    // Transit routes analytics labels
+    // Dynamic Transit Routes Analytics
     private Label _transitOverviewLabel;
-    private Label _route1CardLabel;
-    private Label _route2CardLabel;
-    private Label _route3CardLabel;
+    private VBoxContainer _routesCardContainer;
     private Label _transitFinancialSummaryLabel;
 
     private TransitManager _cachedTransitManager;
+
+    public Color CurrentRouteDesignerColor
+    {
+        get
+        {
+            if (_routeColorOption != null && _routeColorOption.Selected >= 0 && _routeColorOption.Selected < RouteColorPalette.Length)
+                return RouteColorPalette[_routeColorOption.Selected].Color;
+            return RouteColorPalette[0].Color;
+        }
+    }
+
+    public string CurrentRouteDesignerName => _routeNameEdit?.Text ?? "Line 4 - Express";
 
     public bool IsInfographicsVisible => _infoPanel.Visible;
 
@@ -235,6 +269,17 @@ public partial class GameUI : CanvasLayer
         _demolishBtn.Pressed += () => SetInteractionMode(InteractionMode.Demolish);
         topHBox.AddChild(_demolishBtn);
 
+        _createRouteBtn = new Button
+        {
+            Text = "🚌 New Route",
+            TooltipText = "Design and Launch Custom Public Transit Route",
+            ToggleMode = true,
+            ButtonGroup = modeGroup,
+            CustomMinimumSize = new Vector2(110, 36)
+        };
+        _createRouteBtn.Pressed += () => SetInteractionMode(InteractionMode.CreateTransitRoute);
+        topHBox.AddChild(_createRouteBtn);
+
         // Tool Instructions Banner (Centered beneath Top Panel)
         _toolHintPanel = new PanelContainer();
         _toolHintPanel.AnchorLeft = 0.5f;
@@ -272,6 +317,85 @@ public partial class GameUI : CanvasLayer
         };
         _toolHintLabel.AddThemeColorOverride("font_color", new Color(0.4f, 0.8f, 1f));
         _toolHintPanel.AddChild(_toolHintLabel);
+
+        // Dedicated Transit Route Designer Toolbar
+        _routeDesignerPanel = new PanelContainer();
+        _routeDesignerPanel.AnchorLeft = 0.5f;
+        _routeDesignerPanel.AnchorRight = 0.5f;
+        _routeDesignerPanel.OffsetLeft = -400;
+        _routeDesignerPanel.OffsetRight = 400;
+        _routeDesignerPanel.OffsetTop = 96;
+        _routeDesignerPanel.OffsetBottom = 142;
+        _routeDesignerPanel.Visible = false;
+
+        var designerStyle = new StyleBoxFlat
+        {
+            BgColor = new Color(0.05f, 0.07f, 0.12f, 0.95f),
+            CornerRadiusTopLeft = 6,
+            CornerRadiusTopRight = 6,
+            CornerRadiusBottomLeft = 6,
+            CornerRadiusBottomRight = 6,
+            ContentMarginLeft = 12,
+            ContentMarginRight = 12,
+            ContentMarginTop = 6,
+            ContentMarginBottom = 6,
+            BorderWidthLeft = 1,
+            BorderWidthRight = 1,
+            BorderWidthTop = 1,
+            BorderWidthBottom = 1,
+            BorderColor = new Color(0.4f, 0.5f, 0.8f, 0.8f)
+        };
+        _routeDesignerPanel.AddThemeStyleboxOverride("panel", designerStyle);
+        AddChild(_routeDesignerPanel);
+
+        var designerHBox = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.Center };
+        designerHBox.AddThemeConstantOverride("separation", 8);
+        _routeDesignerPanel.AddChild(designerHBox);
+
+        designerHBox.AddChild(new Label { Text = "🚌 Маршрут:" });
+
+        _routeNameEdit = new LineEdit
+        {
+            Text = "Line 4 - Express",
+            CustomMinimumSize = new Vector2(130, 30)
+        };
+        designerHBox.AddChild(_routeNameEdit);
+
+        _routeColorOption = new OptionButton { CustomMinimumSize = new Vector2(110, 30) };
+        for (int i = 0; i < RouteColorPalette.Length; i++)
+        {
+            _routeColorOption.AddItem(RouteColorPalette[i].Name, i);
+        }
+        _routeColorOption.Selected = 0;
+        designerHBox.AddChild(_routeColorOption);
+
+        _routeDesignerStatsLabel = new Label
+        {
+            Text = "Зупинок: 0 | Вузлів: 0"
+        };
+        _routeDesignerStatsLabel.AddThemeColorOverride("font_color", new Color(0.3f, 0.9f, 1f));
+        designerHBox.AddChild(_routeDesignerStatsLabel);
+
+        _launchRouteBtn = new Button
+        {
+            Text = "🚀 Запустити маршрут",
+            Disabled = true,
+            CustomMinimumSize = new Vector2(150, 30)
+        };
+        _launchRouteBtn.Pressed += () => EmitSignal(SignalName.RouteLaunchRequested, _routeNameEdit.Text, CurrentRouteDesignerColor);
+        designerHBox.AddChild(_launchRouteBtn);
+
+        _cancelRouteBtn = new Button
+        {
+            Text = "✖ Скасувати",
+            CustomMinimumSize = new Vector2(90, 30)
+        };
+        _cancelRouteBtn.Pressed += () => 
+        {
+            EmitSignal(SignalName.RouteCancelRequested);
+            SetInteractionMode(InteractionMode.Inspect);
+        };
+        designerHBox.AddChild(_cancelRouteBtn);
 
         // =========================================================================
         // BOTTOM-LEFT STATS PANEL
@@ -376,21 +500,36 @@ public partial class GameUI : CanvasLayer
         _transitViewContainer.Visible = false;
         mainVBox.AddChild(_transitViewContainer);
 
-        _transitOverviewLabel = new Label { Text = "🚌 Муніципальна Транспортна Мережа", ThemeTypeVariation = "HeaderMedium" };
+        var transitHeaderHBox = new HBoxContainer();
+        transitHeaderHBox.AddThemeConstantOverride("separation", 8);
+        _transitViewContainer.AddChild(transitHeaderHBox);
+
+        _transitOverviewLabel = new Label { Text = "🚌 Транспортна Мережа", ThemeTypeVariation = "HeaderMedium" };
         _transitOverviewLabel.AddThemeColorOverride("font_color", new Color(0.3f, 0.8f, 1f));
-        _transitViewContainer.AddChild(_transitOverviewLabel);
+        _transitOverviewLabel.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+        transitHeaderHBox.AddChild(_transitOverviewLabel);
 
-        _route1CardLabel = new Label { AutowrapMode = TextServer.AutowrapMode.Word };
-        _route2CardLabel = new Label { AutowrapMode = TextServer.AutowrapMode.Word };
-        _route3CardLabel = new Label { AutowrapMode = TextServer.AutowrapMode.Word };
+        var newRouteTabBtn = new Button { Text = "➕ Новий", TooltipText = "Побудувати новий маршрут" };
+        newRouteTabBtn.Pressed += () => SetInteractionMode(InteractionMode.CreateTransitRoute);
+        transitHeaderHBox.AddChild(newRouteTabBtn);
+
+        var routeScroll = new ScrollContainer
+        {
+            CustomMinimumSize = new Vector2(0, 290),
+            SizeFlagsVertical = Control.SizeFlags.ExpandFill
+        };
+        _transitViewContainer.AddChild(routeScroll);
+
+        _routesCardContainer = new VBoxContainer
+        {
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
+        };
+        _routesCardContainer.AddThemeConstantOverride("separation", 6);
+        routeScroll.AddChild(_routesCardContainer);
+
+        _transitViewContainer.AddChild(new HSeparator());
+
         _transitFinancialSummaryLabel = new Label { AutowrapMode = TextServer.AutowrapMode.Word };
-
-        _transitViewContainer.AddChild(_route1CardLabel);
-        _transitViewContainer.AddChild(new HSeparator());
-        _transitViewContainer.AddChild(_route2CardLabel);
-        _transitViewContainer.AddChild(new HSeparator());
-        _transitViewContainer.AddChild(_route3CardLabel);
-        _transitViewContainer.AddChild(new HSeparator());
         _transitViewContainer.AddChild(_transitFinancialSummaryLabel);
     }
 
@@ -415,56 +554,125 @@ public partial class GameUI : CanvasLayer
 
     public void UpdateTransitRoutesView()
     {
-        if (_cachedTransitManager == null || _cachedTransitManager.Routes.Count == 0) return;
+        if (_routesCardContainer == null) return;
 
-        var r1 = _cachedTransitManager.Routes[0]; // Blue Line
-        var r2 = _cachedTransitManager.Routes.Count > 1 ? _cachedTransitManager.Routes[1] : null; // Red Line
-        var r3 = _cachedTransitManager.Routes.Count > 2 ? _cachedTransitManager.Routes[2] : null; // Green Line
-
-        if (r1 != null)
+        // Clear existing cards
+        foreach (Node child in _routesCardContainer.GetChildren())
         {
-            _route1CardLabel.Text = 
-                $"🔵 {r1.Name}\n" +
-                $"  🔄 Оборот рейсу: {r1.RoundTripTimeMinutes:F0} хв | Рухомий склад: {r1.FleetSize} авт.\n" +
-                $"  👥 Пасажиропотік: {r1.DailyPassengers:N0} пас/добу\n" +
-                $"  💰 Оборот (Дохід): {r1.DailyRevenue:N0} ₴ (тариф {r1.TicketPrice:F0} ₴)\n" +
-                $"  ⛽ Витрати: {r1.DailyOperatingCost:N0} ₴ | Прибуток: +{r1.NetDailyProfit:N0} ₴\n" +
-                $"  📊 Заповненість: {r1.AverageOccupancy:F0}%";
+            _routesCardContainer.RemoveChild(child);
+            child.QueueFree();
         }
 
-        if (r2 != null)
+        if (_cachedTransitManager == null || _cachedTransitManager.Routes.Count == 0)
         {
-            _route2CardLabel.Text = 
-                $"🔴 {r2.Name}\n" +
-                $"  🔄 Оборот рейсу: {r2.RoundTripTimeMinutes:F0} хв | Рухомий склад: {r2.FleetSize} авт.\n" +
-                $"  👥 Пасажиропотік: {r2.DailyPassengers:N0} пас/добу\n" +
-                $"  💰 Оборот (Дохід): {r2.DailyRevenue:N0} ₴\n" +
-                $"  ⛽ Витрати: {r2.DailyOperatingCost:N0} ₴ | Прибуток: +{r2.NetDailyProfit:N0} ₴\n" +
-                $"  📊 Заповненість: {r2.AverageOccupancy:F0}%";
+            var emptyLabel = new Label
+            {
+                Text = "Немає активних маршрутів.\nНатисніть '➕ Новий', щоб прокласти свій перший маршрут!",
+                AutowrapMode = TextServer.AutowrapMode.Word
+            };
+            emptyLabel.AddThemeColorOverride("font_color", Colors.LightGray);
+            _routesCardContainer.AddChild(emptyLabel);
+
+            if (_transitFinancialSummaryLabel != null)
+            {
+                _transitFinancialSummaryLabel.Text = "🏛️ СУМАРНИЙ БЮДЖЕТ ТРАНСПОРТУ: 0 ₴ (0 маршрутів)";
+            }
+            return;
         }
 
-        if (r3 != null)
+        float totalPass = 0f;
+        float totalRev = 0f;
+        float totalCost = 0f;
+
+        foreach (var r in _cachedTransitManager.Routes)
         {
-            _route3CardLabel.Text = 
-                $"🟢 {r3.Name}\n" +
-                $"  🔄 Оборот рейсу: {r3.RoundTripTimeMinutes:F0} хв | Рухомий склад: {r3.FleetSize} авт.\n" +
-                $"  👥 Пасажиропотік: {r3.DailyPassengers:N0} пас/добу\n" +
-                $"  💰 Оборот (Дохід): {r3.DailyRevenue:N0} ₴\n" +
-                $"  ⛽ Витрати: {r3.DailyOperatingCost:N0} ₴ | Прибуток: +{r3.NetDailyProfit:N0} ₴\n" +
-                $"  📊 Заповненість: {r3.AverageOccupancy:F0}%";
+            totalPass += r.DailyPassengers;
+            totalRev += r.DailyRevenue;
+            totalCost += r.DailyOperatingCost;
+
+            var card = new PanelContainer();
+            var cardStyle = new StyleBoxFlat
+            {
+                BgColor = new Color(0.08f, 0.10f, 0.15f, 0.90f),
+                CornerRadiusTopLeft = 4,
+                CornerRadiusTopRight = 4,
+                CornerRadiusBottomLeft = 4,
+                CornerRadiusBottomRight = 4,
+                ContentMarginLeft = 8,
+                ContentMarginRight = 8,
+                ContentMarginTop = 6,
+                ContentMarginBottom = 6,
+                BorderWidthLeft = 3,
+                BorderColor = r.RouteColor
+            };
+            card.AddThemeStyleboxOverride("panel", cardStyle);
+
+            var cardVBox = new VBoxContainer();
+            cardVBox.AddThemeConstantOverride("separation", 4);
+            card.AddChild(cardVBox);
+
+            // Card Header: Badge, Name, Type, Delete Button
+            var cardHeader = new HBoxContainer();
+            cardHeader.AddThemeConstantOverride("separation", 6);
+            cardVBox.AddChild(cardHeader);
+
+            var colorBadge = new Label { Text = "●" };
+            colorBadge.AddThemeColorOverride("font_color", r.RouteColor);
+            cardHeader.AddChild(colorBadge);
+
+            var nameLabel = new Label
+            {
+                Text = r.Name,
+                ThemeTypeVariation = "HeaderSmall",
+                SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
+            };
+            nameLabel.AddThemeColorOverride("font_color", Colors.White);
+            cardHeader.AddChild(nameLabel);
+
+            var typeBadge = new Label
+            {
+                Text = r.IsLoop ? "🔄 Кільце" : "↔ Лінія"
+            };
+            typeBadge.AddThemeColorOverride("font_color", new Color(0.7f, 0.8f, 0.9f));
+            cardHeader.AddChild(typeBadge);
+
+            int routeId = r.Id;
+            var delBtn = new Button
+            {
+                Text = "🗑️",
+                TooltipText = $"Видалити маршрут {r.Name}",
+                CustomMinimumSize = new Vector2(28, 24)
+            };
+            delBtn.Pressed += () => EmitSignal(SignalName.RouteDeleted, routeId);
+            cardHeader.AddChild(delBtn);
+
+            // Card Body: Metrics
+            string sign = r.NetDailyProfit >= 0 ? "+" : "";
+            var detailsLabel = new Label
+            {
+                Text = $"  🔄 Оборот: {r.RoundTripTimeMinutes:F0} хв | Рухомий склад: {r.FleetSize} авт.\n" +
+                       $"  👥 Пасажиропотік: {r.DailyPassengers:N0} пас/добу\n" +
+                       $"  💰 Дохід: {r.DailyRevenue:N0} ₴ (тариф {r.TicketPrice:F0} ₴)\n" +
+                       $"  ⛽ Витрати: {r.DailyOperatingCost:N0} ₴ | Прибуток: {sign}{r.NetDailyProfit:N0} ₴\n" +
+                       $"  📊 Заповненість: {r.AverageOccupancy:F0}%",
+                AutowrapMode = TextServer.AutowrapMode.Word
+            };
+            cardVBox.AddChild(detailsLabel);
+
+            _routesCardContainer.AddChild(card);
         }
 
-        float totalPass = (r1?.DailyPassengers ?? 0) + (r2?.DailyPassengers ?? 0) + (r3?.DailyPassengers ?? 0);
-        float totalRev = (r1?.DailyRevenue ?? 0) + (r2?.DailyRevenue ?? 0) + (r3?.DailyRevenue ?? 0);
-        float totalCost = (r1?.DailyOperatingCost ?? 0) + (r2?.DailyOperatingCost ?? 0) + (r3?.DailyOperatingCost ?? 0);
         float totalProfit = totalRev - totalCost;
-
+        string profitSign = totalProfit >= 0 ? "+" : "";
         _transitFinancialSummaryLabel.Text = 
-            $"🏛️ СУМАРНИЙ БЮДЖЕТ ТРАНСПОРТУ:\n" +
+            $"🏛️ СУМАРНИЙ БЮДЖЕТ ТРАНСПОРТУ ({_cachedTransitManager.Routes.Count} маршрутів):\n" +
             $"  Всього перевезено: {totalPass:N0} пасажирів\n" +
             $"  Денний оборот мережі: {totalRev:N0} ₴\n" +
-            $"  Чистий прибуток департаменту: +{totalProfit:N0} ₴/добу";
-        _transitFinancialSummaryLabel.AddThemeColorOverride("font_color", new Color(0.3f, 1f, 0.4f));
+            $"  Чистий прибуток департаменту: {profitSign}{totalProfit:N0} ₴/добу";
+        _transitFinancialSummaryLabel.AddThemeColorOverride(
+            "font_color",
+            totalProfit >= 0 ? new Color(0.3f, 1f, 0.4f) : new Color(1f, 0.4f, 0.4f)
+        );
     }
 
     public void ShowZoneInfographics(Zone zone, CityGrid grid, ODMatrix od, float[,] distances)
@@ -634,9 +842,55 @@ public partial class GameUI : CanvasLayer
         else if (mode == InteractionMode.ZoneCommercial && _zoneComBtn != null) _zoneComBtn.ButtonPressed = true;
         else if (mode == InteractionMode.ZoneIndustrial && _zoneIndBtn != null) _zoneIndBtn.ButtonPressed = true;
         else if (mode == InteractionMode.Dezone && _dezoneBtn != null) _dezoneBtn.ButtonPressed = true;
+        else if (mode == InteractionMode.CreateTransitRoute && _createRouteBtn != null) _createRouteBtn.ButtonPressed = true;
+
+        if (_routeDesignerPanel != null)
+        {
+            _routeDesignerPanel.Visible = (mode == InteractionMode.CreateTransitRoute);
+            if (mode == InteractionMode.CreateTransitRoute)
+            {
+                ResetRouteDesignerDefaults();
+            }
+        }
 
         UpdateDefaultHintForMode(mode);
         EmitSignal(SignalName.ModeChanged, (int)mode);
+    }
+
+    /// <summary>
+    /// Updates the status text and launch button state in the Route Designer toolbar.
+    /// </summary>
+    public void UpdateRouteDesignerStatus(int stopsCount, int pathNodeCount, bool isLoop)
+    {
+        if (_routeDesignerStatsLabel != null)
+        {
+            string typeStr = isLoop ? "🔄 Кільце" : "↔ Лінія";
+            _routeDesignerStatsLabel.Text = $"Зупинок: {stopsCount} | Вузлів: {pathNodeCount} ({typeStr})";
+        }
+
+        if (_launchRouteBtn != null)
+        {
+            _launchRouteBtn.Disabled = (stopsCount < 2 || pathNodeCount < 2);
+            _launchRouteBtn.Text = isLoop ? "🚀 Запустити кільце" : "🚀 Запустити маршрут";
+        }
+    }
+
+    /// <summary>
+    /// Populates the route designer toolbar with a default route name and color.
+    /// </summary>
+    public void ResetRouteDesignerDefaults()
+    {
+        int routeNum = (_cachedTransitManager?.Routes.Count ?? 3) + 1;
+        if (_routeNameEdit != null)
+        {
+            _routeNameEdit.Text = $"Line {routeNum} - Express";
+        }
+        if (_routeColorOption != null)
+        {
+            int colorIdx = (_cachedTransitManager?.Routes.Count ?? 3) % RouteColorPalette.Length;
+            _routeColorOption.Selected = colorIdx;
+        }
+        UpdateRouteDesignerStatus(0, 0, false);
     }
 
     private void UpdateDefaultHintForMode(InteractionMode mode)
@@ -663,6 +917,9 @@ public partial class GameUI : CanvasLayer
                 break;
             case InteractionMode.Dezone:
                 SetToolHint("🧹 [Dezone] Click on any zoned cell to clear it back to Empty terrain.", new Color(1.0f, 0.45f, 0.45f));
+                break;
+            case InteractionMode.CreateTransitRoute:
+                SetToolHint("🚌 [Transit Designer] Клікніть на перехрестя/вузли дороги, щоб додати зупинки та побудувати лінію автобуса.", new Color(0.3f, 0.9f, 1.0f));
                 break;
         }
     }
