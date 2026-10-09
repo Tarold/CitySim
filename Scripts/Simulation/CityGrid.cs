@@ -23,7 +23,18 @@ public class CityGrid
             for (int x = 0; x < Width; x++)
             {
                 int id = GetZoneId(x, y);
-                Zones[id] = new Zone(id, ZoneType.Empty, new Vector2I(x, y));
+                ZoneType type = ZoneType.Empty;
+
+                if ((x == 0 && y == height / 2) || (x == width - 1 && y == height / 2))
+                {
+                    type = ZoneType.Entrance;
+                }
+
+                Zones[id] = new Zone(id, type, new Vector2I(x, y));
+                if (type != ZoneType.Empty)
+                {
+                    ActiveZoneIds.Add(id);
+                }
             }
         }
     }
@@ -104,18 +115,27 @@ public class CityGrid
         switch (type)
         {
             case ZoneType.Residential:
-                zone.Population = population > 0 ? population : DefaultResidentialPopulation;
+                zone.ResidentialCap = population > 0 ? population : DefaultResidentialPopulation;
+                zone.Population = 0; // Starts at 0, grows gradually
                 zone.Jobs = 0;
                 zone.CommercialCap = 0;
                 break;
             case ZoneType.Commercial:
+                zone.ResidentialCap = 0;
                 zone.Population = 0;
                 zone.Jobs = jobs > 0 ? jobs : DefaultCommercialJobs;
                 zone.CommercialCap = commercialCap >= 0 ? commercialCap : DefaultCommercialCapacity;
                 break;
             case ZoneType.Industrial:
+                zone.ResidentialCap = 0;
                 zone.Population = 0;
                 zone.Jobs = jobs > 0 ? jobs : DefaultIndustrialJobs;
+                zone.CommercialCap = 0;
+                break;
+            case ZoneType.Entrance:
+                zone.ResidentialCap = 0;
+                zone.Population = 0;
+                zone.Jobs = 0;
                 zone.CommercialCap = 0;
                 break;
         }
@@ -148,6 +168,7 @@ public class CityGrid
 
         zone.Type = ZoneType.Empty;
         zone.Population = 0;
+        zone.ResidentialCap = 0;
         zone.Jobs = 0;
         zone.CommercialCap = 0;
         ActiveZoneIds.Remove(zoneId);
@@ -163,19 +184,24 @@ public class CityGrid
             {
                 int id = GetZoneId(x, y);
                 ZoneType type = ZoneType.Empty;
-                int pop = 0;
+                int resCap = 0;
                 int jobs = 0;
                 int cap = 0;
 
+                // Add City Entrances at the edges of the grid
+                if ((x == 1 && y == 10) || (x == 18 && y == 10) || (x == 10 && y == 1) || (x == 10 && y == 18))
+                {
+                    type = ZoneType.Entrance;
+                }
                 // Margins: leave border cells empty
-                if (x >= 2 && x <= 17 && y >= 2 && y <= 17)
+                else if (x >= 2 && x <= 17 && y >= 2 && y <= 17)
                 {
                     // 1. WEST SIDE: RESIDENTIAL DISTRICT (Green sleep suburbs & apartments)
                     if (x >= 2 && x <= 7)
                     {
                         type = ZoneType.Residential;
                         bool isHighDensity = (x >= 4 && x <= 7) && (y >= 4 && y <= 15);
-                        pop = isHighDensity ? 14000 : 7000;
+                        resCap = isHighDensity ? 14000 : 7000;
                     }
                     // 2. CENTRAL SECTOR: COMMERCIAL DOWNTOWN (Blue office towers & shops)
                     else if (x >= 8 && x <= 11)
@@ -193,7 +219,8 @@ public class CityGrid
                 }
 
                 Zones[id].Type = type;
-                Zones[id].Population = pop;
+                Zones[id].ResidentialCap = resCap;
+                Zones[id].Population = 0; // Starts empty
                 Zones[id].Jobs = jobs;
                 Zones[id].CommercialCap = cap;
 

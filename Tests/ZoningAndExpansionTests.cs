@@ -34,11 +34,12 @@ public class ZoningAndExpansionTests
 
         Assert.That(success, Is.True);
         Assert.That(_grid.Zones[id].Type, Is.EqualTo(ZoneType.Residential));
-        Assert.That(_grid.Zones[id].Population, Is.EqualTo(CityGrid.DefaultResidentialPopulation));
+        Assert.That(_grid.Zones[id].ResidentialCap, Is.EqualTo(CityGrid.DefaultResidentialPopulation));
+        Assert.That(_grid.Zones[id].Population, Is.EqualTo(0));
         Assert.That(_grid.Zones[id].Jobs, Is.EqualTo(0));
         Assert.That(_grid.Zones[id].CommercialCap, Is.EqualTo(0));
         Assert.That(_grid.ActiveZoneIds.Contains(id), Is.True);
-        Assert.That(_grid.TotalPopulation(), Is.EqualTo(CityGrid.DefaultResidentialPopulation));
+        Assert.That(_grid.TotalPopulation(), Is.EqualTo(0));
     }
 
     [Test]
@@ -84,7 +85,8 @@ public class ZoningAndExpansionTests
         int y = 3;
         int id = _grid.GetZoneId(x, y);
 
-        _grid.ZoneCell(x, y, ZoneType.Residential);
+        _grid.ZoneCell(x, y, ZoneType.Residential); int _zId = _grid.GetZoneId(x, y); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
+        _grid.Zones[id].Population = _grid.Zones[id].ResidentialCap; // Simulate
         Assert.That(_grid.ActiveZoneIds.Contains(id), Is.True);
         Assert.That(_grid.TotalPopulation(), Is.GreaterThan(0));
 
@@ -106,7 +108,7 @@ public class ZoningAndExpansionTests
         int y = 2;
         int id = _grid.GetZoneId(x, y);
 
-        _grid.ZoneCell(x, y, ZoneType.Residential);
+        _grid.ZoneCell(x, y, ZoneType.Residential); int _zId = _grid.GetZoneId(x, y); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
         Assert.That(_grid.TotalPopulation(), Is.EqualTo(CityGrid.DefaultResidentialPopulation));
         Assert.That(_grid.TotalJobs(), Is.EqualTo(0));
 
@@ -197,7 +199,7 @@ public class ZoningAndExpansionTests
         int rId = _grid.GetZoneId(1, 1);
         int cId = _grid.GetZoneId(1, 2);
 
-        _grid.ZoneCell(1, 1, ZoneType.Residential);
+        _grid.ZoneCell(1, 1, ZoneType.Residential); int _zId = _grid.GetZoneId(1, 1); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
         _grid.ZoneCell(1, 2, ZoneType.Commercial);
 
         _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
@@ -222,7 +224,7 @@ public class ZoningAndExpansionTests
         int rId = _grid.GetZoneId(1, 1);
         int cId = _grid.GetZoneId(1, 2);
 
-        _grid.ZoneCell(1, 1, ZoneType.Residential);
+        _grid.ZoneCell(1, 1, ZoneType.Residential); int _zId = _grid.GetZoneId(1, 1); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
         _grid.ZoneCell(1, 2, ZoneType.Commercial);
 
         _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
@@ -279,7 +281,7 @@ public class ZoningAndExpansionTests
         int rId = _grid.GetZoneId(2, 2);
         int cId = _grid.GetZoneId(2, 3);
 
-        _grid.ZoneCell(2, 2, ZoneType.Residential);
+        _grid.ZoneCell(2, 2, ZoneType.Residential); int _zId = _grid.GetZoneId(2, 2); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
         _grid.ZoneCell(2, 3, ZoneType.Commercial);
 
         _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
@@ -319,7 +321,15 @@ public class ZoningAndExpansionTests
 
         int edgeId = _roadGraph.FindEdgeId(z1, z2);
         Assert.That(edgeId, Is.Not.EqualTo(-1));
-        carMgr.Cars[0].EdgeId = edgeId;
+        _roadGraph.Edges[edgeId].CurrentVolume = 10f;
+        if (carMgr.Cars.Count == 0)
+        {
+            carMgr.Cars.Add(new VisualCar { EdgeId = edgeId });
+        }
+        else
+        {
+            carMgr.Cars[0].EdgeId = edgeId;
+        }
 
         // Detach node
         _roadGraph.DetachAndRemoveNode(z1);
@@ -338,7 +348,7 @@ public class ZoningAndExpansionTests
         int rId = _grid.GetZoneId(3, 3);
         int cId = _grid.GetZoneId(3, 4);
 
-        _grid.ZoneCell(3, 3, ZoneType.Residential);
+        _grid.ZoneCell(3, 3, ZoneType.Residential); int _zId = _grid.GetZoneId(3, 3); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
         _grid.ZoneCell(3, 4, ZoneType.Commercial);
 
         _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));

@@ -43,6 +43,7 @@ public partial class CityRenderer : Node2D
                     ZoneType.Residential => new Color(0.18f, 0.58f, 0.28f), // Forest Green
                     ZoneType.Commercial  => new Color(0.20f, 0.45f, 0.85f), // Corporate Blue
                     ZoneType.Industrial  => new Color(0.85f, 0.55f, 0.15f), // Amber / Industrial Orange
+                    ZoneType.Entrance    => new Color(0.6f, 0.2f, 0.8f), // Purple Entrance
                     _ => new Color(0.12f, 0.12f, 0.14f)                     // Background terrain
                 };
                 

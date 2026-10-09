@@ -10,7 +10,11 @@ public class ODMatrix
     public float[,] Trips;
     public float[,] CarTrips;
     public float[,] TransitTrips;
+    public float[,] WalkTrips;
     public float TotalTrips;
+    public float TotalCarTrips;
+    public float TotalTransitTrips;
+    public float TotalWalkTrips;
     public float CurrentHour;
 
     public ODMatrix(int zoneCount)
@@ -19,6 +23,7 @@ public class ODMatrix
         Trips = new float[zoneCount, zoneCount];
         CarTrips = new float[zoneCount, zoneCount];
         TransitTrips = new float[zoneCount, zoneCount];
+        WalkTrips = new float[zoneCount, zoneCount];
     }
 
     /// <summary>
@@ -105,7 +110,15 @@ public class ODMatrix
         };
     }
 
-    public void Recalculate(float hour, CityGrid grid, float[,] distances, bool hasTransit, HashSet<int> coveredZoneIds = null)
+    public void Recalculate(
+        float hour,
+        CityGrid grid,
+        float[,] distances,
+        bool hasTransit,
+        HashSet<int> coveredZoneIds = null,
+        float averageTicketPrice = 12f,
+        float[,] walkingDistances = null,
+        TransitManager transitManager = null)
     {
         CurrentHour = hour;
         float demandMult = GetDemandMultiplier(hour);
@@ -114,7 +127,11 @@ public class ODMatrix
         Array.Clear(Trips, 0, Trips.Length);
         Array.Clear(CarTrips, 0, CarTrips.Length);
         Array.Clear(TransitTrips, 0, TransitTrips.Length);
+        Array.Clear(WalkTrips, 0, WalkTrips.Length);
         TotalTrips = 0f;
+        TotalCarTrips = 0f;
+        TotalTransitTrips = 0f;
+        TotalWalkTrips = 0f;
 
         // 1. Calculate raw gravity attraction only for active populated zones
         float rawTotalScore = 0f;
@@ -164,54 +181,135 @@ public class ODMatrix
         float normalizationScale = rawTotalScore > 0f ? (targetHourlyTrips / rawTotalScore) : 0f;
 
         float actualTotalTrips = 0f;
+        float actualTotalCar = 0f;
+        float actualTotalTransit = 0f;
+        float actualTotalWalk = 0f;
+
         for (int a = 0; a < activeCount; a++)
         {
             int i = activeIds[a];
+            var zoneI = grid.GetZone(i);
+
             for (int b = 0; b < activeCount; b++)
             {
+                if (a == b) continue;
                 int j = activeIds[b];
+                var zoneJ = grid.GetZone(j);
+
                 float score = Trips[i, j];
                 if (score <= 0f) continue;
 
+                float travelTime = distances[i, j];
                 float finalTrips = score * normalizationScale;
                 Trips[i, j] = finalTrips;
 
-                if (coveredZoneIds != null && coveredZoneIds.Count > 0)
+                // -------------------------------------------------------------
+                // 3-Mode Multinomial Choice Model (Walk, Car, Transit)
+                // -------------------------------------------------------------
+                float walkTime = (walkingDistances != null && walkingDistances[i, j] < float.MaxValue)
+                    ? walkingDistances[i, j]
+                    : (travelTime * 10f);
+
+                // A. Pure Walking generalized cost (zero fare, high distance penalty)
+                float walkCost = walkTime * 0.9f + Mathf.Pow(Mathf.Max(0f, walkTime - 25f), 1.5f) * 0.7f;
+
+                // B. Private Car generalized cost (vehicle travel time + operating cost/parking)
+                float carCost = (travelTime * 1.4f) + 22.0f;
+
+                // C. Multimodal Transit generalized cost (Access Walk + Wait + In-Vehicle + Fare + Egress Walk)
+                float transitCost;
+                if (transitManager != null && transitManager.Routes.Count > 0)
+                {
+                    float bestAccessDist = float.MaxValue;
+                    float bestEgressDist = float.MaxValue;
+
+                    foreach (var stop in transitManager.Stops.Values)
+                    {
+                        var sZone = grid.GetZone(stop.ZoneId);
+                        if (sZone == null) continue;
+                        int dI = Mathf.Abs(zoneI.GridPos.X - sZone.GridPos.X) + Mathf.Abs(zoneI.GridPos.Y - sZone.GridPos.Y);
+                        if (dI < bestAccessDist) bestAccessDist = dI;
+                        int dJ = Mathf.Abs(zoneJ.GridPos.X - sZone.GridPos.X) + Mathf.Abs(zoneJ.GridPos.Y - sZone.GridPos.Y);
+                        if (dJ < bestEgressDist) bestEgressDist = dJ;
+                    }
+
+                    if (bestAccessDist > 3.5f || bestEgressDist > 3.5f)
+                    {
+                        // Outside walking catchment of transit stops
+                        transitCost = 500f;
+                    }
+                    else
+                    {
+                        float accessWalk = bestAccessDist * 12.8f;
+                        float egressWalk = bestEgressDist * 12.8f;
+                        float waitTime = 5.0f;
+                        float inVeh = travelTime * 1.15f;
+                        transitCost = averageTicketPrice + (accessWalk + egressWalk) * 0.8f + (waitTime * 1.2f) + (inVeh * 1.0f);
+                    }
+                }
+                else if (coveredZoneIds != null && coveredZoneIds.Count > 0)
                 {
                     bool originCovered = coveredZoneIds.Contains(i);
                     bool destCovered = coveredZoneIds.Contains(j);
 
                     if (originCovered && destCovered)
                     {
-                        TransitTrips[i, j] = finalTrips * 0.40f;
-                        CarTrips[i, j] = finalTrips * 0.60f;
+                        transitCost = averageTicketPrice + 10.0f + (travelTime * 1.15f);
                     }
                     else if (originCovered || destCovered)
                     {
-                        TransitTrips[i, j] = finalTrips * 0.15f;
-                        CarTrips[i, j] = finalTrips * 0.85f;
+                        transitCost = averageTicketPrice + 25.0f + (travelTime * 1.15f);
                     }
                     else
                     {
-                        TransitTrips[i, j] = 0f;
-                        CarTrips[i, j] = finalTrips;
+                        transitCost = 500f;
                     }
                 }
                 else if (hasTransit)
                 {
-                    TransitTrips[i, j] = finalTrips * 0.35f;
-                    CarTrips[i, j] = finalTrips * 0.65f;
+                    transitCost = averageTicketPrice + 35.0f + (travelTime * 1.15f);
                 }
                 else
                 {
-                    TransitTrips[i, j] = 0f;
-                    CarTrips[i, j] = finalTrips;
+                    transitCost = 500f;
                 }
 
+                // Multinomial Logit calculation
+                float lambda = 0.08f;
+                float uWalk = -walkCost * lambda;
+                float uCar = -carCost * lambda;
+                float uTransit = -transitCost * lambda;
+
+                float uMax = Mathf.Max(uWalk, Mathf.Max(uCar, uTransit));
+                float expWalk = Mathf.Exp(uWalk - uMax);
+                float expCar = Mathf.Exp(uCar - uMax);
+                float expTransit = Mathf.Exp(uTransit - uMax);
+                float sumExp = expWalk + expCar + expTransit;
+
+                float pWalk = expWalk / sumExp;
+                float pCar = expCar / sumExp;
+                float pTransit = expTransit / sumExp;
+
+                // Exact trip conservation: Walk + Car + Transit == finalTrips
+                float wTrips = finalTrips * pWalk;
+                float cTrips = finalTrips * pCar;
+                float tTrips = finalTrips - wTrips - cTrips;
+                if (tTrips < 0f) tTrips = 0f;
+
+                WalkTrips[i, j] = wTrips;
+                CarTrips[i, j] = cTrips;
+                TransitTrips[i, j] = tTrips;
+
                 actualTotalTrips += finalTrips;
+                actualTotalWalk += wTrips;
+                actualTotalCar += cTrips;
+                actualTotalTransit += tTrips;
             }
         }
 
         TotalTrips = actualTotalTrips;
+        TotalWalkTrips = actualTotalWalk;
+        TotalCarTrips = actualTotalCar;
+        TotalTransitTrips = actualTotalTransit;
     }
 }

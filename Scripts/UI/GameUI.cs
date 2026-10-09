@@ -33,6 +33,7 @@ public partial class GameUI : CanvasLayer
     [Signal] public delegate void SpeedChangedEventHandler(float speed);
     [Signal] public delegate void HeatmapToggledEventHandler(bool enabled);
     [Signal] public delegate void CommuteInfographicsToggledEventHandler(bool enabled);
+    [Signal] public delegate void TransitRoutesToggledEventHandler(bool enabled);
     [Signal] public delegate void ModeChangedEventHandler(int mode);
     [Signal] public delegate void RouteLaunchRequestedEventHandler(string routeName, Color routeColor);
     [Signal] public delegate void RouteCancelRequestedEventHandler();
@@ -52,18 +53,15 @@ public partial class GameUI : CanvasLayer
     };
 
     private Button _inspectBtn;
-    private Button _buildRoadBtn;
-    private Button _demolishBtn;
-    private Button _zoneResBtn;
-    private Button _zoneComBtn;
-    private Button _zoneIndBtn;
-    private Button _dezoneBtn;
-    private Button _createRouteBtn;
+    private MenuButton _zoningMenu;
+    private MenuButton _roadsMenu;
+    private MenuButton _transitMenu;
     
     private Label _timeLabel;
     private Label _popLabel;
     private Label _tripsLabel;
     private Label _congLabel;
+    private Label _moneyLabel;
     
     private Label _ridershipLabel;
     private Label _coverageLabel;
@@ -102,7 +100,28 @@ public partial class GameUI : CanvasLayer
     private VBoxContainer _routesCardContainer;
     private Label _transitFinancialSummaryLabel;
 
+    // Economy View
+    private Button _tabEconomyBtn;
+    private VBoxContainer _economyViewContainer;
+    private HSlider _taxPopSlider;
+    private HSlider _taxJobSlider;
+    private HSlider _ticketSlider;
+    private Label _taxPopLabel;
+    private Label _taxJobLabel;
+    private Label _ticketLabel;
+
     private TransitManager _cachedTransitManager;
+    private EconomyManager _cachedEconomyManager;
+
+    public void SetEconomyManager(EconomyManager em)
+    {
+        _cachedEconomyManager = em;
+        if (_cachedEconomyManager != null && _taxPopSlider != null)
+        {
+            _taxPopSlider.Value = _cachedEconomyManager.TaxPerPopulation;
+            _taxJobSlider.Value = _cachedEconomyManager.TaxPerJob;
+        }
+    }
 
     public Color CurrentRouteDesignerColor
     {
@@ -153,11 +172,14 @@ public partial class GameUI : CanvasLayer
         _popLabel = new Label { Text = "Pop: 1,008,000" };
         _tripsLabel = new Label { Text = "Trips: 0/h" };
         _congLabel = new Label { Text = "Congestion: 0%" };
+        _moneyLabel = new Label { Text = "$50,000", ThemeTypeVariation = "HeaderLarge" };
+        _moneyLabel.AddThemeColorOverride("font_color", Colors.LightGreen);
 
         topHBox.AddChild(_timeLabel);
         topHBox.AddChild(_popLabel);
         topHBox.AddChild(_tripsLabel);
         topHBox.AddChild(_congLabel);
+        topHBox.AddChild(_moneyLabel);
 
         var spacer = new Control { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
         topHBox.AddChild(spacer);
@@ -185,6 +207,10 @@ public partial class GameUI : CanvasLayer
         };
         topHBox.AddChild(infoBtn);
 
+        var transitLinesBtn = new Button { Text = "🚌 Лінії", ToggleMode = true, ButtonPressed = true, CustomMinimumSize = new Vector2(100, 36) };
+        transitLinesBtn.Toggled += (bool pressed) => EmitSignal(SignalName.TransitRoutesToggled, pressed);
+        topHBox.AddChild(transitLinesBtn);
+
         // ---- Interaction Mode Buttons (mutually exclusive via ButtonGroup) ----
         var modeSpacer = new VSeparator();
         topHBox.AddChild(modeSpacer);
@@ -203,82 +229,25 @@ public partial class GameUI : CanvasLayer
         _inspectBtn.Pressed += () => SetInteractionMode(InteractionMode.Inspect);
         topHBox.AddChild(_inspectBtn);
 
-        _zoneResBtn = new Button
-        {
-            Text = "🏡 Res",
-            TooltipText = "Zone Residential District (Green)",
-            ToggleMode = true,
-            ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(72, 36)
-        };
-        _zoneResBtn.Pressed += () => SetInteractionMode(InteractionMode.ZoneResidential);
-        topHBox.AddChild(_zoneResBtn);
+        _zoningMenu = new MenuButton { Text = "🏡 Zoning ▾", CustomMinimumSize = new Vector2(100, 36) };
+        _zoningMenu.GetPopup().AddItem("🏡 Residential", (int)InteractionMode.ZoneResidential);
+        _zoningMenu.GetPopup().AddItem("🏢 Commercial", (int)InteractionMode.ZoneCommercial);
+        _zoningMenu.GetPopup().AddItem("🏭 Industrial", (int)InteractionMode.ZoneIndustrial);
+        _zoningMenu.GetPopup().AddSeparator();
+        _zoningMenu.GetPopup().AddItem("🧹 Dezone", (int)InteractionMode.Dezone);
+        _zoningMenu.GetPopup().IdPressed += (id) => SetInteractionMode((InteractionMode)id);
+        topHBox.AddChild(_zoningMenu);
 
-        _zoneComBtn = new Button
-        {
-            Text = "🏢 Com",
-            TooltipText = "Zone Commercial District (Blue)",
-            ToggleMode = true,
-            ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(72, 36)
-        };
-        _zoneComBtn.Pressed += () => SetInteractionMode(InteractionMode.ZoneCommercial);
-        topHBox.AddChild(_zoneComBtn);
+        _roadsMenu = new MenuButton { Text = "🛣️ Roads ▾", CustomMinimumSize = new Vector2(100, 36) };
+        _roadsMenu.GetPopup().AddItem("🛣️ Build Road", (int)InteractionMode.BuildRoad);
+        _roadsMenu.GetPopup().AddItem("💥 Demolish", (int)InteractionMode.Demolish);
+        _roadsMenu.GetPopup().IdPressed += (id) => SetInteractionMode((InteractionMode)id);
+        topHBox.AddChild(_roadsMenu);
 
-        _zoneIndBtn = new Button
-        {
-            Text = "🏭 Ind",
-            TooltipText = "Zone Industrial District (Amber)",
-            ToggleMode = true,
-            ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(72, 36)
-        };
-        _zoneIndBtn.Pressed += () => SetInteractionMode(InteractionMode.ZoneIndustrial);
-        topHBox.AddChild(_zoneIndBtn);
-
-        _dezoneBtn = new Button
-        {
-            Text = "🧹 Dezone",
-            TooltipText = "Clear / Dezone Grid Tile to Empty Terrain",
-            ToggleMode = true,
-            ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(85, 36)
-        };
-        _dezoneBtn.Pressed += () => SetInteractionMode(InteractionMode.Dezone);
-        topHBox.AddChild(_dezoneBtn);
-
-        _buildRoadBtn = new Button
-        {
-            Text = "🛣️ Road",
-            TooltipText = "Construct Road Between Adjacent Cells",
-            ToggleMode = true,
-            ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(75, 36)
-        };
-        _buildRoadBtn.Pressed += () => SetInteractionMode(InteractionMode.BuildRoad);
-        topHBox.AddChild(_buildRoadBtn);
-
-        _demolishBtn = new Button
-        {
-            Text = "💥 Demolish",
-            TooltipText = "Demolish Road Connection",
-            ToggleMode = true,
-            ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(92, 36)
-        };
-        _demolishBtn.Pressed += () => SetInteractionMode(InteractionMode.Demolish);
-        topHBox.AddChild(_demolishBtn);
-
-        _createRouteBtn = new Button
-        {
-            Text = "🚌 New Route",
-            TooltipText = "Design and Launch Custom Public Transit Route",
-            ToggleMode = true,
-            ButtonGroup = modeGroup,
-            CustomMinimumSize = new Vector2(110, 36)
-        };
-        _createRouteBtn.Pressed += () => SetInteractionMode(InteractionMode.CreateTransitRoute);
-        topHBox.AddChild(_createRouteBtn);
+        _transitMenu = new MenuButton { Text = "🚌 Transit ▾", CustomMinimumSize = new Vector2(110, 36) };
+        _transitMenu.GetPopup().AddItem("🚌 New Route", (int)InteractionMode.CreateTransitRoute);
+        _transitMenu.GetPopup().IdPressed += (id) => SetInteractionMode((InteractionMode)id);
+        topHBox.AddChild(_transitMenu);
 
         // Tool Instructions Banner (Centered beneath Top Panel)
         _toolHintPanel = new PanelContainer();
@@ -444,14 +413,17 @@ public partial class GameUI : CanvasLayer
         tabHBox.AddThemeConstantOverride("separation", 8);
         mainVBox.AddChild(tabHBox);
 
-        _tabCommuteBtn = new Button { Text = "🧭 Шляхи та Робота", SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
-        _tabTransitBtn = new Button { Text = "🚌 Обороти Маршрутів", SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
+        _tabCommuteBtn = new Button { Text = "🧭 Шляхи", SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
+        _tabTransitBtn = new Button { Text = "🚌 Маршрути", SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
+        _tabEconomyBtn = new Button { Text = "💰 Економіка", SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
 
         _tabCommuteBtn.Pressed += SwitchToCommuteTab;
         _tabTransitBtn.Pressed += SwitchToTransitTab;
+        _tabEconomyBtn.Pressed += SwitchToEconomyTab;
 
         tabHBox.AddChild(_tabCommuteBtn);
         tabHBox.AddChild(_tabTransitBtn);
+        tabHBox.AddChild(_tabEconomyBtn);
 
         var tabSep = new HSeparator();
         mainVBox.AddChild(tabSep);
@@ -531,19 +503,76 @@ public partial class GameUI : CanvasLayer
 
         _transitFinancialSummaryLabel = new Label { AutowrapMode = TextServer.AutowrapMode.Word };
         _transitViewContainer.AddChild(_transitFinancialSummaryLabel);
+
+        // Container 3: Economy View
+        _economyViewContainer = new VBoxContainer();
+        _economyViewContainer.AddThemeConstantOverride("separation", 12);
+        _economyViewContainer.Visible = false;
+        mainVBox.AddChild(_economyViewContainer);
+
+        var econTitle = new Label { Text = "💰 Економіка та Податки", ThemeTypeVariation = "HeaderMedium" };
+        econTitle.AddThemeColorOverride("font_color", Colors.Gold);
+        _economyViewContainer.AddChild(econTitle);
+
+        _taxPopLabel = new Label { Text = "Податок на жителя: 0.05 ₴" };
+        _taxPopSlider = new HSlider { MinValue = 0.01, MaxValue = 0.50, Step = 0.01, Value = 0.05 };
+        _taxPopSlider.ValueChanged += (v) => { _taxPopLabel.Text = $"Податок на жителя: {v:F2} ₴"; UpdateEconomySettings(); };
+        _economyViewContainer.AddChild(_taxPopLabel);
+        _economyViewContainer.AddChild(_taxPopSlider);
+
+        _taxJobLabel = new Label { Text = "Податок на бізнес: 0.10 ₴" };
+        _taxJobSlider = new HSlider { MinValue = 0.01, MaxValue = 0.50, Step = 0.01, Value = 0.10 };
+        _taxJobSlider.ValueChanged += (v) => { _taxJobLabel.Text = $"Податок на бізнес: {v:F2} ₴"; UpdateEconomySettings(); };
+        _economyViewContainer.AddChild(_taxJobLabel);
+        _economyViewContainer.AddChild(_taxJobSlider);
+
+        _economyViewContainer.AddChild(new HSeparator());
+
+        _ticketLabel = new Label { Text = "Тариф на проїзд (всі маршрути): 12 ₴" };
+        _ticketSlider = new HSlider { MinValue = 1.0, MaxValue = 50.0, Step = 1.0, Value = 12.0 };
+        _ticketSlider.ValueChanged += (v) => { _ticketLabel.Text = $"Тариф на проїзд (всі маршрути): {v:F0} ₴"; UpdateEconomySettings(); };
+        _economyViewContainer.AddChild(_ticketLabel);
+        _economyViewContainer.AddChild(_ticketSlider);
+    }
+
+    private void UpdateEconomySettings()
+    {
+        if (_cachedEconomyManager != null)
+        {
+            _cachedEconomyManager.TaxPerPopulation = (float)_taxPopSlider.Value;
+            _cachedEconomyManager.TaxPerJob = (float)_taxJobSlider.Value;
+        }
+        if (_cachedTransitManager != null)
+        {
+            foreach (var r in _cachedTransitManager.Routes)
+            {
+                r.TicketPrice = (float)_ticketSlider.Value;
+            }
+            if (_transitViewContainer.Visible)
+                UpdateTransitRoutesView();
+        }
     }
 
     private void SwitchToCommuteTab()
     {
         _commuteViewContainer.Visible = true;
         _transitViewContainer.Visible = false;
+        if (_economyViewContainer != null) _economyViewContainer.Visible = false;
     }
 
     private void SwitchToTransitTab()
     {
         _commuteViewContainer.Visible = false;
         _transitViewContainer.Visible = true;
+        if (_economyViewContainer != null) _economyViewContainer.Visible = false;
         UpdateTransitRoutesView();
+    }
+
+    private void SwitchToEconomyTab()
+    {
+        _commuteViewContainer.Visible = false;
+        _transitViewContainer.Visible = false;
+        if (_economyViewContainer != null) _economyViewContainer.Visible = true;
     }
 
     public void SetTransitManager(TransitManager tm)
@@ -648,9 +677,12 @@ public partial class GameUI : CanvasLayer
 
             // Card Body: Metrics
             string sign = r.NetDailyProfit >= 0 ? "+" : "";
+            float currentHour = _cachedTransitManager?.CurrentGameHour ?? 12f;
+            float operHeadway = r.GetOperationalHeadwayMinutes(currentHour);
+            string peakBadge = TransitManager.IsPeakHour(currentHour) ? " [Пік]" : "";
             var detailsLabel = new Label
             {
-                Text = $"  🔄 Оборот: {r.RoundTripTimeMinutes:F0} хв | Рухомий склад: {r.FleetSize} авт.\n" +
+                Text = $"  🔄 Оборот: {r.RoundTripTimeMinutes:F0} хв | Інтервал: {operHeadway:F1} хв{peakBadge} | Рухомий склад: {r.FleetSize} авт.\n" +
                        $"  👥 Пасажиропотік: {r.DailyPassengers:N0} пас/добу\n" +
                        $"  💰 Дохід: {r.DailyRevenue:N0} ₴ (тариф {r.TicketPrice:F0} ₴)\n" +
                        $"  ⛽ Витрати: {r.DailyOperatingCost:N0} ₴ | Прибуток: {sign}{r.NetDailyProfit:N0} ₴\n" +
@@ -691,36 +723,35 @@ public partial class GameUI : CanvasLayer
             _infoTitleLabel.AddThemeColorOverride("font_color", new Color(0.4f, 0.9f, 0.5f));
 
             int workers = Mathf.RoundToInt(zone.Population * 0.50f);
+            var res = CommuteAnalytics.GetResidentialCommute(zone, grid, od);
+
             _infoStat1Label.Text = $"Населення: {zone.Population:N0} чол.";
-            _infoStat2Label.Text = $"Працездатні: {workers:N0} працівників";
-
-            // Destination calculation
-            float comTrips = 0f;
-            float indTrips = 0f;
-
-            for (int j = 0; j < grid.ZoneCount; j++)
-            {
-                var dest = grid.GetZone(j);
-                if (dest == null) continue;
-                float t = od.Trips[zone.Id, j];
-                if (dest.Type == ZoneType.Commercial) comTrips += t;
-                else if (dest.Type == ZoneType.Industrial) indTrips += t;
-            }
-
-            float totalWorkTrips = comTrips + indTrips;
-            float comPct = totalWorkTrips > 0f ? (comTrips / totalWorkTrips * 100f) : 40f;
-            float indPct = totalWorkTrips > 0f ? (indTrips / totalWorkTrips * 100f) : 60f;
+            _infoStat2Label.Text = $"Працездатні: {workers:N0} працівників (поїздок: {res.totalTrips:N0}/год)";
 
             _infoWorkplaceBreakdown.Text = 
                 $"Де працюють мешканці цього кварталу:\n" +
-                $"  🏢 Діловий Центр (Офіси): {comPct:F0}%\n" +
-                $"  🏭 Східна Промзона (Заводи): {indPct:F0}%";
+                $"  🏢 Діловий Центр (Офіси): {res.comPct:F1}% ({res.comTrips:N0})\n" +
+                $"  🏭 Східна Промзона (Заводи): {res.indPct:F1}% ({res.indTrips:N0})";
 
-            _infoModeSplit.Text = $"🚗 На власному авто: 65%    🚌 На автобусі: 35%";
-            _infoTopDestinations.Text = 
-                $"Маршрути до робочих місць:\n" +
-                $"  • На заводи ➔ через вул. 10 (Синя лінія) / вул. 14\n" +
-                $"  • В офіси ➔ прямі артерії до центру міста";
+            _infoModeSplit.Text = $"🚗 На авто: {res.carPct:F1}% ({res.outgoingCar:N0})   🚌 Громадський транспорт: {res.transitPct:F1}% ({res.outgoingTransit:N0})   🚶 Пішки: {res.walkPct:F1}% ({res.outgoingWalk:N0})";
+
+            if (res.destinations.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder("Головні напрямки поїздок:\n");
+                int count = Mathf.Min(3, res.destinations.Count);
+                for (int d = 0; d < count; d++)
+                {
+                    var dest = res.destinations[d];
+                    string icon = dest.Zone.Type == ZoneType.Commercial ? "🏢 Офіси" : "🏭 Завод";
+                    sb.AppendLine($"  • {icon} ({dest.Zone.GridPos.X}, {dest.Zone.GridPos.Y}): {dest.Trips:N0} поїздок ({dest.Percentage:F1}%)");
+                }
+                _infoTopDestinations.Text = sb.ToString().TrimEnd();
+            }
+            else
+            {
+                _infoTopDestinations.Text = "Головні напрямки поїздок:\n  • Немає активних поїздок до робочих місць";
+            }
+
             _infoHint.Text = "✨ Підсвічені вулиці на мапі показують точний дорожній шлях працівників!";
         }
         else if (zone.Type == ZoneType.Industrial)
@@ -728,16 +759,36 @@ public partial class GameUI : CanvasLayer
             _infoTitleLabel.Text = $"🏭 Заводський комплекс ({zone.GridPos.X}, {zone.GridPos.Y})";
             _infoTitleLabel.AddThemeColorOverride("font_color", new Color(1.0f, 0.70f, 0.2f));
 
+            var ind = CommuteAnalytics.GetIncomingCommute(zone, grid, od);
+
             _infoStat1Label.Text = $"Робочих місць: {zone.Jobs:N0}";
-            _infoStat2Label.Text = $"Завантаженість цехів: 100% заповнено";
+            _infoStat2Label.Text = $"Вхідний потік: {ind.totalTrips:N0} робітників/год";
 
-            _infoWorkplaceBreakdown.Text = 
-                $"Звідки добираються працівники на цей завод:\n" +
-                $"  🏡 Західні спальні квартали: 95%\n" +
-                $"  🏪 Сусідні райони: 5%";
+            if (ind.origins.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder("Звідки добираються працівники на цей завод:\n");
+                int count = Mathf.Min(3, ind.origins.Count);
+                float shownPct = 0f;
+                for (int o = 0; o < count; o++)
+                {
+                    var orig = ind.origins[o];
+                    shownPct += orig.Percentage;
+                    sb.AppendLine($"  🏡 Квартал ({orig.Zone.GridPos.X}, {orig.Zone.GridPos.Y}): {orig.Trips:N0} поїздок ({orig.Percentage:F1}%)");
+                }
+                if (ind.origins.Count > count)
+                {
+                    float otherPct = Mathf.Max(0f, 100f - shownPct);
+                    sb.AppendLine($"  🔄 Інші житлові квартали: {otherPct:F1}%");
+                }
+                _infoWorkplaceBreakdown.Text = sb.ToString().TrimEnd();
+            }
+            else
+            {
+                _infoWorkplaceBreakdown.Text = "Звідки добираються працівники на цей завод:\n  • Немає активних вхідних поїздок";
+            }
 
-            _infoModeSplit.Text = $"Транспортні артерії: Автомагістраль 10 + Синя лінія";
-            _infoTopDestinations.Text = $"Час прибуття зміни: 06:45–08:30 ранку\nЧас виїзду зміни: 16:30–18:30 вечора";
+            _infoModeSplit.Text = $"🚗 На авто: {ind.carPct:F1}% ({ind.incomingCar:N0})   🚌 Громадський транспорт: {ind.transitPct:F1}% ({ind.incomingTransit:N0})   🚶 Пішки: {ind.walkPct:F1}% ({ind.incomingWalk:N0})";
+            _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {ind.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {ind.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {ind.incomingWalk:N0} піш/год";
             _infoHint.Text = "✨ Підсвічені зелені вулиці показують шлях працівників зі спальних районів!";
         }
         else if (zone.Type == ZoneType.Commercial)
@@ -745,16 +796,36 @@ public partial class GameUI : CanvasLayer
             _infoTitleLabel.Text = $"🏢 Бізнес-центр ({zone.GridPos.X}, {zone.GridPos.Y})";
             _infoTitleLabel.AddThemeColorOverride("font_color", new Color(0.3f, 0.7f, 1f));
 
+            var com = CommuteAnalytics.GetIncomingCommute(zone, grid, od);
+
             _infoStat1Label.Text = $"Офісних місць: {zone.Jobs:N0}";
-            _infoStat2Label.Text = $"Ємність торгівлі: {zone.CommercialCap:N0}";
+            _infoStat2Label.Text = $"Вхідний потік: {com.totalTrips:N0} працівників/год (місткість: {zone.CommercialCap:N0})";
 
-            _infoWorkplaceBreakdown.Text = 
-                $"Звідки добираються співробітники офісів:\n" +
-                $"  🏡 Західний сектор міста: 90%\n" +
-                $"  🔄 Інші квартали: 10%";
+            if (com.origins.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder("Звідки добираються співробітники офісів:\n");
+                int count = Mathf.Min(3, com.origins.Count);
+                float shownPct = 0f;
+                for (int o = 0; o < count; o++)
+                {
+                    var orig = com.origins[o];
+                    shownPct += orig.Percentage;
+                    sb.AppendLine($"  🏡 Квартал ({orig.Zone.GridPos.X}, {orig.Zone.GridPos.Y}): {orig.Trips:N0} поїздок ({orig.Percentage:F1}%)");
+                }
+                if (com.origins.Count > count)
+                {
+                    float otherPct = Mathf.Max(0f, 100f - shownPct);
+                    sb.AppendLine($"  🔄 Інші житлові квартали: {otherPct:F1}%");
+                }
+                _infoWorkplaceBreakdown.Text = sb.ToString().TrimEnd();
+            }
+            else
+            {
+                _infoWorkplaceBreakdown.Text = "Звідки добираються співробітники офісів:\n  • Немає активних вхідних поїздок";
+            }
 
-            _infoModeSplit.Text = $"Транспорт: Синя магістраль + Зелене кільце";
-            _infoTopDestinations.Text = $"Години пікового навантаження: 08:00–18:00";
+            _infoModeSplit.Text = $"🚗 На авто: {com.carPct:F1}% ({com.incomingCar:N0})   🚌 Громадський транспорт: {com.transitPct:F1}% ({com.incomingTransit:N0})   🚶 Пішки: {com.walkPct:F1}% ({com.incomingWalk:N0})";
+            _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {com.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {com.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {com.incomingWalk:N0} піш/год";
             _infoHint.Text = "✨ Підсвічені вулиці показують шляхи прибуття офісних співробітників!";
         }
     }
@@ -764,20 +835,21 @@ public partial class GameUI : CanvasLayer
         _infoTitleLabel.Text = "📊 Шляхи: Місто на 1M+";
         _infoTitleLabel.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.3f));
 
+        var city = CommuteAnalytics.GetCityOverview(grid, od);
+
         int totalPop = grid.TotalPopulation();
-        int totalJobs = grid.TotalJobs();
         _infoStat1Label.Text = $"Населення: {totalPop:N0}";
-        _infoStat2Label.Text = $"Робочі місця: {totalJobs:N0}";
+        _infoStat2Label.Text = $"Робочі місця: {city.totalJobs:N0}";
 
         _infoWorkplaceBreakdown.Text = 
             $"Структура зайнятості міста:\n" +
-            $"  🏢 Офіси й торгівля (Центр): 42%\n" +
-            $"  🏭 Важка індустрія (Схід): 58%";
+            $"  🏢 Офіси й торгівля (Центр): {city.comPct:F1}% ({city.comJobs:N0})\n" +
+            $"  🏭 Важка індустрія (Схід): {city.indPct:F1}% ({city.indJobs:N0})";
 
-        _infoModeSplit.Text = $"🚗 Автомобіль: 65%   🚌 Громадський транспорт: 35%";
+        _infoModeSplit.Text = $"🚗 На авто: {city.carPct:F1}% ({city.totalCarTrips:N0})   🚌 Громадський транспорт: {city.transitPct:F1}% ({city.totalTransitTrips:N0})   🚶 Пішки: {city.walkPct:F1}% ({city.totalWalkTrips:N0})";
         _infoTopDestinations.Text = 
-            $"Головні транспортні артерії:\n" +
-            $"Захід (Дім) ➔ Схід (Заводи) та Центр (Офіси)";
+            $"Загальний обсяг поїздок: {city.totalTrips:N0} поїздок/год\n" +
+            $"Активних зон у мережі: {grid.ActiveZoneIds.Count}";
         _infoHint.Text = "💡 Клікніть на будь-який сектор мапи, щоб побачити точний дорожній маршрут працівників!";
     }
 
@@ -817,6 +889,13 @@ public partial class GameUI : CanvasLayer
         }
     }
 
+    public void UpdateEconomy(float money, float lastDelta)
+    {
+        string sign = lastDelta >= 0 ? "+" : "";
+        _moneyLabel.Text = $"${money:N0} ({sign}${lastDelta:N0})";
+        _moneyLabel.AddThemeColorOverride("font_color", lastDelta >= 0 ? Colors.LightGreen : Colors.Coral);
+    }
+
     /// <summary>
     /// Updates the tool instruction / hint text displayed in the HUD banner.
     /// </summary>
@@ -835,14 +914,36 @@ public partial class GameUI : CanvasLayer
     public void SetInteractionMode(InteractionMode mode)
     {
         CurrentMode = mode;
-        if (mode == InteractionMode.Inspect && _inspectBtn != null) _inspectBtn.ButtonPressed = true;
-        else if (mode == InteractionMode.BuildRoad && _buildRoadBtn != null) _buildRoadBtn.ButtonPressed = true;
-        else if (mode == InteractionMode.Demolish && _demolishBtn != null) _demolishBtn.ButtonPressed = true;
-        else if (mode == InteractionMode.ZoneResidential && _zoneResBtn != null) _zoneResBtn.ButtonPressed = true;
-        else if (mode == InteractionMode.ZoneCommercial && _zoneComBtn != null) _zoneComBtn.ButtonPressed = true;
-        else if (mode == InteractionMode.ZoneIndustrial && _zoneIndBtn != null) _zoneIndBtn.ButtonPressed = true;
-        else if (mode == InteractionMode.Dezone && _dezoneBtn != null) _dezoneBtn.ButtonPressed = true;
-        else if (mode == InteractionMode.CreateTransitRoute && _createRouteBtn != null) _createRouteBtn.ButtonPressed = true;
+        if (_inspectBtn != null) _inspectBtn.ButtonPressed = (mode == InteractionMode.Inspect);
+        
+        if (_zoningMenu != null)
+        {
+            _zoningMenu.Text = mode switch
+            {
+                InteractionMode.ZoneResidential => "🏡 Res ▾",
+                InteractionMode.ZoneCommercial => "🏢 Com ▾",
+                InteractionMode.ZoneIndustrial => "🏭 Ind ▾",
+                InteractionMode.Dezone => "🧹 Dezone ▾",
+                _ => "🏡 Zoning ▾"
+            };
+        }
+        if (_roadsMenu != null)
+        {
+            _roadsMenu.Text = mode switch
+            {
+                InteractionMode.BuildRoad => "🛣️ Build ▾",
+                InteractionMode.Demolish => "💥 Demolish ▾",
+                _ => "🛣️ Roads ▾"
+            };
+        }
+        if (_transitMenu != null)
+        {
+            _transitMenu.Text = mode switch
+            {
+                InteractionMode.CreateTransitRoute => "🚌 New Route ▾",
+                _ => "🚌 Transit ▾"
+            };
+        }
 
         if (_routeDesignerPanel != null)
         {
@@ -865,7 +966,8 @@ public partial class GameUI : CanvasLayer
         if (_routeDesignerStatsLabel != null)
         {
             string typeStr = isLoop ? "🔄 Кільце" : "↔ Лінія";
-            _routeDesignerStatsLabel.Text = $"Зупинок: {stopsCount} | Вузлів: {pathNodeCount} ({typeStr})";
+            int estFleet = TransitManager.CalculateOptimalFleetSize(pathNodeCount, isLoop);
+            _routeDesignerStatsLabel.Text = $"Зупинок: {stopsCount} | Вузлів: {pathNodeCount} ({typeStr}) | Автопарк: {estFleet} авт.";
         }
 
         if (_launchRouteBtn != null)

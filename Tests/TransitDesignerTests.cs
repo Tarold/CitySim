@@ -320,7 +320,7 @@ public class TransitDesignerTests
         odMatrix.Recalculate(8f, _grid, distMatrix, hasTransit: false, coveredZoneIds: initialCovered);
         Assert.That(odMatrix.Trips[zOrigin, zDest], Is.GreaterThan(0f));
         Assert.That(odMatrix.TransitTrips[zOrigin, zDest], Is.EqualTo(0f));
-        Assert.That(odMatrix.CarTrips[zOrigin, zDest], Is.EqualTo(odMatrix.Trips[zOrigin, zDest]));
+        Assert.That(odMatrix.CarTrips[zOrigin, zDest] + odMatrix.WalkTrips[zOrigin, zDest], Is.EqualTo(odMatrix.Trips[zOrigin, zDest]).Within(0.01f));
 
         // Create route covering both origin and destination
         var path = _roadGraph.GetShortestNodePath(zOrigin, zDest);
@@ -333,10 +333,205 @@ public class TransitDesignerTests
         float coverageRatio = _transitManager.GetTransitCoverage(_grid);
         Assert.That(coverageRatio, Is.GreaterThan(0f));
 
-        // Recalculate with covered zones: mode split shifts 40% to transit, 60% to car
+        // Recalculate with covered zones: mode split uses dynamic 3-mode choice model
         odMatrix.Recalculate(8f, _grid, distMatrix, hasTransit: true, coveredZoneIds: coveredAfter);
         float totalTrips = odMatrix.Trips[zOrigin, zDest];
-        Assert.That(odMatrix.TransitTrips[zOrigin, zDest], Is.EqualTo(totalTrips * 0.40f).Within(0.01f));
-        Assert.That(odMatrix.CarTrips[zOrigin, zDest], Is.EqualTo(totalTrips * 0.60f).Within(0.01f));
+        
+        Assert.That(odMatrix.TransitTrips[zOrigin, zDest], Is.GreaterThan(0f));
+        Assert.That(odMatrix.TransitTrips[zOrigin, zDest] + odMatrix.CarTrips[zOrigin, zDest] + odMatrix.WalkTrips[zOrigin, zDest], 
+            Is.EqualTo(totalTrips).Within(0.01f));
+        Assert.That(odMatrix.TransitTrips[zOrigin, zDest] / totalTrips, Is.GreaterThan(0.05f));
+    }
+
+    [Test]
+    public void CalculateOptimalFleetSize_EnforcesMinimumTwo_AndScalesWithRouteLength()
+    {
+        // 1. Minimum 2 buses strictly enforced even for tiny routes
+        Assert.That(TransitManager.CalculateOptimalFleetSize(1, false), Is.EqualTo(2));
+        Assert.That(TransitManager.CalculateOptimalFleetSize(2, false), Is.EqualTo(2));
+        Assert.That(TransitManager.CalculateOptimalFleetSize(2, true), Is.EqualTo(2));
+        Assert.That(TransitManager.CalculateOptimalFleetSize(3, false), Is.EqualTo(2));
+
+        // 2. Linear route scaling with length
+        int fleetShort = TransitManager.CalculateOptimalFleetSize(5, false); // 8 segments -> 2
+        int fleetMedium = TransitManager.CalculateOptimalFleetSize(10, false); // 18 segments -> 4
+        int fleetLong = TransitManager.CalculateOptimalFleetSize(16, false); // 30 segments -> 6
+        int fleetExtra = TransitManager.CalculateOptimalFleetSize(25, false); // 48 segments -> 10
+
+        Assert.That(fleetShort, Is.GreaterThanOrEqualTo(2));
+        Assert.That(fleetMedium, Is.GreaterThan(fleetShort));
+        Assert.That(fleetLong, Is.GreaterThan(fleetMedium));
+        Assert.That(fleetExtra, Is.GreaterThan(fleetLong));
+
+        // 3. Loop route scaling with length
+        int loopShort = TransitManager.CalculateOptimalFleetSize(4, true); // 4 segments -> 2
+        int loopMedium = TransitManager.CalculateOptimalFleetSize(15, true); // 15 segments -> 3
+        int loopLong = TransitManager.CalculateOptimalFleetSize(28, true); // 28 segments -> 6
+
+        Assert.That(loopShort, Is.GreaterThanOrEqualTo(2));
+        Assert.That(loopMedium, Is.GreaterThan(loopShort));
+        Assert.That(loopLong, Is.GreaterThan(loopMedium));
+
+        // 4. Default routes scale appropriately
+        var defaultMgr = new TransitManager();
+        defaultMgr.CreateDefaultRoutes(_grid, _roadGraph);
+        foreach (var route in defaultMgr.Routes)
+        {
+            Assert.That(route.FleetSize, Is.GreaterThanOrEqualTo(2));
+            Assert.That(defaultMgr.Vehicles.Count(v => v.RouteId == route.Id), Is.EqualTo(route.FleetSize));
+        }
+    }
+
+    [Test]
+    public void AntiBunching_PhysicalSeparation_PreventsVehiclesFromStacking()
+    {
+        int s1 = _grid.GetZoneId(2, 4);
+        int s2 = _grid.GetZoneId(6, 4);
+        var path = _roadGraph.GetShortestNodePath(s1, s2);
+        var route = _transitManager.CreateRoute("AntiStack Line", path, new HashSet<int> { s1, s2 }, Colors.Red, false, fleetSize: 2);
+
+        var vehicles = _transitManager.Vehicles.Where(v => v.RouteId == route.Id).ToList();
+        Assert.That(vehicles.Count, Is.EqualTo(2));
+
+        var leadVehicle = vehicles[0];
+        var trailVehicle = vehicles[1];
+
+        // Deliberately position both on segment 0, moving forward, very close to each other
+        leadVehicle.CurrentPathIndex = 0;
+        leadVehicle.ProgressToNext = 0.50f;
+        leadVehicle.Forward = true;
+        leadVehicle.State = VehicleState.Moving;
+
+        trailVehicle.CurrentPathIndex = 0;
+        trailVehicle.ProgressToNext = 0.40f; // Only 0.10 behind (below minStopDistance 0.20)
+        trailVehicle.Forward = true;
+        trailVehicle.State = VehicleState.Moving;
+
+        // Run an update tick
+        _transitManager.Update(delta: 0.2f, gameSpeedMultiplier: 1.0f, _roadGraph, _trafficLights);
+
+        // Verify trailing vehicle stopped or was clamped to maintain spacing and never stacked onto lead
+        float separation = leadVehicle.ProgressToNext - trailVehicle.ProgressToNext;
+        Assert.That(separation, Is.GreaterThanOrEqualTo(0.18f), "Trailing vehicle must maintain physical separation and never stack");
+        Assert.That(trailVehicle.ProgressToNext, Is.LessThan(leadVehicle.ProgressToNext));
+
+        // Now test queueing behind a stopped lead vehicle (e.g. at red light or stop)
+        leadVehicle.CurrentPathIndex = 0;
+        leadVehicle.ProgressToNext = 0.85f;
+        leadVehicle.State = VehicleState.AtStop;
+        leadVehicle.StateTimer = 5.0f; // Lead vehicle is stopped
+
+        trailVehicle.CurrentPathIndex = 0;
+        trailVehicle.ProgressToNext = 0.70f;
+        trailVehicle.State = VehicleState.Moving;
+
+        // Run update tick
+        _transitManager.Update(delta: 0.2f, gameSpeedMultiplier: 1.0f, _roadGraph, _trafficLights);
+
+        // Trail vehicle must stop behind lead vehicle and not advance onto 0.85f
+        Assert.That(trailVehicle.ProgressToNext, Is.LessThanOrEqualTo(0.651f), "Trailing vehicle must stop behind leading vehicle");
+        Assert.That(leadVehicle.ProgressToNext - trailVehicle.ProgressToNext, Is.GreaterThanOrEqualTo(0.199f));
+    }
+
+    [Test]
+    public void ScheduleAdherence_HeadwayHoldingControl_RegulatesBunchedVehicles()
+    {
+        int s1 = _grid.GetZoneId(2, 4);
+        int s2 = _grid.GetZoneId(4, 4);
+        int s3 = _grid.GetZoneId(6, 4);
+        var path = _roadGraph.GetShortestNodePath(s1, s3);
+        var route = _transitManager.CreateRoute("Holding Line", path, new HashSet<int> { s1, s2, s3 }, Colors.Green, false, fleetSize: 2);
+
+        var vehicles = _transitManager.Vehicles.Where(v => v.RouteId == route.Id).ToList();
+        var leadVehicle = vehicles[0];
+        var trailVehicle = vehicles[1];
+
+        // Lead vehicle is just ahead, e.g. on node 2 moving forward
+        leadVehicle.CurrentPathIndex = 2;
+        leadVehicle.ProgressToNext = 0.20f;
+        leadVehicle.Forward = true;
+
+        // Trail vehicle is arriving at stop s2 (node index 2 is stop) but right behind lead vehicle (severely bunched!)
+        trailVehicle.CurrentPathIndex = 1;
+        trailVehicle.ProgressToNext = 0.98f;
+        trailVehicle.Forward = true;
+
+        // One update step moves trail vehicle into stop s2
+        _transitManager.Update(delta: 0.2f, gameSpeedMultiplier: 1.0f, _roadGraph, _trafficLights);
+
+        Assert.That(trailVehicle.CurrentPathIndex, Is.EqualTo(2));
+        Assert.That(trailVehicle.State, Is.EqualTo(VehicleState.AtStop));
+        // Holding time should be applied because it is bunched with the vehicle in front
+        Assert.That(trailVehicle.StateTimer, Is.GreaterThan(2.5f), "Holding time must be added to base dwell time for bunched vehicle");
+        Assert.That(trailVehicle.IsHolding, Is.True, "IsHolding flag must be set during schedule holding control");
+    }
+
+    [Test]
+    public void PeakHour_DynamicFrequencyModulation_AdjustsHeadwayAndHolding()
+    {
+        // 1. Peak hour detection
+        Assert.That(TransitManager.IsPeakHour(7.0f), Is.True);
+        Assert.That(TransitManager.IsPeakHour(8.5f), Is.True);
+        Assert.That(TransitManager.IsPeakHour(9.0f), Is.True);
+        Assert.That(TransitManager.IsPeakHour(12.0f), Is.False);
+        Assert.That(TransitManager.IsPeakHour(17.0f), Is.True);
+        Assert.That(TransitManager.IsPeakHour(18.3f), Is.True);
+        Assert.That(TransitManager.IsPeakHour(20.0f), Is.False);
+
+        // 2. Night hour detection
+        Assert.That(TransitManager.IsNightHour(3.0f), Is.True);
+        Assert.That(TransitManager.IsNightHour(23.0f), Is.True);
+        Assert.That(TransitManager.IsNightHour(12.0f), Is.False);
+
+        // 3. Operational Headway modulation
+        int s1 = _grid.GetZoneId(2, 4);
+        int s2 = _grid.GetZoneId(6, 4);
+        var path = _roadGraph.GetShortestNodePath(s1, s2);
+        var route = _transitManager.CreateRoute("Frequency Line", path, new HashSet<int> { s1, s2 }, Colors.Blue, false, fleetSize: 4);
+
+        float baseHeadway = route.HeadwayMinutes;
+        float peakHeadway = route.GetOperationalHeadwayMinutes(8.0f); // 08:00 AM rush hour
+        float offPeakHeadway = route.GetOperationalHeadwayMinutes(12.0f); // 12:00 PM midday
+        float nightHeadway = route.GetOperationalHeadwayMinutes(2.0f); // 02:00 AM late night
+
+        Assert.That(peakHeadway, Is.LessThan(baseHeadway), "Peak hour headway must be shorter (more frequent buses)");
+        Assert.That(offPeakHeadway, Is.EqualTo(baseHeadway), "Off-peak headway must match base headway");
+        Assert.That(nightHeadway, Is.GreaterThan(baseHeadway), "Night headway must be relaxed (less frequent buses)");
+
+        // 4. Update loop tracks current game hour
+        _transitManager.Update(0.1f, 1.0f, _roadGraph, _trafficLights, gameHour: 17.5f);
+        Assert.That(_transitManager.CurrentGameHour, Is.EqualTo(17.5f));
+    }
+
+    [Test]
+    public void TerminusTurnaroundDispatch_RegulatesSimultaneousDepartures()
+    {
+        int s1 = _grid.GetZoneId(2, 4);
+        int s2 = _grid.GetZoneId(6, 4);
+        var path = _roadGraph.GetShortestNodePath(s1, s2);
+        var route = _transitManager.CreateRoute("Terminus Line", path, new HashSet<int> { s1, s2 }, Colors.Purple, false, fleetSize: 2);
+
+        var v1 = _transitManager.Vehicles[0];
+        var v2 = _transitManager.Vehicles[1];
+
+        // Place v1 just departed from terminus 0 into forward trip
+        v1.CurrentPathIndex = 0;
+        v1.ProgressToNext = 0.15f;
+        v1.Forward = true;
+        v1.State = VehicleState.Moving;
+
+        // Place v2 at the terminus finishing layover
+        v2.CurrentPathIndex = 0;
+        v2.ProgressToNext = 0.0f;
+        v2.Forward = true;
+        v2.State = VehicleState.TerminusLayover;
+        v2.StateTimer = 0.01f; // Ready to depart
+
+        // Update tick expires v2's timer, but v1 is still in departure corridor
+        _transitManager.Update(delta: 0.1f, gameSpeedMultiplier: 1.0f, _roadGraph, _trafficLights);
+
+        // v2 must NOT have entered moving service simultaneously
+        Assert.That(v2.State, Is.EqualTo(VehicleState.TerminusLayover), "Turnaround dispatch must hold v2 while v1 is still clearing terminus");
+        Assert.That(v2.StateTimer, Is.GreaterThan(0f));
     }
 }

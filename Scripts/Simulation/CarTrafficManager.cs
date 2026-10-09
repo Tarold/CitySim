@@ -16,6 +16,8 @@ public class VisualCar
 public class CarTrafficManager
 {
     public const int MaxCars = 160;
+    public const float DemandThreshold = 0.05f;
+
     public List<VisualCar> Cars = new List<VisualCar>();
     private Random _random = new Random(42);
     private List<int> _busyEdgeIds = new List<int>();
@@ -31,34 +33,68 @@ public class CarTrafficManager
         new Color(0.35f, 0.60f, 0.35f)  // Green
     };
 
+    public static bool HasDemand(RoadEdge edge)
+    {
+        return edge != null && edge.FromId != -1 && edge.ToId != -1 && edge.CurrentVolume > DemandThreshold;
+    }
+
+    public List<int> GetActiveDemandEdgeIds(RoadGraph graph)
+    {
+        var list = new List<int>();
+        if (graph == null) return list;
+        for (int i = 0; i < graph.Edges.Count; i++)
+        {
+            var edge = graph.Edges[i];
+            if (HasDemand(edge))
+            {
+                list.Add(i);
+            }
+        }
+        return list;
+    }
+
+    public int CalculateTargetCarCount(RoadGraph graph)
+    {
+        if (graph == null || graph.Edges.Count == 0) return 0;
+        float totalVol = 0f;
+        int activeEdgeCount = 0;
+        for (int i = 0; i < graph.Edges.Count; i++)
+        {
+            var edge = graph.Edges[i];
+            if (HasDemand(edge))
+            {
+                totalVol += edge.CurrentVolume;
+                activeEdgeCount++;
+            }
+        }
+
+        if (activeEdgeCount == 0 || totalVol <= DemandThreshold) return 0;
+
+        // Scale dynamically with actual total traffic volume
+        int countFromVolume = Mathf.RoundToInt(totalVol * 0.12f);
+        int target = Mathf.Clamp(countFromVolume, 1, MaxCars);
+        // Avoid overloading if very few active edges
+        target = Mathf.Min(target, activeEdgeCount * 4);
+        return Mathf.Clamp(target, 1, MaxCars);
+    }
+
     public void Initialize(RoadGraph graph)
     {
         Cars.Clear();
         _busyEdgeIds.Clear();
 
-        if (graph.Edges.Count == 0) return;
-
-        for (int i = 0; i < MaxCars; i++)
-        {
-            int edgeIdx = _random.Next(graph.Edges.Count);
-            Cars.Add(new VisualCar
-            {
-                EdgeId = edgeIdx,
-                Progress = (float)_random.NextDouble(),
-                Speed = graph.Edges[edgeIdx].FreeFlowSpeed,
-                CarColor = Palette[_random.Next(Palette.Length)],
-                IsStopped = false
-            });
-        }
+        if (graph == null || graph.Edges.Count == 0) return;
+        RefreshBusyEdges(graph);
     }
 
     public void RefreshBusyEdges(RoadGraph graph)
     {
         _busyEdgeIds.Clear();
+        if (graph == null) return;
         for (int i = 0; i < graph.Edges.Count; i++)
         {
             var edge = graph.Edges[i];
-            if (edge.FromId != -1 && edge.ToId != -1 && edge.CurrentVolume > 10f)
+            if (HasDemand(edge))
             {
                 _busyEdgeIds.Add(i);
             }
@@ -66,85 +102,62 @@ public class CarTrafficManager
     }
 
     /// <summary>
-    /// Respawns or cleans any cars referencing demolished or invalidated edges.
+    /// Respawns or cleans any cars referencing demolished, invalidated, or zero-demand edges.
     /// </summary>
     public void HandleInvalidatedEdges(RoadGraph graph)
     {
-        _busyEdgeIds.RemoveAll(eid => eid < 0 || eid >= graph.Edges.Count || 
-                                     graph.Edges[eid].FromId == -1 || graph.Edges[eid].ToId == -1);
+        RefreshBusyEdges(graph);
 
         for (int i = 0; i < Cars.Count; i++)
         {
             var car = Cars[i];
             if (car.EdgeId < 0 || car.EdgeId >= graph.Edges.Count ||
-                graph.Edges[car.EdgeId].FromId == -1 || graph.Edges[car.EdgeId].ToId == -1)
+                graph.Edges[car.EdgeId].FromId == -1 || graph.Edges[car.EdgeId].ToId == -1 ||
+                !HasDemand(graph.Edges[car.EdgeId]))
             {
-                RespawnCar(car, graph);
+                if (!TryRespawnCar(car, graph, _busyEdgeIds))
+                {
+                    car.EdgeId = -1;
+                }
             }
         }
     }
 
     public void Update(float delta, float gameSpeed, RoadGraph graph, TrafficLightManager trafficLights)
     {
-        if (graph.Edges.Count == 0 || Cars.Count == 0) return;
+        if (graph == null || graph.Edges.Count == 0)
+        {
+            Cars.Clear();
+            return;
+        }
+
+        RefreshBusyEdges(graph);
+
+        // In 100% flow-based architecture, visualization is rendered directly from edge flows (Zero-Agent).
+        // If any legacy car structs are added by external unit tests, cleanly maintain them:
+        if (Cars.Count == 0) return;
 
         float speedMult = Mathf.Clamp(gameSpeed, 0.1f, 10.0f);
 
-        for (int i = 0; i < Cars.Count; i++)
+        for (int i = Cars.Count - 1; i >= 0; i--)
         {
             var car = Cars[i];
             if (car.EdgeId < 0 || car.EdgeId >= graph.Edges.Count)
             {
-                RespawnCar(car, graph);
-                continue;
-            }
-
-            var edge = graph.Edges[car.EdgeId];
-            if (edge.FromId == -1 || edge.ToId == -1)
-            {
-                RespawnCar(car, graph);
-                continue;
-            }
-
-            var fromNode = graph.GetNode(edge.FromId);
-            var toNode = graph.GetNode(edge.ToId);
-            if (fromNode == null || toNode == null)
-            {
-                RespawnCar(car, graph);
-                continue;
-            }
-
-            // Congestion slowdown factor based on edge volume
-            float congestion = edge.GetCongestionRatio();
-            float speedFactor = 1.0f / (1.0f + 0.25f * Mathf.Pow(congestion, 3.0f));
-            float targetSpeed = (edge.FreeFlowSpeed * 1.5f * speedFactor) * speedMult;
-
-            // Check traffic light at intersection
-            bool redLight = false;
-            if (car.Progress > 0.80f)
-            {
-                if (!trafficLights.IsGreen(edge.ToId, fromNode.WorldPosition))
+                if (!TryRespawnCar(car, graph, _busyEdgeIds))
                 {
-                    redLight = true;
+                    Cars.RemoveAt(i);
+                    continue;
                 }
             }
 
-            if (redLight && car.Progress >= 0.85f)
+            var edge = graph.Edges[car.EdgeId];
+            if (!HasDemand(edge))
             {
-                car.Speed = 0f;
-                car.IsStopped = true;
-                car.Progress = 0.85f; // Hold before intersection
-            }
-            else
-            {
-                car.Speed = targetSpeed;
-                car.IsStopped = false;
-                float progressStep = (car.Speed * delta) / Mathf.Max(edge.Length, 15f);
-                car.Progress += progressStep;
-
-                if (car.Progress >= 1.0f)
+                if (!TryRespawnCar(car, graph, _busyEdgeIds))
                 {
-                    TransitionToNextEdge(car, edge, graph);
+                    Cars.RemoveAt(i);
+                    continue;
                 }
             }
         }
@@ -154,16 +167,16 @@ public class CarTrafficManager
     {
         if (graph.AdjacencyEdges.TryGetValue(currentEdge.ToId, out var nextEdgeIds) && nextEdgeIds.Count > 0)
         {
-            // Pick next outgoing edge that does not instantly reverse
+            // Pick next outgoing edge that has active volume (> 0.05f) and does not instantly reverse
             int bestEdgeId = -1;
-            float bestVol = -1f;
+            float bestVol = DemandThreshold;
 
             for (int i = 0; i < nextEdgeIds.Count; i++)
             {
                 int candidateId = nextEdgeIds[i];
                 if (candidateId < 0 || candidateId >= graph.Edges.Count) continue;
                 var candidate = graph.Edges[candidateId];
-                if (candidate.FromId == -1 || candidate.ToId == -1) continue; // Skip invalidated edges
+                if (!HasDemand(candidate)) continue;
                 if (candidate.ToId == currentEdge.FromId) continue; // Avoid 180 u-turn
 
                 if (candidate.CurrentVolume > bestVol)
@@ -181,48 +194,32 @@ public class CarTrafficManager
             }
         }
 
-        RespawnCar(car, graph);
+        // If no outgoing edge has volume, respawn on an active demand edge or despawn
+        if (!TryRespawnCar(car, graph, _busyEdgeIds))
+        {
+            car.EdgeId = -1; // Despawn
+        }
     }
 
-    private void RespawnCar(VisualCar car, RoadGraph graph)
+    private bool TryRespawnCar(VisualCar car, RoadGraph graph, List<int> activeDemandEdgeIds)
     {
-        // Try busy edges first
-        int attempts = 0;
-        while (_busyEdgeIds.Count > 0 && attempts < 10)
-        {
-            int candidate = _busyEdgeIds[_random.Next(_busyEdgeIds.Count)];
-            if (candidate >= 0 && candidate < graph.Edges.Count &&
-                graph.Edges[candidate].FromId != -1 && graph.Edges[candidate].ToId != -1)
-            {
-                car.EdgeId = candidate;
-                car.Progress = (float)_random.NextDouble() * 0.3f;
-                car.IsStopped = false;
-                return;
-            }
-            _busyEdgeIds.Remove(candidate);
-            attempts++;
-        }
-
-        // Fallback: pick any valid active edge in graph
-        var validEdgeIds = new List<int>();
-        for (int i = 0; i < graph.Edges.Count; i++)
-        {
-            if (graph.Edges[i].FromId != -1 && graph.Edges[i].ToId != -1)
-            {
-                validEdgeIds.Add(i);
-            }
-        }
-
-        if (validEdgeIds.Count > 0)
-        {
-            car.EdgeId = validEdgeIds[_random.Next(validEdgeIds.Count)];
-        }
-        else
+        if (activeDemandEdgeIds == null || activeDemandEdgeIds.Count == 0)
         {
             car.EdgeId = -1;
+            return false;
         }
 
-        car.Progress = (float)_random.NextDouble() * 0.3f;
-        car.IsStopped = false;
+        int candidate = activeDemandEdgeIds[_random.Next(activeDemandEdgeIds.Count)];
+        if (candidate >= 0 && candidate < graph.Edges.Count && HasDemand(graph.Edges[candidate]))
+        {
+            car.EdgeId = candidate;
+            car.Progress = (float)_random.NextDouble() * 0.3f;
+            car.Speed = graph.Edges[candidate].FreeFlowSpeed;
+            car.IsStopped = false;
+            return true;
+        }
+
+        car.EdgeId = -1;
+        return false;
     }
 }

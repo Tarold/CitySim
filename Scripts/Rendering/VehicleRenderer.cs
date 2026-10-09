@@ -8,13 +8,17 @@ public partial class VehicleRenderer : Node2D
 {
     private TransitManager _transitManager;
     private CarTrafficManager _carManager;
+    private PedestrianManager _pedManager;
     private RoadGraph _graph;
     private float _animTime = 0f;
 
-    public void Initialize(TransitManager tm, CarTrafficManager carMgr, RoadGraph graph)
+    public bool ShowTransitRoutes { get; set; } = true;
+
+    public void Initialize(TransitManager tm, CarTrafficManager carMgr, PedestrianManager pedMgr, RoadGraph graph)
     {
         _transitManager = tm;
         _carManager = carMgr;
+        _pedManager = pedMgr;
         _graph = graph;
     }
 
@@ -31,7 +35,7 @@ public partial class VehicleRenderer : Node2D
         // =========================================================================
         // 1. DRAW TRANSIT ROUTE CORRIDORS (TRACK LINES)
         // =========================================================================
-        if (_transitManager != null)
+        if (ShowTransitRoutes && _transitManager != null)
         {
             foreach (var route in _transitManager.Routes)
             {
@@ -83,39 +87,65 @@ public partial class VehicleRenderer : Node2D
         }
 
         // =========================================================================
-        // 2. DRAW VISUAL CAR TRAFFIC
+        // 2. DRAW ZERO-AGENT FLOW-BASED VEHICLE TRAFFIC ON DRIVING LANES
         // =========================================================================
-        if (_carManager != null)
+        for (int eIdx = 0; eIdx < _graph.Edges.Count; eIdx++)
         {
-            foreach (var car in _carManager.Cars)
+            var edge = _graph.Edges[eIdx];
+            if (edge.FromId == -1 || edge.ToId == -1 || edge.CurrentVolume <= 0.05f) continue;
+
+            var fromNode = _graph.GetNode(edge.FromId);
+            var toNode = _graph.GetNode(edge.ToId);
+            if (fromNode == null || toNode == null) continue;
+
+            Vector2 deltaVec = toNode.WorldPosition - fromNode.WorldPosition;
+            float edgeLen = deltaVec.Length();
+            if (edgeLen < 2f) continue;
+
+            Vector2 dir = deltaVec / edgeLen;
+            Vector2 rightNormal = new Vector2(-dir.Y, dir.X);
+            Vector2 laneOffset = rightNormal * 4.5f;
+
+            float volume = edge.CurrentVolume;
+            float capacity = Mathf.Max(edge.Capacity, 1f);
+            float congestion = edge.GetCongestionRatio();
+
+            // Congestion slowdown factor
+            float speedFactor = 1.0f / (1.0f + 0.35f * Mathf.Pow(congestion, 3.0f));
+            float streamSpeed = (edge.FreeFlowSpeed / 12f) * speedFactor;
+
+            // Coloring: white when free-flowing -> amber when congested -> red when gridlocked
+            Color streamColor;
+            if (congestion < 0.50f)
             {
-                if (car.EdgeId < 0 || car.EdgeId >= _graph.Edges.Count) continue;
-                var edge = _graph.Edges[car.EdgeId];
-                if (edge.FromId == -1 || edge.ToId == -1) continue;
-                var fromNode = _graph.GetNode(edge.FromId);
-                var toNode = _graph.GetNode(edge.ToId);
-                if (fromNode == null || toNode == null) continue;
+                streamColor = new Color(0.95f, 0.98f, 1.0f, 0.95f);
+            }
+            else if (congestion < 0.85f)
+            {
+                float t = (congestion - 0.50f) / 0.35f;
+                streamColor = new Color(1.0f, Mathf.Lerp(0.95f, 0.70f, t), 0.20f, 0.95f);
+            }
+            else
+            {
+                float t = Mathf.Clamp((congestion - 0.85f) / 0.40f, 0f, 1f);
+                streamColor = new Color(1.0f, Mathf.Lerp(0.40f, 0.15f, t), 0.15f, 1.0f);
+            }
 
-                Vector2 deltaVec = toNode.WorldPosition - fromNode.WorldPosition;
-                float edgeLen = deltaVec.Length();
-                if (edgeLen < 1f) continue;
+            // Pulse count / stream density directly reflecting CurrentVolume
+            int pulses = Mathf.Clamp(Mathf.RoundToInt(volume / 250f) + 1, 1, 6);
+            float dashLen = Mathf.Clamp(4.0f + (volume / capacity) * 4.0f, 3.5f, 8.0f);
 
-                Vector2 dir = deltaVec / edgeLen;
-                Vector2 rightNormal = new Vector2(-dir.Y, dir.X);
+            for (int k = 0; k < pulses; k++)
+            {
+                float phase = ((_animTime * streamSpeed * 0.15f) + ((float)k / pulses)) % 1.0f;
+                if (phase < 0f) phase += 1.0f;
 
-                // Right lane position
-                Vector2 carPos = fromNode.WorldPosition.Lerp(toNode.WorldPosition, car.Progress) + rightNormal * 4.5f;
+                Vector2 center = fromNode.WorldPosition.Lerp(toNode.WorldPosition, phase) + laneOffset;
+                Vector2 p1 = center - dir * (dashLen * 0.5f);
+                Vector2 p2 = center + dir * (dashLen * 0.5f);
 
-                // Fast crisp car rendering
-                Vector2 front = carPos + dir * 3.6f;
-                Vector2 back = carPos - dir * 3.6f;
-
-                DrawLine(back, front, car.CarColor, 3.5f, true);
-
-                if (car.IsStopped)
-                {
-                    DrawCircle(back, 1.3f, Colors.Red); // Braking light
-                }
+                DrawLine(p1, p2, streamColor, 3.2f, true);
+                DrawCircle(p2, 1.8f, streamColor);
             }
         }
 
@@ -162,6 +192,64 @@ public partial class VehicleRenderer : Node2D
                     9, 
                     Colors.White
                 );
+
+                // Fullness indicator bar
+                float fillRatio = (float)vehicle.Passengers / Mathf.Max(1, vehicle.Capacity);
+                Rect2 barBg = new Rect2(pos.X - 8f, pos.Y - 14f, 16f, 3f);
+                DrawRect(barBg, new Color(0.1f, 0.1f, 0.1f, 0.8f));
+                
+                Rect2 barFill = new Rect2(pos.X - 8f, pos.Y - 14f, 16f * fillRatio, 3f);
+                Color fillColor = Colors.Green;
+                if (fillRatio > 0.85f) fillColor = Colors.Red;
+                else if (fillRatio > 0.5f) fillColor = Colors.Yellow;
+                DrawRect(barFill, fillColor);
+            }
+        }
+
+        // =========================================================================
+        // 4. DRAW ZERO-AGENT FLOW-BASED PEDESTRIAN TRAFFIC ON SIDEWALKS
+        // =========================================================================
+        for (int eIdx = 0; eIdx < _graph.Edges.Count; eIdx++)
+        {
+            var edge = _graph.Edges[eIdx];
+            if (edge.FromId == -1 || edge.ToId == -1 || edge.PedestrianVolume <= 0.05f) continue;
+
+            var fromNode = _graph.GetNode(edge.FromId);
+            var toNode = _graph.GetNode(edge.ToId);
+            if (fromNode == null || toNode == null) continue;
+
+            Vector2 deltaVec = toNode.WorldPosition - fromNode.WorldPosition;
+            float edgeLen = deltaVec.Length();
+            if (edgeLen < 2f) continue;
+
+            Vector2 dir = deltaVec / edgeLen;
+            Vector2 rightNormal = new Vector2(-dir.Y, dir.X);
+
+            float pedVol = edge.PedestrianVolume;
+            float pedRatio = edge.GetPedestrianCongestionRatio();
+            float walkSpeed = (edge.WalkingSpeed / 10f) * (1.0f - 0.20f * Mathf.Clamp(pedRatio, 0f, 0.7f));
+
+            // Density: directly reflects PedestrianVolume
+            int pedDashes = Mathf.Clamp(Mathf.RoundToInt(pedVol / 200f) + 1, 1, 8);
+            Color pedColor = new Color(0.40f, 0.95f, 0.65f, 0.90f);
+            if (pedRatio > 0.6f) pedColor = new Color(0.35f, 0.85f, 1.0f, 0.95f);
+
+            for (int p = 0; p < pedDashes; p++)
+            {
+                float phase = ((_animTime * walkSpeed * 0.20f) + ((float)p / pedDashes)) % 1.0f;
+                if (phase < 0f) phase += 1.0f;
+
+                // Right sidewalk
+                Vector2 pedPosR = fromNode.WorldPosition.Lerp(toNode.WorldPosition, phase) + rightNormal * 7.5f;
+                DrawCircle(pedPosR, 1.6f, pedColor);
+
+                // Both sidewalks active if high pedestrian volume
+                if (pedVol > 400f)
+                {
+                    float phaseL = (phase + 0.5f) % 1.0f;
+                    Vector2 pedPosL = fromNode.WorldPosition.Lerp(toNode.WorldPosition, phaseL) - rightNormal * 7.5f;
+                    DrawCircle(pedPosL, 1.6f, pedColor);
+                }
             }
         }
     }

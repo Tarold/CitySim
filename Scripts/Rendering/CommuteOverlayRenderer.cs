@@ -35,86 +35,11 @@ public partial class CommuteOverlayRenderer : Node2D
     {
         _graph = graph;
         SelectedZoneId = zoneId;
-        Targets.Clear();
-
-        if (zoneId < 0 || zoneId >= _grid.ZoneCount)
-        {
-            QueueRedraw();
-            return;
-        }
-
-        var sourceZone = _grid.GetZone(zoneId);
-        if (sourceZone == null || sourceZone.Type == ZoneType.Empty)
+        Targets = CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _odMatrix, distances, graph);
+        if (Targets.Count == 0 && (zoneId < 0 || zoneId >= _grid.ZoneCount || _grid.GetZone(zoneId)?.Type == ZoneType.Empty))
         {
             SelectedZoneId = -1;
-            QueueRedraw();
-            return;
         }
-
-        // 1. If residential: trace path to workplaces (Commercial offices / Industrial factories)
-        if (sourceZone.Type == ZoneType.Residential)
-        {
-            for (int j = 0; j < _grid.ZoneCount; j++)
-            {
-                if (zoneId == j) continue;
-                var dest = _grid.GetZone(j);
-                if (dest == null || dest.Type == ZoneType.Empty) continue;
-
-                float trips = _odMatrix.Trips[zoneId, j];
-                if (trips > 0.05f)
-                {
-                    List<int> edgePath = null;
-                    if (graph.PathCache.TryGetValue((zoneId, j), out var path))
-                    {
-                        edgePath = path;
-                    }
-
-                    Targets.Add(new CommuteTarget
-                    {
-                        ZoneId = j,
-                        Position = _grid.GetWorldCenter(j),
-                        Volume = trips,
-                        Type = dest.Type,
-                        TravelTime = distances[zoneId, j],
-                        EdgePath = edgePath != null ? new List<int>(edgePath) : new List<int>()
-                    });
-                }
-            }
-        }
-        // 2. If workplace: trace feeder paths from worker homes (Residential)
-        else if (sourceZone.Type == ZoneType.Commercial || sourceZone.Type == ZoneType.Industrial)
-        {
-            for (int i = 0; i < _grid.ZoneCount; i++)
-            {
-                if (zoneId == i) continue;
-                var origin = _grid.GetZone(i);
-                if (origin == null || origin.Type != ZoneType.Residential) continue;
-
-                float trips = _odMatrix.Trips[i, zoneId];
-                if (trips > 0.05f)
-                {
-                    List<int> edgePath = null;
-                    if (graph.PathCache.TryGetValue((i, zoneId), out var path))
-                    {
-                        edgePath = path;
-                    }
-
-                    Targets.Add(new CommuteTarget
-                    {
-                        ZoneId = i,
-                        Position = _grid.GetWorldCenter(i),
-                        Volume = trips,
-                        Type = origin.Type,
-                        TravelTime = distances[i, zoneId],
-                        EdgePath = edgePath != null ? new List<int>(edgePath) : new List<int>()
-                    });
-                }
-            }
-        }
-
-        // Sort by commuter volume descending and keep top 8 most prominent paths
-        Targets.Sort((a, b) => b.Volume.CompareTo(a.Volume));
-        if (Targets.Count > 8) Targets.RemoveRange(8, Targets.Count - 8);
 
         QueueRedraw();
     }
@@ -150,11 +75,18 @@ public partial class CommuteOverlayRenderer : Node2D
                 float relativeWeight = Mathf.Clamp(target.Volume / Mathf.Max(maxVol, 0.01f), 0.2f, 1.0f);
                 float lineWidth = 2.5f + relativeWeight * 4.0f;
 
-                Color pathGlowColor = target.Type switch
+                Color corridorColor = sourceZone.Type switch
                 {
-                    ZoneType.Commercial => new Color(0.15f, 0.70f, 1.0f, 0.85f), // Glowing Cyan to downtown offices
-                    ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.85f), // Glowing Amber to factories
-                    _ => new Color(0.35f, 0.95f, 0.45f, 0.85f)                   // Lime Green to residences
+                    ZoneType.Commercial => new Color(0.20f, 0.80f, 1.0f, 0.90f), // Glowing Cyan for commercial corridors
+                    ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.90f), // Glowing Amber for industrial corridors
+                    _ => (target.Type == ZoneType.Commercial ? new Color(0.20f, 0.80f, 1.0f, 0.90f) : new Color(1.0f, 0.65f, 0.15f, 0.90f))
+                };
+
+                Color pinColor = target.Type switch
+                {
+                    ZoneType.Commercial => new Color(0.15f, 0.70f, 1.0f, 0.95f),
+                    ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.95f),
+                    _ => new Color(0.35f, 0.95f, 0.45f, 0.95f) // Lime Green for residential origins
                 };
 
                 // A. Draw the EXACT road street path edges
@@ -170,7 +102,7 @@ public partial class CommuteOverlayRenderer : Node2D
                             if (fn != null && tn != null)
                             {
                                 // Draw high-visibility illuminated street corridor
-                                DrawLine(fn.WorldPosition, tn.WorldPosition, pathGlowColor, lineWidth, true);
+                                DrawLine(fn.WorldPosition, tn.WorldPosition, corridorColor, lineWidth, true);
                             }
                         }
                     }
@@ -178,11 +110,11 @@ public partial class CommuteOverlayRenderer : Node2D
                 else
                 {
                     // Fallback direct ray if path cache doesn't have intermediate nodes
-                    DrawLine(fromPos, target.Position, pathGlowColor, lineWidth, true);
+                    DrawLine(fromPos, target.Position, corridorColor, lineWidth, true);
                 }
 
-                // B. Draw destination pin badge
-                DrawCircle(target.Position, 6.5f + relativeWeight * 2f, pathGlowColor);
+                // B. Draw origin / destination pin badge
+                DrawCircle(target.Position, 6.5f + relativeWeight * 2f, pinColor);
                 DrawArc(target.Position, 7f + relativeWeight * 2f, 0, Mathf.Tau, 16, Colors.White, 1.4f, true);
                 DrawCircle(target.Position, 2.5f, Colors.White);
             }

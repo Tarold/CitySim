@@ -187,7 +187,15 @@ public class RoadConstructionTests
         Assert.That(fwdId, Is.Not.EqualTo(-1));
 
         // Place a car explicitly on this edge
-        carMgr.Cars[0].EdgeId = fwdId;
+        _roadGraph.Edges[fwdId].CurrentVolume = 10f;
+        if (carMgr.Cars.Count == 0)
+        {
+            carMgr.Cars.Add(new VisualCar { EdgeId = fwdId });
+        }
+        else
+        {
+            carMgr.Cars[0].EdgeId = fwdId;
+        }
 
         // Demolish the segment
         _roadGraph.RemoveRoadSegment(z1, z2);

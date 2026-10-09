@@ -11,11 +11,13 @@ public partial class Main : Node2D
     private CityGrid _grid;
     private RoadGraph _roadGraph;
     private float[,] _distanceMatrix;
+    private float[,] _walkingDistanceMatrix;
     private ODMatrix _odMatrix;
     private TrafficEngine _trafficEngine;
     private TransitManager _transitManager;
     private TrafficLightManager _trafficLights;
     private CarTrafficManager _carTrafficManager;
+    private PedestrianManager _pedestrianManager;
     
     private CityRenderer _cityRenderer;
     private RoadRenderer _roadRenderer;
@@ -31,6 +33,8 @@ public partial class Main : Node2D
     private float _lastODRecalcHour = -10f;
     private bool _heatmapEnabled = false;
     private float _odRecalcInterval = 0.5f; // Recalculate OD every 30 game minutes
+    private float _lastFinancialTickHour = 6.5f;
+    private EconomyManager _economyManager;
     
     private bool _isDragging = false;
     private int _selectedZoneId = -1;
@@ -42,19 +46,27 @@ public partial class Main : Node2D
     private List<int> _draftTransitPath = new List<int>();
     private bool _draftIsLoop = false;
     
+    public static bool LoadTutorialMode { get; set; } = true;
+
     public override void _Ready()
     {
         _grid = new CityGrid(20, 20, 64f);
-        _grid.GenerateDefaultCity();
+        
+        if (LoadTutorialMode)
+        {
+            _grid.GenerateDefaultCity();
+        }
         
         _roadGraph = new RoadGraph();
         _roadGraph.BuildFromGrid(_grid);
         
         _distanceMatrix = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
+        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
         _roadGraph.BuildPathCache(_grid.ZoneCount);
         
         _odMatrix = new ODMatrix(_grid.ZoneCount);
         _trafficEngine = new TrafficEngine();
+        _economyManager = new EconomyManager();
         
         _trafficLights = new TrafficLightManager();
         _trafficLights.BuildIntersections(_roadGraph);
@@ -64,6 +76,9 @@ public partial class Main : Node2D
         
         _transitManager = new TransitManager();
         _transitManager.CreateDefaultRoutes(_grid, _roadGraph);
+        
+        _pedestrianManager = new PedestrianManager();
+        _pedestrianManager.Initialize(_roadGraph, _grid, _transitManager);
         
         _camera = new Camera2D();
         _camera.Position = new Vector2(_grid.Width * _grid.CellSize / 2f, _grid.Height * _grid.CellSize / 2f);
@@ -84,7 +99,7 @@ public partial class Main : Node2D
         
         _vehicleRenderer = new VehicleRenderer();
         AddChild(_vehicleRenderer);
-        _vehicleRenderer.Initialize(_transitManager, _carTrafficManager, _roadGraph);
+        _vehicleRenderer.Initialize(_transitManager, _carTrafficManager, _pedestrianManager, _roadGraph);
 
         _previewRenderer = new ToolPreviewRenderer();
         AddChild(_previewRenderer);
@@ -93,6 +108,7 @@ public partial class Main : Node2D
         _gameUI = new GameUI();
         AddChild(_gameUI);
         _gameUI.SetTransitManager(_transitManager);
+        _gameUI.SetEconomyManager(_economyManager);
         
         _gameUI.SpeedChanged += (speed) => _gameSpeed = speed;
         _gameUI.HeatmapToggled += (enabled) => 
@@ -105,6 +121,12 @@ public partial class Main : Node2D
         _gameUI.CommuteInfographicsToggled += (enabled) =>
         {
             _commuteOverlay.Visible = enabled;
+        };
+
+        _gameUI.TransitRoutesToggled += (enabled) =>
+        {
+            _vehicleRenderer.ShowTransitRoutes = enabled;
+            _vehicleRenderer.QueueRedraw();
         };
 
         _gameUI.ModeChanged += OnInteractionModeChanged;
@@ -161,8 +183,16 @@ public partial class Main : Node2D
     private void RecalculateODMatrix()
     {
         var coveredZones = _transitManager.GetCoveredZoneIds(_grid);
-        _odMatrix.Recalculate(_gameHour, _grid, _distanceMatrix, _transitManager.Routes.Count > 0, coveredZones);
-        _trafficEngine.AssignFlows(_odMatrix, _roadGraph, _grid);
+        float avgPrice = 12f;
+        if (_transitManager.Routes.Count > 0)
+        {
+            float total = 0f;
+            foreach (var r in _transitManager.Routes) total += r.TicketPrice;
+            avgPrice = total / _transitManager.Routes.Count;
+        }
+
+        _odMatrix.Recalculate(_gameHour, _grid, _distanceMatrix, _transitManager.Routes.Count > 0, coveredZones, avgPrice, _walkingDistanceMatrix, _transitManager);
+        _trafficEngine.AssignFlows(_odMatrix, _roadGraph, _grid, _transitManager);
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
         _carTrafficManager.RefreshBusyEdges(_roadGraph);
         _lastODRecalcHour = _gameHour;
@@ -191,6 +221,7 @@ public partial class Main : Node2D
             _gameHour -= 24f;
             _gameDay++;
             _lastODRecalcHour -= 24f;
+            _lastFinancialTickHour -= 24f;
         }
         
         // Recalculate macro traffic flows when 30 game minutes elapse
@@ -198,11 +229,20 @@ public partial class Main : Node2D
         {
             RecalculateODMatrix();
         }
+
+        if (Mathf.Abs(_gameHour - _lastFinancialTickHour) >= 1f)
+        {
+            _economyManager.ProcessFinancialTick(_grid, _roadGraph, _transitManager);
+            _lastFinancialTickHour = _gameHour;
+        }
         
         // Update simulation sub-systems
         _trafficLights.Update(dt, _gameSpeed);
         _carTrafficManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights);
-        _transitManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights);
+        _transitManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights, _gameHour);
+        _pedestrianManager.Update(dt, _gameSpeed, _roadGraph, _grid, _transitManager);
+        
+        ProcessPopulationGrowth(dt, _gameSpeed);
         
         // Calculate transit ridership
         float transitRidership = 0f;
@@ -220,6 +260,8 @@ public partial class Main : Node2D
             ODMatrix.GetDirectionalBias(_gameHour)
         );
         
+        _gameUI.UpdateEconomy(_economyManager.Money, _economyManager.LastDelta);
+        
         HandleCameraPan(delta);
     }
     
@@ -236,6 +278,60 @@ public partial class Main : Node2D
         if (pan != Vector2.Zero)
         {
             _camera.Position += pan.Normalized() * panSpeed * (float)delta;
+        }
+    }
+    
+    private float _populationGrowthTimer = 0f;
+
+    private void ProcessPopulationGrowth(float dt, float gameSpeed)
+    {
+        _populationGrowthTimer += dt * gameSpeed;
+        if (_populationGrowthTimer >= 1.0f) // roughly every in-game minute
+        {
+            _populationGrowthTimer -= 1.0f;
+
+            var entrances = new List<int>();
+            for (int i = 0; i < _grid.ZoneCount; i++)
+            {
+                if (_grid.GetZone(i).Type == ZoneType.Entrance)
+                    entrances.Add(i);
+            }
+
+            if (entrances.Count == 0) return;
+
+            bool uiNeedsUpdate = false;
+            for (int i = 0; i < _grid.ZoneCount; i++)
+            {
+                var zone = _grid.GetZone(i);
+                if (zone.Type == ZoneType.Residential && zone.Population < zone.ResidentialCap)
+                {
+                    bool isConnected = false;
+                    foreach (int ent in entrances)
+                    {
+                        // Check if path exists from entrance to residential zone
+                        if (_distanceMatrix[ent, i] < float.MaxValue)
+                        {
+                            isConnected = true;
+                            break;
+                        }
+                    }
+
+                    if (isConnected)
+                    {
+                        zone.Population = Mathf.Min(zone.ResidentialCap, zone.Population + 50);
+                        uiNeedsUpdate = true;
+                    }
+                }
+            }
+
+            if (uiNeedsUpdate && _selectedZoneId != -1)
+            {
+                var selectedZone = _grid.GetZone(_selectedZoneId);
+                if (selectedZone.Type == ZoneType.Residential)
+                {
+                    _gameUI.ShowZoneInfographics(selectedZone, _grid, _odMatrix, _distanceMatrix);
+                }
+            }
         }
     }
     
@@ -317,7 +413,7 @@ public partial class Main : Node2D
         }
         else
         {
-            _gameUI.SetInteractionMode(_currentMode);
+            _gameUI.SetInteractionMode(InteractionMode.Inspect);
         }
     }
 
@@ -387,9 +483,8 @@ public partial class Main : Node2D
         int zoneId = _grid.GetZoneId(gx, gy);
         var zone = _grid.GetZone(zoneId);
 
-        if (zone == null || zone.Type == ZoneType.Empty)
+        if (zone == null)
         {
-            _gameUI.SetToolHint("⚠️ Cannot build road on empty terrain. Click an active zone.", Colors.Coral);
             return;
         }
 
@@ -436,11 +531,22 @@ public partial class Main : Node2D
                 return;
             }
 
+            if (!_economyManager.CanAfford(EconomyManager.RoadSegmentCost))
+            {
+                CancelPendingOperation();
+                _gameUI.SetToolHint($"⚠️ Insufficient funds! Road segment costs ${EconomyManager.RoadSegmentCost}.", Colors.Coral);
+                return;
+            }
+
             // Create road segment in both directions
+            _roadGraph.EnsureNode(_pendingStartZoneId, _grid.GetWorldCenter(_pendingStartZoneId));
+            _roadGraph.EnsureNode(zone.Id, _grid.GetWorldCenter(zone.Id));
             bool added = _roadGraph.AddRoadSegment(_pendingStartZoneId, zone.Id);
             if (added)
             {
+                _economyManager.Spend(EconomyManager.RoadSegmentCost);
                 _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+                _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
                 _trafficLights.BuildIntersections(_roadGraph);
                 RecalculateODMatrix();
                 _roadRenderer.Refresh();
@@ -470,9 +576,8 @@ public partial class Main : Node2D
         int zoneId = _grid.GetZoneId(gx, gy);
         var zone = _grid.GetZone(zoneId);
 
-        if (zone == null || zone.Type == ZoneType.Empty)
+        if (zone == null)
         {
-            _gameUI.SetToolHint("⚠️ Cannot demolish on empty terrain. Click an active zone.", Colors.Coral);
             return;
         }
 
@@ -541,8 +646,10 @@ public partial class Main : Node2D
             if (removed)
             {
                 _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+                _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
                 _trafficLights.BuildIntersections(_roadGraph);
                 _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
+                _pedestrianManager.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
                 RecalculateODMatrix();
                 _roadRenderer.Refresh();
                 _cityRenderer.Refresh();
@@ -577,11 +684,19 @@ public partial class Main : Node2D
             return;
         }
 
+        if (!_economyManager.CanAfford(EconomyManager.ZoningCost))
+        {
+            _gameUI.SetToolHint($"⚠️ Insufficient funds! Zoning costs ${EconomyManager.ZoningCost}.", Colors.Coral);
+            return;
+        }
+
         bool changed = _grid.ZoneCell(zoneId, type);
         if (changed)
         {
+            _economyManager.Spend(EconomyManager.ZoningCost);
             _roadGraph.EnsureNode(zoneId, _grid.GetWorldCenter(zoneId));
             _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+            _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
             RecalculateODMatrix();
             _cityRenderer.Refresh();
             _roadRenderer.Refresh();
@@ -621,13 +736,14 @@ public partial class Main : Node2D
             ClearInspectSelection();
         }
 
-        // Safely detach all road edges and remove node from graph
-        _roadGraph.DetachAndRemoveNode(zoneId);
+        // Only dezone the cell, leaving any existing road nodes and edges intact
         _grid.DezoneCell(zoneId);
 
         _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
         _trafficLights.BuildIntersections(_roadGraph);
         _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
+        _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
         RecalculateODMatrix();
         _cityRenderer.Refresh();
         _roadRenderer.Refresh();
@@ -644,7 +760,7 @@ public partial class Main : Node2D
         if (zoneId < 0 || zoneId >= _grid.ZoneCount) return list;
 
         var zone = _grid.GetZone(zoneId);
-        if (zone == null || zone.Type == ZoneType.Empty) return list;
+        if (zone == null) return list;
 
         int gx = zone.GridPos.X;
         int gy = zone.GridPos.Y;
@@ -658,7 +774,7 @@ public partial class Main : Node2D
 
             int nId = _grid.GetZoneId(nx, ny);
             var nZone = _grid.GetZone(nId);
-            if (nZone == null || nZone.Type == ZoneType.Empty) continue;
+            if (nZone == null) continue;
 
             bool hasRoad = _roadGraph.HasEdge(zoneId, nId) || _roadGraph.HasEdge(nId, zoneId);
             if (mode == InteractionMode.BuildRoad && !hasRoad)
@@ -757,16 +873,24 @@ public partial class Main : Node2D
             return;
         }
 
+        if (!_economyManager.CanAfford(EconomyManager.TransitRouteBaseCost))
+        {
+            _gameUI.SetToolHint($"⚠️ Insufficient funds! Launching a route costs ${EconomyManager.TransitRouteBaseCost}.", Colors.Coral);
+            return;
+        }
+
+        int optimalFleet = TransitManager.CalculateOptimalFleetSize(_draftTransitPath.Count, _draftIsLoop);
         var newRoute = _transitManager.CreateRoute(
             routeName,
             _draftTransitPath,
             _draftTransitStops,
             color,
             _draftIsLoop,
-            fleetSize: 4,
+            fleetSize: optimalFleet,
             ticketPrice: 12f
         );
 
+        _economyManager.Spend(EconomyManager.TransitRouteBaseCost);
         CancelTransitDraft();
         _gameUI.SetInteractionMode(InteractionMode.Inspect);
         RecalculateODMatrix();

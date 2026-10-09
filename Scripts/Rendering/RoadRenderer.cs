@@ -28,6 +28,11 @@ public partial class RoadRenderer : Node2D
         QueueRedraw();
     }
 
+    public override void _Process(double delta)
+    {
+        QueueRedraw();
+    }
+
     public override void _Draw()
     {
         if (_graph == null) return;

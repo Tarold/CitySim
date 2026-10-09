@@ -23,6 +23,11 @@ public class RoadEdge
     public float CurrentVolume;
     public int Lanes;
 
+    // Pedestrian flow attributes
+    public float PedestrianVolume;
+    public float PedestrianCapacity = 1800f; // ped/hour
+    public float WalkingSpeed = 5.0f; // km/h (1.39 m/s, matching FreeFlowSpeed unit scale)
+
     public float GetTravelTime()
     {
         return (Length / FreeFlowSpeed) * (1f + 0.15f * Mathf.Pow(CurrentVolume / Mathf.Max(Capacity, 1f), 4f));
@@ -31,6 +36,16 @@ public class RoadEdge
     public float GetCongestionRatio()
     {
         return CurrentVolume / Mathf.Max(Capacity, 1f);
+    }
+
+    public float GetWalkingTravelTime()
+    {
+        return (Length / WalkingSpeed) * (1f + 0.10f * Mathf.Pow(PedestrianVolume / Mathf.Max(PedestrianCapacity, 1f), 2f));
+    }
+
+    public float GetPedestrianCongestionRatio()
+    {
+        return PedestrianVolume / Mathf.Max(PedestrianCapacity, 1f);
     }
 }
 
@@ -41,6 +56,7 @@ public class RoadGraph
     public Dictionary<int, RoadNode> NodeMap = new Dictionary<int, RoadNode>();
     public Dictionary<int, List<int>> AdjacencyEdges = new Dictionary<int, List<int>>();
     public Dictionary<(int, int), List<int>> PathCache = new Dictionary<(int, int), List<int>>();
+    public Dictionary<(int, int), List<int>> WalkingPathCache = new Dictionary<(int, int), List<int>>();
 
     public RoadNode GetNode(int id) => NodeMap.TryGetValue(id, out var n) ? n : null;
 
@@ -116,7 +132,10 @@ public class RoadGraph
             Capacity = cap,
             FreeFlowSpeed = 50f,
             Lanes = 2,
-            CurrentVolume = 0f
+            CurrentVolume = 0f,
+            PedestrianCapacity = 1800f,
+            WalkingSpeed = 5.0f,
+            PedestrianVolume = 0f
         };
 
         var e2 = new RoadEdge
@@ -128,7 +147,10 @@ public class RoadGraph
             Capacity = cap,
             FreeFlowSpeed = 50f,
             Lanes = 2,
-            CurrentVolume = 0f
+            CurrentVolume = 0f,
+            PedestrianCapacity = 1800f,
+            WalkingSpeed = 5.0f,
+            PedestrianVolume = 0f
         };
 
         Edges.Add(e1);
@@ -282,9 +304,145 @@ public class RoadGraph
         return nodePath;
     }
 
+    public float[] DijkstraWalking(int sourceNodeId)
+    {
+        int maxId = GetMaxNodeIndex();
+        float[] dist = new float[maxId];
+        Array.Fill(dist, float.MaxValue);
+        
+        if (!AdjacencyEdges.ContainsKey(sourceNodeId) || sourceNodeId >= maxId) return dist;
+
+        dist[sourceNodeId] = 0f;
+        var pq = new PriorityQueue<int, float>();
+        pq.Enqueue(sourceNodeId, 0f);
+
+        while (pq.Count > 0)
+        {
+            pq.TryDequeue(out int u, out float d);
+            if (d > dist[u]) continue;
+
+            foreach (var edgeId in AdjacencyEdges[u])
+            {
+                var edge = Edges[edgeId];
+                if (edge.FromId == -1 || edge.ToId == -1) continue;
+                int v = edge.ToId;
+                float weight = edge.GetWalkingTravelTime();
+
+                if (dist[u] + weight < dist[v])
+                {
+                    dist[v] = dist[u] + weight;
+                    pq.Enqueue(v, dist[v]);
+                }
+            }
+        }
+
+        return dist;
+    }
+
+    public float[,] ComputeWalkingDistanceMatrix(int zoneCount)
+    {
+        float[,] matrix = new float[zoneCount, zoneCount];
+        for (int i = 0; i < zoneCount; i++)
+        {
+            if (AdjacencyEdges.ContainsKey(i))
+            {
+                float[] dists = DijkstraWalking(i);
+                for (int j = 0; j < zoneCount; j++)
+                {
+                    matrix[i, j] = j < dists.Length ? dists[j] : float.MaxValue;
+                }
+            }
+            else
+            {
+                for (int j = 0; j < zoneCount; j++)
+                {
+                    matrix[i, j] = float.MaxValue;
+                }
+            }
+        }
+        return matrix;
+    }
+
+    public List<int> GetShortestWalkingPath(int fromNodeId, int toNodeId)
+    {
+        if (!AdjacencyEdges.ContainsKey(fromNodeId) || !AdjacencyEdges.ContainsKey(toNodeId)) return null;
+
+        int maxId = GetMaxNodeIndex();
+        if (fromNodeId >= maxId || toNodeId >= maxId) return null;
+
+        float[] dist = new float[maxId];
+        int[] edgeTo = new int[maxId];
+        Array.Fill(dist, float.MaxValue);
+        Array.Fill(edgeTo, -1);
+
+        dist[fromNodeId] = 0f;
+        var pq = new PriorityQueue<int, float>();
+        pq.Enqueue(fromNodeId, 0f);
+
+        while (pq.Count > 0)
+        {
+            pq.TryDequeue(out int u, out float d);
+            if (u == toNodeId) break;
+            if (d > dist[u]) continue;
+
+            foreach (var edgeId in AdjacencyEdges[u])
+            {
+                var edge = Edges[edgeId];
+                if (edge.FromId == -1 || edge.ToId == -1) continue;
+                int v = edge.ToId;
+                float weight = edge.GetWalkingTravelTime();
+
+                if (dist[u] + weight < dist[v])
+                {
+                    dist[v] = dist[u] + weight;
+                    edgeTo[v] = edgeId;
+                    pq.Enqueue(v, dist[v]);
+                }
+            }
+        }
+
+        if (dist[toNodeId] == float.MaxValue) return null;
+
+        var path = new List<int>();
+        int curr = toNodeId;
+        while (curr != fromNodeId)
+        {
+            int eId = edgeTo[curr];
+            if (eId == -1) return null;
+            path.Add(eId);
+            curr = Edges[eId].FromId;
+        }
+        path.Reverse();
+        return path;
+    }
+
+    public List<int> GetShortestWalkingNodePath(int fromNodeId, int toNodeId)
+    {
+        if (!NodeMap.ContainsKey(fromNodeId) || !NodeMap.ContainsKey(toNodeId)) return null;
+        if (fromNodeId == toNodeId) return new List<int> { fromNodeId };
+
+        var edgePath = GetShortestWalkingPath(fromNodeId, toNodeId);
+        if (edgePath == null || edgePath.Count == 0) return null;
+
+        var nodePath = new List<int> { fromNodeId };
+        foreach (int eid in edgePath)
+        {
+            if (eid >= 0 && eid < Edges.Count && Edges[eid].ToId != -1)
+            {
+                nodePath.Add(Edges[eid].ToId);
+            }
+            else
+            {
+                return null;
+            }
+        }
+        return nodePath;
+    }
+
     public void BuildPathCache(int zoneCount)
     {
         PathCache.Clear();
+        WalkingPathCache.Clear();
         foreach (var u in Nodes)
         {
             foreach (var v in Nodes)
@@ -296,6 +454,12 @@ public class RoadGraph
                     {
                         PathCache[(u.Id, v.Id)] = path;
                     }
+
+                    var walkingPath = GetShortestWalkingPath(u.Id, v.Id);
+                    if (walkingPath != null)
+                    {
+                        WalkingPathCache[(u.Id, v.Id)] = walkingPath;
+                    }
                 }
             }
         }
@@ -306,6 +470,7 @@ public class RoadGraph
         foreach (var e in Edges)
         {
             e.CurrentVolume = 0f;
+            e.PedestrianVolume = 0f;
         }
     }
 
@@ -363,7 +528,10 @@ public class RoadGraph
             Capacity = capacity,
             FreeFlowSpeed = 50f,
             Lanes = 2,
-            CurrentVolume = 0f
+            CurrentVolume = 0f,
+            PedestrianCapacity = 1800f,
+            WalkingSpeed = 5.0f,
+            PedestrianVolume = 0f
         };
 
         var e2 = new RoadEdge
@@ -375,7 +543,10 @@ public class RoadGraph
             Capacity = capacity,
             FreeFlowSpeed = 50f,
             Lanes = 2,
-            CurrentVolume = 0f
+            CurrentVolume = 0f,
+            PedestrianCapacity = 1800f,
+            WalkingSpeed = 5.0f,
+            PedestrianVolume = 0f
         };
 
         Edges.Add(e1);
@@ -419,6 +590,8 @@ public class RoadGraph
             Edges[eidForward].ToId = -1;
             Edges[eidForward].Capacity = 0f;
             Edges[eidForward].CurrentVolume = 0f;
+            Edges[eidForward].PedestrianCapacity = 0f;
+            Edges[eidForward].PedestrianVolume = 0f;
         }
         if (eidReverse != -1)
         {
@@ -426,6 +599,8 @@ public class RoadGraph
             Edges[eidReverse].ToId = -1;
             Edges[eidReverse].Capacity = 0f;
             Edges[eidReverse].CurrentVolume = 0f;
+            Edges[eidReverse].PedestrianCapacity = 0f;
+            Edges[eidReverse].PedestrianVolume = 0f;
         }
 
         // Invalidate affected path cache entries
@@ -443,6 +618,21 @@ public class RoadGraph
         }
         foreach (var key in keysToRemove)
             PathCache.Remove(key);
+
+        var walkingKeysToRemove = new List<(int, int)>();
+        foreach (var kvp in WalkingPathCache)
+        {
+            foreach (var pid in kvp.Value)
+            {
+                if (pid == eidForward || pid == eidReverse)
+                {
+                    walkingKeysToRemove.Add(kvp.Key);
+                    break;
+                }
+            }
+        }
+        foreach (var key in walkingKeysToRemove)
+            WalkingPathCache.Remove(key);
 
         return true;
     }
@@ -534,6 +724,15 @@ public class RoadGraph
         foreach (var key in keysToRemove)
             PathCache.Remove(key);
 
+        var walkingKeysToRemove = new List<(int, int)>();
+        foreach (var key in WalkingPathCache.Keys)
+        {
+            if (key.Item1 == zoneId || key.Item2 == zoneId)
+                walkingKeysToRemove.Add(key);
+        }
+        foreach (var key in walkingKeysToRemove)
+            WalkingPathCache.Remove(key);
+
         return changed;
     }
 
@@ -543,6 +742,7 @@ public class RoadGraph
     public float[,] RebuildAfterTopologyChange(int zoneCount)
     {
         PathCache.Clear();
+        WalkingPathCache.Clear();
         var matrix = ComputeDistanceMatrix(zoneCount);
         BuildPathCache(zoneCount);
         return matrix;

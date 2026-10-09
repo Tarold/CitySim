@@ -40,6 +40,22 @@ public class TransitRoute
     public int FleetSize = 6;
     public float HeadwayMinutes => FleetSize > 0 ? (RoundTripTimeMinutes / FleetSize) : FrequencyMinutes;
     public float AverageOccupancy = 65f; // % capacity utilized
+
+    /// <summary>
+    /// Calculates the operational target headway in minutes modulated by time of day (rush hour vs. off-peak vs. night).
+    /// </summary>
+    public float GetOperationalHeadwayMinutes(float gameHour)
+    {
+        if (TransitManager.IsPeakHour(gameHour))
+        {
+            return HeadwayMinutes * 0.70f;
+        }
+        else if (TransitManager.IsNightHour(gameHour))
+        {
+            return HeadwayMinutes * 1.40f;
+        }
+        return HeadwayMinutes;
+    }
 }
 
 public class TransitVehicle
@@ -53,6 +69,7 @@ public class TransitVehicle
     public bool Forward = true;
     public VehicleState State = VehicleState.Moving;
     public float StateTimer = 0f;
+    public bool IsHolding = false;
 
     public Vector2 GetWorldPosition(TransitRoute route, RoadGraph graph)
     {
@@ -108,6 +125,227 @@ public class TransitManager
     /// <summary>Next available route ID counter.</summary>
     public int NextRouteId => _nextRouteId;
 
+    /// <summary>Currently tracked in-game hour (0.0 to 24.0).</summary>
+    public float CurrentGameHour { get; set; } = 8.0f;
+
+    /// <summary>
+    /// Determines if the specified in-game hour falls within morning (07:00-09:00) or evening (16:30-18:30) peak periods.
+    /// </summary>
+    public static bool IsPeakHour(float hour)
+    {
+        float h = hour % 24f;
+        if (h < 0f) h += 24f;
+        return (h >= 7.0f && h <= 9.0f) || (h >= 16.5f && h <= 18.5f);
+    }
+
+    /// <summary>
+    /// Determines if the specified in-game hour falls during late-night / off-hours (22:00-06:00).
+    /// </summary>
+    public static bool IsNightHour(float hour)
+    {
+        float h = hour % 24f;
+        if (h < 0f) h += 24f;
+        return h < 6.0f || h >= 22.0f;
+    }
+
+    /// <summary>
+    /// Calculates base fleet size dynamically as a function of route length / node count / round-trip cycle time.
+    /// Enforces a strict minimum of 2 buses on every route (even for short routes).
+    /// </summary>
+    public static int CalculateOptimalFleetSize(int pathNodeCount, bool isLoop)
+    {
+        if (pathNodeCount < 2) return 2;
+        int cycleSegments = isLoop ? pathNodeCount : 2 * (pathNodeCount - 1);
+        int optimal = Mathf.RoundToInt(cycleSegments / 5.0f);
+        return Mathf.Max(2, optimal);
+    }
+
+    /// <summary>
+    /// Calculates continuous 1D progress coordinate along the complete route cycle.
+    /// For loops: [0, pathNodeCount). For lines: [0, 2 * (pathNodeCount - 1)).
+    /// </summary>
+    public static float GetRouteCycleProgress(TransitVehicle vehicle, TransitRoute route)
+    {
+        if (route == null || route.PathNodeIds.Count < 2) return 0f;
+        if (route.IsLoop)
+        {
+            int count = route.PathNodeIds.Count;
+            float progress = (vehicle.CurrentPathIndex + vehicle.ProgressToNext) % count;
+            if (progress < 0f) progress += count;
+            return progress;
+        }
+        else
+        {
+            int nodes = route.PathNodeIds.Count;
+            float halfCycle = nodes - 1;
+            float fullCycle = 2.0f * halfCycle;
+            float progress;
+            if (vehicle.Forward)
+            {
+                progress = vehicle.CurrentPathIndex + vehicle.ProgressToNext;
+            }
+            else
+            {
+                progress = halfCycle + (halfCycle - vehicle.CurrentPathIndex) + vehicle.ProgressToNext;
+            }
+            progress %= fullCycle;
+            if (progress < 0f) progress += fullCycle;
+            return progress;
+        }
+    }
+
+    /// <summary>
+    /// Returns total round-trip cycle distance in segments.
+    /// </summary>
+    public static float GetRouteCycleLength(TransitRoute route)
+    {
+        if (route == null || route.PathNodeIds.Count < 2) return 1f;
+        return route.IsLoop ? route.PathNodeIds.Count : 2.0f * (route.PathNodeIds.Count - 1);
+    }
+
+    /// <summary>
+    /// Finds the preceding vehicle traveling in the same direction on the route cycle ahead of the specified vehicle.
+    /// Returns the vehicle and the cycle distance along the track to it.
+    /// </summary>
+    public (TransitVehicle Leader, float Distance) FindPrecedingVehicle(TransitVehicle vehicle, TransitRoute route)
+    {
+        if (route == null || route.PathNodeIds.Count < 2) return (null, float.MaxValue);
+        float cycleLen = GetRouteCycleLength(route);
+        float myProg = GetRouteCycleProgress(vehicle, route);
+
+        TransitVehicle bestLeader = null;
+        float bestDist = float.MaxValue;
+
+        foreach (var other in Vehicles)
+        {
+            if (other.RouteId != route.Id || other.Id == vehicle.Id) continue;
+
+            // In a linear route, check vehicles traveling in the same service direction
+            if (!route.IsLoop && other.Forward != vehicle.Forward)
+            {
+                continue;
+            }
+
+            float otherProg = GetRouteCycleProgress(other, route);
+            float dist = otherProg - myProg;
+            while (dist <= 0f) dist += cycleLen;
+            while (dist > cycleLen) dist -= cycleLen;
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestLeader = other;
+            }
+        }
+
+        return (bestLeader, bestDist);
+    }
+
+    /// <summary>
+    /// Finds the leader ahead of this vehicle along the entire round-trip route cycle.
+    /// </summary>
+    public (TransitVehicle Leader, float Distance) FindCycleLeader(TransitVehicle vehicle, TransitRoute route)
+    {
+        if (route == null || route.PathNodeIds.Count < 2) return (null, float.MaxValue);
+        float cycleLen = GetRouteCycleLength(route);
+        float myProg = GetRouteCycleProgress(vehicle, route);
+
+        TransitVehicle bestLeader = null;
+        float bestDist = float.MaxValue;
+
+        foreach (var other in Vehicles)
+        {
+            if (other.RouteId != route.Id || other.Id == vehicle.Id) continue;
+
+            float otherProg = GetRouteCycleProgress(other, route);
+            float dist = otherProg - myProg;
+            while (dist <= 0.0001f) dist += cycleLen;
+            while (dist > cycleLen) dist -= cycleLen;
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestLeader = other;
+            }
+        }
+
+        return (bestLeader, bestDist);
+    }
+
+    /// <summary>
+    /// Calculates holding dwell time at a stop to regulate bunched vehicles and restore even headway.
+    /// </summary>
+    public float CalculateHeadwayHoldingTime(TransitVehicle vehicle, TransitRoute route, float gameHour)
+    {
+        if (route == null || route.FleetSize <= 1) return 0f;
+
+        float cycleLen = GetRouteCycleLength(route);
+        float idealSpacing = cycleLen / Mathf.Max(route.FleetSize, 1);
+
+        var (leader, distToLead) = FindCycleLeader(vehicle, route);
+        if (leader == null) return 0f;
+
+        // Headway ratio relative to ideal even spacing
+        float ratio = distToLead / idealSpacing;
+
+        // If running too close to the bus in front (ratio < 0.85), apply holding control
+        if (ratio < 0.85f)
+        {
+            float deficit = 0.85f - ratio;
+            float holdSeconds = deficit * 4.5f;
+
+            // Peak hour adjustment: shorten holding intervals for more brisk throughput
+            if (IsPeakHour(gameHour))
+            {
+                holdSeconds *= 0.65f;
+            }
+            else if (IsNightHour(gameHour))
+            {
+                holdSeconds *= 1.25f;
+            }
+
+            return Mathf.Clamp(holdSeconds, 0f, 6.0f);
+        }
+
+        return 0f;
+    }
+
+    /// <summary>
+    /// Checks whether a vehicle at a terminus can safely dispatch into service without stacking
+    /// on another recently dispatched vehicle heading in the same direction.
+    /// </summary>
+    public bool CanDispatchFromTerminus(TransitVehicle vehicle, TransitRoute route)
+    {
+        if (route == null || route.IsLoop) return true;
+
+        bool departureForward = (vehicle.CurrentPathIndex <= 0);
+
+        // Check if any other vehicle is on the departure segment or within 1.0 segment traveling in same direction
+        foreach (var other in Vehicles)
+        {
+            if (other.RouteId != route.Id || other.Id == vehicle.Id) continue;
+            if (other.Forward != departureForward) continue;
+
+            if (departureForward)
+            {
+                if (other.CurrentPathIndex == 0 || (other.CurrentPathIndex == 1 && other.ProgressToNext < 0.3f))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                int lastIdx = route.PathNodeIds.Count - 1;
+                if (other.CurrentPathIndex == lastIdx || (other.CurrentPathIndex == lastIdx - 1 && other.ProgressToNext < 0.3f))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
     public void CreateDefaultRoutes(CityGrid grid, RoadGraph graph)
     {
         Routes.Clear();
@@ -147,7 +385,7 @@ public class TransitManager
 
         if (r1.PathNodeIds.Count > 1)
         {
-            r1.FleetSize = 6;
+            r1.FleetSize = CalculateOptimalFleetSize(r1.PathNodeIds.Count, r1.IsLoop);
             r1.RoundTripTimeMinutes = 36f;
             r1.DailyPassengers = 48500f;
             r1.DailyRevenue = 48500f * r1.TicketPrice;
@@ -155,7 +393,7 @@ public class TransitManager
             r1.AverageOccupancy = 72f;
 
             Routes.Add(r1);
-            DeployLineVehicles(r1, 6);
+            DeployLineVehicles(r1, r1.FleetSize);
         }
 
         // =========================================================================
@@ -187,7 +425,7 @@ public class TransitManager
 
         if (r2.PathNodeIds.Count > 1)
         {
-            r2.FleetSize = 4;
+            r2.FleetSize = CalculateOptimalFleetSize(r2.PathNodeIds.Count, r2.IsLoop);
             r2.RoundTripTimeMinutes = 30f;
             r2.DailyPassengers = 29000f;
             r2.DailyRevenue = 29000f * r2.TicketPrice;
@@ -195,7 +433,7 @@ public class TransitManager
             r2.AverageOccupancy = 64f;
 
             Routes.Add(r2);
-            DeployLineVehicles(r2, 4);
+            DeployLineVehicles(r2, r2.FleetSize);
         }
 
         // =========================================================================
@@ -237,7 +475,7 @@ public class TransitManager
 
         if (r3.PathNodeIds.Count > 3)
         {
-            r3.FleetSize = 6;
+            r3.FleetSize = CalculateOptimalFleetSize(r3.PathNodeIds.Count, r3.IsLoop);
             r3.RoundTripTimeMinutes = 42f;
             r3.DailyPassengers = 39000f;
             r3.DailyRevenue = 39000f * r3.TicketPrice;
@@ -245,7 +483,7 @@ public class TransitManager
             r3.AverageOccupancy = 68f;
 
             Routes.Add(r3);
-            DeployLoopVehicles(r3, 6);
+            DeployLoopVehicles(r3, r3.FleetSize);
         }
     }
 
@@ -286,11 +524,15 @@ public class TransitManager
         IEnumerable<int> stopNodeIds,
         Color color,
         bool isLoop,
-        int fleetSize = 4,
+        int fleetSize = 0,
         float ticketPrice = 12f)
     {
         if (pathNodeIds == null || pathNodeIds.Count < 2)
             throw new ArgumentException("A transit route must have at least 2 path nodes.");
+
+        int effectiveFleet = fleetSize <= 0
+            ? CalculateOptimalFleetSize(pathNodeIds.Count, isLoop)
+            : Mathf.Max(2, fleetSize);
 
         int routeId = _nextRouteId++;
         var route = new TransitRoute
@@ -302,9 +544,9 @@ public class TransitManager
             RouteColor = color,
             IsLoop = isLoop,
             TicketPrice = ticketPrice,
-            FleetSize = fleetSize,
+            FleetSize = effectiveFleet,
             RoundTripTimeMinutes = isLoop ? Mathf.Max(20f, pathNodeIds.Count * 2.0f) : Mathf.Max(20f, pathNodeIds.Count * 2.5f),
-            FrequencyMinutes = Mathf.Max(2.5f, 30f / Mathf.Max(fleetSize, 1)),
+            FrequencyMinutes = Mathf.Max(2.5f, 30f / Mathf.Max(effectiveFleet, 1)),
             DailyPassengers = 0f,
             DailyRevenue = 0f,
             DailyOperatingCost = 0f,
@@ -318,7 +560,7 @@ public class TransitManager
         }
 
         Routes.Add(route);
-        DeployRouteVehicles(route, fleetSize);
+        DeployRouteVehicles(route, effectiveFleet);
 
         return route;
     }
@@ -380,7 +622,7 @@ public class TransitManager
     {
         var route = Routes.FirstOrDefault(r => r.Id == routeId);
         if (route == null) return false;
-        DeployRouteVehicles(route, Mathf.Max(0, count));
+        DeployRouteVehicles(route, Mathf.Max(2, count));
         return true;
     }
 
@@ -398,14 +640,30 @@ public class TransitManager
     private void DeployLineVehicles(TransitRoute route, int count)
     {
         int totalNodes = route.PathNodeIds.Count;
+        float cycleLen = 2.0f * (totalNodes - 1);
+        float spacing = cycleLen / Mathf.Max(count, 1);
+
         for (int i = 0; i < count; i++)
         {
-            // Evenly space vehicles along the line:
-            int startIdx = (totalNodes > 1) ? (i * (totalNodes - 1) / Mathf.Max(count - 1, 1)) : 0;
-            startIdx = Mathf.Clamp(startIdx, 0, totalNodes - 1);
-            bool fwd = (i % 2 == 0); // Half forward, half backward
+            float cyclePos = i * spacing;
+            int startIdx;
+            float prog;
+            bool fwd;
 
-            // Terminus edge safety
+            if (cyclePos < totalNodes - 1)
+            {
+                startIdx = Mathf.Clamp(Mathf.FloorToInt(cyclePos), 0, totalNodes - 1);
+                prog = Mathf.Clamp(cyclePos - startIdx, 0.05f, 0.95f);
+                fwd = true;
+            }
+            else
+            {
+                float backPos = cyclePos - (totalNodes - 1);
+                startIdx = Mathf.Clamp((totalNodes - 1) - Mathf.FloorToInt(backPos), 0, totalNodes - 1);
+                prog = Mathf.Clamp(backPos - Mathf.FloorToInt(backPos), 0.05f, 0.95f);
+                fwd = false;
+            }
+
             if (startIdx == 0) fwd = true;
             if (startIdx == totalNodes - 1) fwd = false;
 
@@ -414,7 +672,7 @@ public class TransitManager
                 Id = _nextVehicleId++,
                 RouteId = route.Id,
                 CurrentPathIndex = startIdx,
-                ProgressToNext = 0.05f,
+                ProgressToNext = prog,
                 Passengers = 20f + _random.Next(20),
                 Capacity = 75,
                 Forward = fwd,
@@ -431,13 +689,15 @@ public class TransitManager
 
         for (int i = 0; i < count; i++)
         {
-            int idx = Mathf.FloorToInt(i * spacing) % totalNodes;
+            float pos = i * spacing;
+            int idx = Mathf.FloorToInt(pos) % totalNodes;
+            float prog = Mathf.Clamp(pos - Mathf.FloorToInt(pos), 0.05f, 0.95f);
             Vehicles.Add(new TransitVehicle
             {
                 Id = _nextVehicleId++,
                 RouteId = route.Id,
                 CurrentPathIndex = idx,
-                ProgressToNext = 0.05f,
+                ProgressToNext = prog,
                 Passengers = 20f + _random.Next(25),
                 Capacity = 75,
                 Forward = true,
@@ -447,14 +707,20 @@ public class TransitManager
         }
     }
 
-    public void Update(float delta, float gameSpeedMultiplier, RoadGraph graph, TrafficLightManager trafficLights)
+    public void Update(float delta, float gameSpeedMultiplier, RoadGraph graph, TrafficLightManager trafficLights, float gameHour = -1f)
     {
+        if (gameHour >= 0f)
+        {
+            CurrentGameHour = gameHour;
+        }
+
         float speedMult = Mathf.Clamp(gameSpeedMultiplier, 0.2f, 15.0f);
 
-        // Periodically refresh passenger demand at stops
+        // Periodically refresh passenger demand at stops (elevated during peak periods)
+        float demandRate = IsPeakHour(CurrentGameHour) ? 0.7f : 0.4f;
         foreach (var stop in Stops.Values)
         {
-            stop.WaitingPassengers = Mathf.Min(stop.WaitingPassengers + delta * speedMult * 0.4f, 80f);
+            stop.WaitingPassengers = Mathf.Min(stop.WaitingPassengers + delta * speedMult * demandRate, 80f);
         }
 
         foreach (var vehicle in Vehicles)
@@ -465,13 +731,14 @@ public class TransitManager
             // Safe clamping
             vehicle.CurrentPathIndex = Mathf.Clamp(vehicle.CurrentPathIndex, 0, route.PathNodeIds.Count - 1);
 
-            // Handle dwell / stop states
+            // 1. Handle dwell / stop states
             if (vehicle.State == VehicleState.AtStop)
             {
                 vehicle.StateTimer -= delta * speedMult;
                 if (vehicle.StateTimer <= 0f)
                 {
                     vehicle.State = VehicleState.Moving;
+                    vehicle.IsHolding = false;
                 }
                 continue; // Do not move while dwelling at stop
             }
@@ -480,13 +747,24 @@ public class TransitManager
                 vehicle.StateTimer -= delta * speedMult;
                 if (vehicle.StateTimer <= 0f)
                 {
-                    // Cleanly resume service in reversed direction
-                    vehicle.State = VehicleState.Moving;
+                    // Regulate turnaround dispatch release: two vehicles never depart simultaneously in same direction
+                    if (CanDispatchFromTerminus(vehicle, route))
+                    {
+                        vehicle.State = VehicleState.Moving;
+                        vehicle.Forward = (vehicle.CurrentPathIndex <= 0);
+                        vehicle.IsHolding = false;
+                    }
+                    else
+                    {
+                        // Preceding departed vehicle is still clearing terminus corridor: hold release
+                        vehicle.StateTimer = 2.0f;
+                        vehicle.IsHolding = true;
+                    }
                 }
                 continue; // Vehicle rests at terminus
             }
 
-            // Normal moving state:
+            // 2. Normal moving state:
             if (!route.IsLoop)
             {
                 if (vehicle.CurrentPathIndex <= 0) vehicle.Forward = true;
@@ -501,7 +779,7 @@ public class TransitManager
             nextIdx = Mathf.Clamp(nextIdx, 0, route.PathNodeIds.Count - 1);
             int nextNodeId = route.PathNodeIds[nextIdx];
 
-            // Check traffic light when approaching intersection
+            // 3. Check traffic light when approaching intersection
             if (vehicle.ProgressToNext > 0.82f)
             {
                 var currNode = graph.GetNode(currNodeId);
@@ -513,21 +791,113 @@ public class TransitManager
                 }
             }
 
-            // Advance vehicle along the segment
-            float moveSpeed = 0.55f * speedMult;
+            // 4. Microscopic Physical Separation & Anti-Bunching (Vehicle Following)
+            var (leader, leaderDist) = FindPrecedingVehicle(vehicle, route);
+            float speedFactor = 1.0f;
+
+            if (leader != null)
+            {
+                // A. Same segment check: leader is ahead on the exact same segment
+                if (leader.CurrentPathIndex == vehicle.CurrentPathIndex && leader.Forward == vehicle.Forward)
+                {
+                    float progDiff = leader.ProgressToNext - vehicle.ProgressToNext;
+                    if (progDiff > 0f)
+                    {
+                        if (progDiff < 0.20f)
+                        {
+                            // Stacking prevention: decelerate/stop behind preceding vehicle
+                            vehicle.ProgressToNext = Mathf.Max(0f, leader.ProgressToNext - 0.20f);
+                            speedFactor = 0f;
+                        }
+                        else if (progDiff < 0.35f)
+                        {
+                            speedFactor = Mathf.Clamp((progDiff - 0.20f) / 0.15f, 0.1f, 0.7f);
+                        }
+                    }
+                }
+                // B. Next node / segment boundary check: leader is on nextIdx in same direction
+                else if (leader.CurrentPathIndex == nextIdx && leader.Forward == vehicle.Forward)
+                {
+                    float distAcrossBoundary = (1.0f - vehicle.ProgressToNext) + leader.ProgressToNext;
+                    if (distAcrossBoundary < 0.22f)
+                    {
+                        // Stop before crossing into the next node to avoid stacking
+                        vehicle.ProgressToNext = Mathf.Clamp(1.0f - (0.22f - leader.ProgressToNext), 0f, 0.95f);
+                        speedFactor = 0f;
+                    }
+                    else if (distAcrossBoundary < 0.38f)
+                    {
+                        speedFactor = Mathf.Clamp((distAcrossBoundary - 0.22f) / 0.16f, 0.1f, 0.7f);
+                    }
+                }
+                // C. General track distance check
+                else if (leaderDist < 0.25f)
+                {
+                    speedFactor = 0f;
+                }
+                else if (leaderDist < 0.45f)
+                {
+                    speedFactor = Mathf.Clamp((leaderDist - 0.25f) / 0.20f, 0.1f, 0.8f);
+                }
+            }
+
+            // D. World position proximity check against stacking
+            if (speedFactor > 0f)
+            {
+                Vector2 myPos = vehicle.GetWorldPosition(route, graph);
+                foreach (var other in Vehicles)
+                {
+                    if (other.RouteId != route.Id || other.Id == vehicle.Id) continue;
+                    if (!route.IsLoop && other.Forward != vehicle.Forward) continue;
+
+                    Vector2 otherPos = other.GetWorldPosition(route, graph);
+                    float worldDist = (otherPos - myPos).Length();
+                    if (worldDist < 20.0f)
+                    {
+                        float myCycle = GetRouteCycleProgress(vehicle, route);
+                        float otherCycle = GetRouteCycleProgress(other, route);
+                        float cycleLen = GetRouteCycleLength(route);
+                        float forwardDiff = otherCycle - myCycle;
+                        while (forwardDiff <= 0f) forwardDiff += cycleLen;
+                        while (forwardDiff > cycleLen) forwardDiff -= cycleLen;
+
+                        if (forwardDiff < cycleLen * 0.5f)
+                        {
+                            speedFactor = 0f;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (speedFactor <= 0f)
+            {
+                // Stopped behind preceding bus
+                continue;
+            }
+
+            // 5. Advance vehicle along the segment
+            float rushBonus = IsPeakHour(CurrentGameHour) ? 1.15f : 1.0f;
+            float moveSpeed = 0.55f * speedMult * speedFactor * rushBonus;
             vehicle.ProgressToNext += delta * moveSpeed;
 
-            // Reached next node:
+            // 6. Reached next node:
             if (vehicle.ProgressToNext >= 1.0f)
             {
+                // Prevent entering next node if leader is currently dwelling right on it
+                if (leader != null && leader.CurrentPathIndex == nextIdx && leader.Forward == vehicle.Forward && leader.ProgressToNext < 0.15f)
+                {
+                    vehicle.ProgressToNext = 0.95f;
+                    continue;
+                }
+
                 vehicle.ProgressToNext = 0f;
                 vehicle.CurrentPathIndex = nextIdx;
                 int arrivedNodeId = route.PathNodeIds[vehicle.CurrentPathIndex];
 
-                // 1. Check if arrived at LINE TERMINUS (end of route)
+                // A. Check if arrived at LINE TERMINUS (end of route)
                 if (!route.IsLoop && (vehicle.CurrentPathIndex <= 0 || vehicle.CurrentPathIndex >= route.PathNodeIds.Count - 1))
                 {
-                    // REALISTIC TRANSIT: At terminus, ALL passengers disembark!
                     vehicle.Passengers = 0;
                     vehicle.State = VehicleState.TerminusLayover;
                     vehicle.StateTimer = 4.0f; // Layover dwell before return trip
@@ -535,11 +905,16 @@ public class TransitManager
                     continue;
                 }
 
-                // 2. Check if arrived at a DESIGNATED BUS STOP
+                // B. Check if arrived at a DESIGNATED BUS STOP
                 if (route.StopNodeIds.Contains(arrivedNodeId))
                 {
                     vehicle.State = VehicleState.AtStop;
-                    vehicle.StateTimer = 2.5f; // Stop dwell time
+                    float baseDwell = 2.5f;
+
+                    // Anti-bunching headway holding control
+                    float holdingTime = CalculateHeadwayHoldingTime(vehicle, route, CurrentGameHour);
+                    vehicle.StateTimer = baseDwell + holdingTime;
+                    vehicle.IsHolding = (holdingTime > 0.2f);
 
                     // Passengers alight (20% to 40%)
                     int alighting = Mathf.RoundToInt(vehicle.Passengers * (0.20f + (float)_random.NextDouble() * 0.20f));
