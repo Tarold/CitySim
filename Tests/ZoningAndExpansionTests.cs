@@ -385,5 +385,57 @@ public class ZoningAndExpansionTests
         Assert.That(_roadGraph.NodeMap.ContainsKey(zId), Is.False);
         Assert.That(_roadGraph.AdjacencyEdges.ContainsKey(zId), Is.False);
     }
+
+    [Test]
+    public void RoadGraph_GetNodeDegree_AccuratelyReportsDegreeAndExcludesDisconnectedEdges()
+    {
+        int z1 = _grid.GetZoneId(1, 1);
+        int z2 = _grid.GetZoneId(1, 2);
+
+        _roadGraph.EnsureNode(z1, _grid.GetWorldCenter(z1));
+        _roadGraph.EnsureNode(z2, _grid.GetWorldCenter(z2));
+
+        // Isolated nodes have degree 0
+        Assert.That(_roadGraph.GetNodeDegree(z1), Is.EqualTo(0));
+        Assert.That(_roadGraph.GetNodeDegree(z2), Is.EqualTo(0));
+
+        // Add connecting road
+        _roadGraph.AddRoadSegment(z1, z2);
+        Assert.That(_roadGraph.GetNodeDegree(z1), Is.EqualTo(1));
+        Assert.That(_roadGraph.GetNodeDegree(z2), Is.EqualTo(1));
+
+        // Remove road segment: degree should revert to 0
+        _roadGraph.RemoveRoadSegment(z1, z2);
+        Assert.That(_roadGraph.GetNodeDegree(z1), Is.EqualTo(0));
+        Assert.That(_roadGraph.GetNodeDegree(z2), Is.EqualTo(0));
+    }
+
+    [Test]
+    public void RoadGraph_MultiConnectionAndSplit_DegreesAreAccurate()
+    {
+        int z1 = _grid.GetZoneId(2, 2);
+        int z2 = _grid.GetZoneId(2, 3);
+        int z3 = _grid.GetZoneId(3, 2);
+
+        _roadGraph.EnsureNode(z1, _grid.GetWorldCenter(z1));
+        _roadGraph.EnsureNode(z2, _grid.GetWorldCenter(z2));
+        _roadGraph.EnsureNode(z3, _grid.GetWorldCenter(z3));
+
+        _roadGraph.AddRoadSegment(z1, z2);
+        _roadGraph.AddRoadSegment(z1, z3);
+
+        Assert.That(_roadGraph.GetNodeDegree(z1), Is.EqualTo(2));
+        Assert.That(_roadGraph.GetNodeDegree(z2), Is.EqualTo(1));
+        Assert.That(_roadGraph.GetNodeDegree(z3), Is.EqualTo(1));
+
+        // Detach and remove z1
+        bool removed = _roadGraph.DetachAndRemoveNode(z1);
+        Assert.That(removed, Is.True);
+        Assert.That(_roadGraph.GetNode(z1), Is.Null);
+        Assert.That(_roadGraph.GetNodeDegree(z1), Is.EqualTo(0));
+        // z2 and z3 now have degree 0
+        Assert.That(_roadGraph.GetNodeDegree(z2), Is.EqualTo(0));
+        Assert.That(_roadGraph.GetNodeDegree(z3), Is.EqualTo(0));
+    }
 }
 

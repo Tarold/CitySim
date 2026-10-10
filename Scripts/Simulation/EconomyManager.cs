@@ -17,6 +17,31 @@ public class EconomyManager
     /// Gets the net income or expense (delta) calculated during the last financial tick.
     /// </summary>
     public float LastDelta { get; private set; }
+
+    /// <summary>
+    /// Gets the total tax revenue collected during the last financial tick.
+    /// </summary>
+    public float LastTaxRevenue { get; private set; }
+
+    /// <summary>
+    /// Gets the transit fare income collected during the last financial tick.
+    /// </summary>
+    public float LastTransitRevenue { get; private set; }
+
+    /// <summary>
+    /// Gets the operating expenses deducted during the last financial tick.
+    /// </summary>
+    public float LastExpenses { get; private set; }
+
+    /// <summary>
+    /// Gets the population tax revenue collected during the last financial tick.
+    /// </summary>
+    public float LastPopulationTax { get; private set; }
+
+    /// <summary>
+    /// Gets the job tax revenue collected during the last financial tick.
+    /// </summary>
+    public float LastJobTax { get; private set; }
     
     /// <summary>
     /// The cost to build a single road segment.
@@ -110,51 +135,73 @@ public class EconomyManager
     public void ProcessFinancialTick(CityGrid grid, RoadGraph roadGraph, TransitManager transitManager, ParcelManager parcelManager = null)
     {
         float expenses = 0f;
-        float income = 0f;
+        float popTax = 0f;
+        float jobTax = 0f;
+        float transitIncome = 0f;
 
         // 1. Road Maintenance
-        int activeSegments = 0;
-        foreach (var edge in roadGraph.Edges)
+        if (roadGraph != null)
         {
-            if (edge.FromId != -1) activeSegments++;
+            int activeSegments = 0;
+            foreach (var edge in roadGraph.Edges)
+            {
+                if (edge.FromId != -1) activeSegments++;
+            }
+            activeSegments /= 2; // Because edges are bidirectional
+            expenses += (activeSegments * RoadMaintenancePerSegment) / 24f;
         }
-        activeSegments /= 2; // Because edges are bidirectional
-        expenses += (activeSegments * RoadMaintenancePerSegment) / 24f;
 
-        // 2. Transit Maintenance (Using Fleet Size)
-        foreach (var route in transitManager.Routes)
+        // 2. Transit Maintenance (Using Fleet Size) and Transit Fare Income
+        if (transitManager != null)
         {
-            expenses += (route.FleetSize * 15f) / 24f; // Fixed cost per vehicle per tick
-            // Route maintenance
-            expenses += 50f / 24f; 
+            foreach (var route in transitManager.Routes)
+            {
+                expenses += (route.FleetSize * 15f) / 24f; // Fixed cost per vehicle per tick
+                expenses += 50f / 24f; // Route maintenance
+
+                // Transit fare income per hourly tick (from route turnover)
+                transitIncome += route.DailyRevenue / 24f;
+            }
         }
         
         // 3. Taxes from Grid Zones
-        for (int i = 0; i < grid.ZoneCount; i++)
+        if (grid != null)
         {
-            var zone = grid.GetZone(i);
-            if (zone == null || zone.Type == ZoneType.Empty || zone.Type == ZoneType.Entrance) continue;
+            for (int i = 0; i < grid.ZoneCount; i++)
+            {
+                var zone = grid.GetZone(i);
+                if (zone == null || zone.Type == ZoneType.Empty || zone.Type == ZoneType.Entrance) continue;
 
-            if (zone.Type == ZoneType.Residential)
-            {
-                income += (zone.Population * TaxPerPopulation) / 24f;
-            }
-            else if (zone.Type == ZoneType.Commercial || zone.Type == ZoneType.Industrial)
-            {
-                income += (zone.Jobs * TaxPerJob) / 24f;
+                if (zone.Type == ZoneType.Residential)
+                {
+                    popTax += (zone.Population * TaxPerPopulation) / 24f;
+                }
+                else if (zone.Type == ZoneType.Commercial || zone.Type == ZoneType.Industrial)
+                {
+                    jobTax += (zone.Jobs * TaxPerJob) / 24f;
+                }
             }
         }
 
         // 4. Taxes from Roadside Parcels
         if (parcelManager != null)
         {
-            income += (parcelManager.TotalPopulation * TaxPerPopulation) / 24f;
-            income += (parcelManager.TotalJobs * TaxPerJob) / 24f;
+            popTax += (parcelManager.TotalPopulation * TaxPerPopulation) / 24f;
+            jobTax += (parcelManager.TotalJobs * TaxPerJob) / 24f;
         }
+
+        float taxIncome = popTax + jobTax;
+        float income = taxIncome + transitIncome;
 
         // Apply
         float delta = income - expenses;
         Money += delta;
         LastDelta = delta;
+
+        LastPopulationTax = popTax;
+        LastJobTax = jobTax;
+        LastTaxRevenue = taxIncome;
+        LastTransitRevenue = transitIncome;
+        LastExpenses = expenses;
     }
 }

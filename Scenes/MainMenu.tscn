@@ -30,7 +30,7 @@ grow_vertical = 2
 
 [node name="VBoxContainer" type="VBoxContainer" parent="CenterContainer"]
 layout_mode = 2
-theme_override_constants/separation = 20
+theme_override_constants/separation = 16
 
 [node name="Title" type="Label" parent="CenterContainer/VBoxContainer"]
 layout_mode = 2
@@ -46,17 +46,35 @@ text = "A traffic and transit simulator"
 horizontal_alignment = 1
 
 [node name="Control" type="Control" parent="CenterContainer/VBoxContainer"]
-custom_minimum_size = Vector2(0, 40)
+custom_minimum_size = Vector2(0, 20)
 layout_mode = 2
 
 [node name="StartNewCityButton" type="Button" parent="CenterContainer/VBoxContainer"]
-custom_minimum_size = Vector2(300, 60)
+custom_minimum_size = Vector2(360, 52)
 layout_mode = 2
-theme_override_font_sizes/font_size = 28
+theme_override_font_sizes/font_size = 24
 text = "Start New City"
 
 [node name="LoadTutorialButton" type="Button" parent="CenterContainer/VBoxContainer"]
-custom_minimum_size = Vector2(300, 60)
+custom_minimum_size = Vector2(360, 52)
 layout_mode = 2
-theme_override_font_sizes/font_size = 28
+theme_override_font_sizes/font_size = 24
 text = "Load Tutorial City"
+
+[node name="LoadEconomyTestButton" type="Button" parent="CenterContainer/VBoxContainer"]
+custom_minimum_size = Vector2(360, 52)
+layout_mode = 2
+theme_override_font_sizes/font_size = 24
+text = "Economy Test Scenario"
+
+[node name="LoadRoutingTestButton" type="Button" parent="CenterContainer/VBoxContainer"]
+custom_minimum_size = Vector2(360, 52)
+layout_mode = 2
+theme_override_font_sizes/font_size = 24
+text = "Routing Test Scenario"
+
+[node name="LoadMapEditingTestButton" type="Button" parent="CenterContainer/VBoxContainer"]
+custom_minimum_size = Vector2(360, 52)
+layout_mode = 2
+theme_override_font_sizes/font_size = 24
+text = "Map Editing Test Scenario"

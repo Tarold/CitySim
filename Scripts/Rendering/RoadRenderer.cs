@@ -8,7 +8,16 @@ public partial class RoadRenderer : Node2D
 {
     private RoadGraph _graph;
     private TrafficLightManager _trafficLights;
+    /// <summary>
+    /// Gets or sets whether heatmap mode is active.
+    /// </summary>
     public bool HeatmapEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Gets or sets whether commute infographics mode is active.
+    /// </summary>
+    public bool CommuteInfographicsEnabled { get; set; } = false;
+
     private float _maxVolume = 1f;
 
     public void Initialize(RoadGraph graph, TrafficLightManager trafficLights)
@@ -100,11 +109,12 @@ public partial class RoadRenderer : Node2D
         }
 
         // Draw smooth circular/filleted junction asphalt caps at intersection nodes to cleanly seal multi-road junctions without jagged seams
+        // Only draw caps for nodes with connecting edges (degree >= 1). Nodes with degree 0 must never render cul-de-sac or junction circles.
         if (!HeatmapEnabled)
         {
             foreach (var node in _graph.Nodes)
             {
-                int degree = _graph.AdjacencyEdges.TryGetValue(node.Id, out var edges) ? edges.Count : 0;
+                int degree = _graph.GetNodeDegree(node.Id);
                 if (degree >= 3)
                 {
                     // Multi-road junction / intersection: larger fillet to seal wider ribbon joins cleanly
@@ -117,9 +127,9 @@ public partial class RoadRenderer : Node2D
                     DrawCircle(node.WorldPosition, 3.8f, new Color(0.12f, 0.12f, 0.15f, 0.95f));
                     DrawCircle(node.WorldPosition, 3.0f, new Color(0.22f, 0.22f, 0.26f, 0.95f));
                 }
-                else
+                else if (degree == 1)
                 {
-                    // Cul-de-sac / isolated node
+                    // Cul-de-sac / dead end with road attachment
                     DrawCircle(node.WorldPosition, 3.5f, new Color(0.12f, 0.12f, 0.15f, 0.95f));
                     DrawCircle(node.WorldPosition, 2.8f, new Color(0.22f, 0.22f, 0.26f, 0.95f));
                 }
@@ -180,12 +190,16 @@ public partial class RoadRenderer : Node2D
         {
             foreach (var node in _graph.Nodes)
             {
+                if (_graph.GetNodeDegree(node.Id) == 0) continue;
                 float maxRatio = 0f;
                 if (_graph.AdjacencyEdges.TryGetValue(node.Id, out var edgeIds))
                 {
                     foreach (var eid in edgeIds)
                     {
-                        float r = _graph.Edges[eid].GetCongestionRatio();
+                        if (eid < 0 || eid >= _graph.Edges.Count) continue;
+                        var e = _graph.Edges[eid];
+                        if (e.FromId == -1 || e.ToId == -1) continue;
+                        float r = e.GetCongestionRatio();
                         if (r > maxRatio) maxRatio = r;
                     }
                 }
@@ -195,6 +209,64 @@ public partial class RoadRenderer : Node2D
                     Color hotColor = GetHeatmapColor(maxRatio);
                     DrawCircle(node.WorldPosition, 5f + maxRatio * 2f, hotColor);
                 }
+            }
+        }
+
+        // 4. Quantitative Road Congestion Numbers Overlay
+        if (HeatmapEnabled || CommuteInfographicsEnabled)
+        {
+            var processedSegments = new HashSet<(int, int)>();
+
+            foreach (var edge in _graph.Edges)
+            {
+                if (edge.FromId == -1 || edge.ToId == -1) continue;
+
+                int u = Mathf.Min(edge.FromId, edge.ToId);
+                int v = Mathf.Max(edge.FromId, edge.ToId);
+                if (processedSegments.Contains((u, v))) continue;
+                processedSegments.Add((u, v));
+
+                var fromNode = _graph.GetNode(edge.FromId);
+                var toNode = _graph.GetNode(edge.ToId);
+                if (fromNode == null || toNode == null) continue;
+
+                int revEdgeId = _graph.FindEdgeId(edge.ToId, edge.FromId);
+                RoadEdge revEdge = revEdgeId >= 0 && revEdgeId < _graph.Edges.Count ? _graph.Edges[revEdgeId] : null;
+
+                float forwardRatio = edge.GetCongestionRatio();
+                float reverseRatio = revEdge?.GetCongestionRatio() ?? 0f;
+                float peakRatio = Mathf.Max(forwardRatio, reverseRatio);
+                float totalVol = edge.CurrentVolume + (revEdge?.CurrentVolume ?? 0f);
+
+                // Display numerical congestion values for road edges with active traffic
+                if (totalVol < 0.5f && peakRatio < 0.01f) continue;
+
+                Vector2 labelPos = edge.Curve != null
+                    ? edge.Curve.Evaluate(0.5f)
+                    : (fromNode.WorldPosition + toNode.WorldPosition) * 0.5f;
+
+                string text = $"{peakRatio * 100f:F0}%";
+                int fontSize = 9;
+                float badgeWidth = text.Length >= 4 ? 30f : 24f;
+                float badgeHeight = 13f;
+
+                Rect2 bgRect = new Rect2(labelPos.X - badgeWidth * 0.5f, labelPos.Y - badgeHeight * 0.5f, badgeWidth, badgeHeight);
+
+                // High-contrast dark badge background backing with heatmap color-coded outline
+                Color heatColor = GetHeatmapColor(peakRatio);
+                DrawRect(bgRect, new Color(0.06f, 0.06f, 0.09f, 0.90f), true);
+                DrawRect(bgRect, heatColor, false, 1.0f);
+
+                // High-contrast white text centered horizontally and vertically
+                DrawString(
+                    ThemeDB.FallbackFont,
+                    new Vector2(bgRect.Position.X, labelPos.Y + 3.5f),
+                    text,
+                    HorizontalAlignment.Center,
+                    badgeWidth,
+                    fontSize,
+                    Colors.White
+                );
             }
         }
     }

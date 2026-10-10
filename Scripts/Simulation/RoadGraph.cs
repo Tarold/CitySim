@@ -962,11 +962,18 @@ public class RoadGraph
     }
 
     /// <summary>
-    /// Returns the degree (number of outgoing edges) of a node.
+    /// Returns the degree (number of active connecting edges) of a node.
     /// </summary>
     public int GetNodeDegree(int nodeId)
     {
-        return AdjacencyEdges.TryGetValue(nodeId, out var edges) ? edges.Count : 0;
+        if (!AdjacencyEdges.TryGetValue(nodeId, out var edges)) return 0;
+        int count = 0;
+        foreach (int eid in edges)
+        {
+            if (eid >= 0 && eid < Edges.Count && Edges[eid].FromId != -1 && Edges[eid].ToId != -1)
+                count++;
+        }
+        return count;
     }
 
     /// <summary>

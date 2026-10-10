@@ -59,7 +59,19 @@ public partial class Main : Node2D
     private List<int> _draftTransitPath = new List<int>();
     private bool _draftIsLoop = false;
     
-    public static bool LoadTutorialMode { get; set; } = true;
+    /// <summary>
+    /// Gets or sets the scenario to load when entering the simulation scene.
+    /// </summary>
+    public static ScenarioType SelectedScenario { get; set; } = ScenarioType.Tutorial;
+
+    /// <summary>
+    /// Compatibility property for tutorial city loading flag.
+    /// </summary>
+    public static bool LoadTutorialMode
+    {
+        get => SelectedScenario == ScenarioType.Tutorial;
+        set => SelectedScenario = value ? ScenarioType.Tutorial : ScenarioType.Sandbox;
+    }
 
     public override void _Ready()
     {
@@ -70,15 +82,26 @@ public partial class Main : Node2D
         _economyManager = new EconomyManager();
         _parcelManager.Initialize(_roadGraph);
         
-        if (LoadTutorialMode)
+        switch (SelectedScenario)
         {
-            TutorialCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
-        }
-        else
-        {
-            _roadGraph.BuildFromGrid(_grid);
-            _transitManager.CreateDefaultRoutes(_grid, _roadGraph);
-            _parcelManager.RefreshParcels(_roadGraph);
+            case ScenarioType.Tutorial:
+                TutorialCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
+                break;
+            case ScenarioType.EconomyTest:
+                EconomyTestCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
+                break;
+            case ScenarioType.RoutingTest:
+                RoutingTestCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
+                break;
+            case ScenarioType.MapEditingTest:
+                MapEditingTestCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
+                break;
+            case ScenarioType.Sandbox:
+            default:
+                _roadGraph.BuildFromGrid(_grid);
+                _transitManager.CreateDefaultRoutes(_grid, _roadGraph);
+                _parcelManager.RefreshParcels(_roadGraph);
+                break;
         }
         
         _distanceMatrix = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
@@ -139,6 +162,8 @@ public partial class Main : Node2D
         _gameUI.CommuteInfographicsToggled += (enabled) =>
         {
             _commuteOverlay.Visible = enabled;
+            _roadRenderer.CommuteInfographicsEnabled = enabled;
+            _roadRenderer.Refresh();
         };
 
         _gameUI.TransitRoutesToggled += (enabled) =>
@@ -946,6 +971,43 @@ public partial class Main : Node2D
             var validTargets = GetValidAdjacentTargets(InteractionMode.Demolish, zone.Id);
             if (validTargets.Count == 0)
             {
+                // If this is an isolated building or orphan node with degree 0, demolish/dezone it directly
+                if (_roadGraph.GetNodeDegree(zone.Id) == 0)
+                {
+                    bool wasNode = _roadGraph.GetNode(zone.Id) != null;
+                    bool wasZoned = zone.Type != ZoneType.Empty;
+
+                    if (wasNode)
+                    {
+                        _roadGraph.DetachAndRemoveNode(zone.Id);
+                    }
+                    if (wasZoned)
+                    {
+                        _grid.DezoneCell(zone.Id);
+                    }
+
+                    if (wasNode || wasZoned)
+                    {
+                        if (_selectedZoneId == zone.Id)
+                        {
+                            ClearInspectSelection();
+                        }
+                        _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+                        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+                        _trafficLights.BuildIntersections(_roadGraph);
+                        _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
+                        _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
+                        RecalculateODMatrix();
+                        _cityRenderer.Refresh();
+                        _roadRenderer.Refresh();
+                        _vehicleRenderer.QueueRedraw();
+                        _gameUI.ShowCityOverview(_grid, _odMatrix);
+
+                        _gameUI.SetToolHint($"💥 Demolished isolated building/node at ({gx}, {gy}).", new Color(1f, 0.4f, 0.3f));
+                        return;
+                    }
+                }
+
                 _gameUI.SetToolHint($"⚠️ Zone at ({gx}, {gy}) has no road connections to demolish.", Colors.Coral);
                 return;
             }
@@ -1004,6 +1066,18 @@ public partial class Main : Node2D
             bool removed = _roadGraph.RemoveRoadSegment(_pendingStartZoneId, zone.Id);
             if (removed)
             {
+                // If either endpoint is now an empty zone with degree 0, detach and remove it
+                var startZ = _grid.GetZone(_pendingStartZoneId);
+                if (startZ != null && startZ.Type == ZoneType.Empty && _roadGraph.GetNodeDegree(_pendingStartZoneId) == 0)
+                {
+                    _roadGraph.DetachAndRemoveNode(_pendingStartZoneId);
+                }
+                var targetZ = _grid.GetZone(zone.Id);
+                if (targetZ != null && targetZ.Type == ZoneType.Empty && _roadGraph.GetNodeDegree(zone.Id) == 0)
+                {
+                    _roadGraph.DetachAndRemoveNode(zone.Id);
+                }
+
                 _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
                 _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
                 _trafficLights.BuildIntersections(_roadGraph);
@@ -1111,6 +1185,16 @@ public partial class Main : Node2D
 
         if (zone == null || zone.Type == ZoneType.Empty)
         {
+            if (_roadGraph.GetNode(zoneId) != null && _roadGraph.GetNodeDegree(zoneId) == 0)
+            {
+                _roadGraph.DetachAndRemoveNode(zoneId);
+                _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+                _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+                _trafficLights.BuildIntersections(_roadGraph);
+                _roadRenderer.Refresh();
+                _gameUI.SetToolHint($"🧹 Cleared orphan connector dot at ({gx}, {gy}).", new Color(1f, 0.7f, 0.4f));
+                return;
+            }
             _gameUI.SetToolHint($"ℹ️ Cell ({gx}, {gy}) is already empty terrain.", Colors.LightGray);
             return;
         }
@@ -1120,8 +1204,14 @@ public partial class Main : Node2D
             ClearInspectSelection();
         }
 
-        // Only dezone the cell, leaving any existing road nodes and edges intact
+        // Dezone the cell
         _grid.DezoneCell(zoneId);
+
+        // If the associated RoadNode has degree 0 (no road edges attached), detach and remove it
+        if (_roadGraph.GetNode(zoneId) != null && _roadGraph.GetNodeDegree(zoneId) == 0)
+        {
+            _roadGraph.DetachAndRemoveNode(zoneId);
+        }
 
         _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
         _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);

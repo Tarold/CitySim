@@ -452,7 +452,11 @@ public partial class GameUI : CanvasLayer
         var sep2 = new HSeparator();
         _commuteViewContainer.AddChild(sep2);
 
-        _infoModeSplit = new Label { Text = "🚗 Авто: 65%   🚌 Громадський транспорт: 35%" };
+        _infoModeSplit = new Label 
+        { 
+            Text = "🚗 На авто: 65%\n🚌 Громадський транспорт: 35%",
+            AutowrapMode = TextServer.AutowrapMode.Word
+        };
         _commuteViewContainer.AddChild(_infoModeSplit);
 
         _infoTopDestinations = new Label 
@@ -711,6 +715,11 @@ public partial class GameUI : CanvasLayer
         );
     }
 
+    private static string FormatModeSplit(float carPct, float carTrips, float transitPct, float transitTrips, float walkPct, float walkTrips)
+    {
+        return $"🚗 На авто: {carPct:F1}% ({carTrips:N0})\n🚌 Громадський транспорт: {transitPct:F1}% ({transitTrips:N0})\n🚶 Пішки: {walkPct:F1}% ({walkTrips:N0})";
+    }
+
     public void ShowZoneInfographics(Zone zone, CityGrid grid, ODMatrix od, float[,] distances)
     {
         SwitchToCommuteTab();
@@ -737,7 +746,7 @@ public partial class GameUI : CanvasLayer
                 $"  🏢 Діловий Центр (Офіси): {res.comPct:F1}% ({res.comTrips:N0})\n" +
                 $"  🏭 Східна Промзона (Заводи): {res.indPct:F1}% ({res.indTrips:N0})";
 
-            _infoModeSplit.Text = $"🚗 На авто: {res.carPct:F1}% ({res.outgoingCar:N0})   🚌 Громадський транспорт: {res.transitPct:F1}% ({res.outgoingTransit:N0})   🚶 Пішки: {res.walkPct:F1}% ({res.outgoingWalk:N0})";
+            _infoModeSplit.Text = FormatModeSplit(res.carPct, res.outgoingCar, res.transitPct, res.outgoingTransit, res.walkPct, res.outgoingWalk);
 
             if (res.destinations.Count > 0)
             {
@@ -791,7 +800,7 @@ public partial class GameUI : CanvasLayer
                 _infoWorkplaceBreakdown.Text = "Звідки добираються працівники на цей завод:\n  • Немає активних вхідних поїздок";
             }
 
-            _infoModeSplit.Text = $"🚗 На авто: {ind.carPct:F1}% ({ind.incomingCar:N0})   🚌 Громадський транспорт: {ind.transitPct:F1}% ({ind.incomingTransit:N0})   🚶 Пішки: {ind.walkPct:F1}% ({ind.incomingWalk:N0})";
+            _infoModeSplit.Text = FormatModeSplit(ind.carPct, ind.incomingCar, ind.transitPct, ind.incomingTransit, ind.walkPct, ind.incomingWalk);
             _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {ind.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {ind.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {ind.incomingWalk:N0} піш/год";
             _infoHint.Text = "✨ Підсвічені зелені вулиці показують шлях працівників зі спальних районів!";
         }
@@ -828,7 +837,7 @@ public partial class GameUI : CanvasLayer
                 _infoWorkplaceBreakdown.Text = "Звідки добираються співробітники офісів:\n  • Немає активних вхідних поїздок";
             }
 
-            _infoModeSplit.Text = $"🚗 На авто: {com.carPct:F1}% ({com.incomingCar:N0})   🚌 Громадський транспорт: {com.transitPct:F1}% ({com.incomingTransit:N0})   🚶 Пішки: {com.walkPct:F1}% ({com.incomingWalk:N0})";
+            _infoModeSplit.Text = FormatModeSplit(com.carPct, com.incomingCar, com.transitPct, com.incomingTransit, com.walkPct, com.incomingWalk);
             _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {com.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {com.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {com.incomingWalk:N0} піш/год";
             _infoHint.Text = "✨ Підсвічені вулиці показують шляхи прибуття офісних співробітників!";
         }
@@ -860,7 +869,7 @@ public partial class GameUI : CanvasLayer
                 $"  🏢 Офіси й послуги: {res.comPct:F1}% ({res.comTrips:N0})\n" +
                 $"  🏭 Промисловість: {res.indPct:F1}% ({res.indTrips:N0})";
 
-            _infoModeSplit.Text = $"🚗 На авто: {res.carPct:F1}% ({res.outgoingCar:N0})   🚌 Громадський транспорт: {res.transitPct:F1}% ({res.outgoingTransit:N0})   🚶 Пішки: {res.walkPct:F1}% ({res.outgoingWalk:N0})";
+            _infoModeSplit.Text = FormatModeSplit(res.carPct, res.outgoingCar, res.transitPct, res.outgoingTransit, res.walkPct, res.outgoingWalk);
 
             if (res.destinations.Count > 0)
             {
@@ -914,7 +923,7 @@ public partial class GameUI : CanvasLayer
                 _infoWorkplaceBreakdown.Text = "Звідки добираються робітники:\n  • Немає активних вхідних поїздок";
             }
 
-            _infoModeSplit.Text = $"🚗 На авто: {ind.carPct:F1}% ({ind.incomingCar:N0})   🚌 Громадський транспорт: {ind.transitPct:F1}% ({ind.incomingTransit:N0})   🚶 Пішки: {ind.walkPct:F1}% ({ind.incomingWalk:N0})";
+            _infoModeSplit.Text = FormatModeSplit(ind.carPct, ind.incomingCar, ind.transitPct, ind.incomingTransit, ind.walkPct, ind.incomingWalk);
             _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {ind.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {ind.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {ind.incomingWalk:N0} піш/год";
             _infoHint.Text = "✨ Підсвічені зелені вулиці показують шлях робітників зі спальних районів!";
         }
@@ -951,7 +960,7 @@ public partial class GameUI : CanvasLayer
                 _infoWorkplaceBreakdown.Text = "Звідки добираються співробітники:\n  • Немає активних вхідних поїздок";
             }
 
-            _infoModeSplit.Text = $"🚗 На авто: {com.carPct:F1}% ({com.incomingCar:N0})   🚌 Громадський транспорт: {com.transitPct:F1}% ({com.incomingTransit:N0})   🚶 Пішки: {com.walkPct:F1}% ({com.incomingWalk:N0})";
+            _infoModeSplit.Text = FormatModeSplit(com.carPct, com.incomingCar, com.transitPct, com.incomingTransit, com.walkPct, com.incomingWalk);
             _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {com.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {com.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {com.incomingWalk:N0} піш/год";
             _infoHint.Text = "✨ Підсвічені вулиці показують шляхи прибуття співробітників!";
         }
@@ -973,7 +982,7 @@ public partial class GameUI : CanvasLayer
             $"  🏢 Офіси й торгівля: {city.comPct:F1}% ({city.comJobs:N0})\n" +
             $"  🏭 Промисловість: {city.indPct:F1}% ({city.indJobs:N0})";
 
-        _infoModeSplit.Text = $"🚗 На авто: {city.carPct:F1}% ({city.totalCarTrips:N0})   🚌 Громадський транспорт: {city.transitPct:F1}% ({city.totalTransitTrips:N0})   🚶 Пішки: {city.walkPct:F1}% ({city.totalWalkTrips:N0})";
+        _infoModeSplit.Text = FormatModeSplit(city.carPct, city.totalCarTrips, city.transitPct, city.totalTransitTrips, city.walkPct, city.totalWalkTrips);
         _infoTopDestinations.Text = 
             $"Загальний обсяг поїздок: {city.totalTrips:N0} поїздок/год\n" +
             $"Активних зон і ділянок: {(grid?.ActiveZoneIds.Count ?? 0) + (parcelManager != null ? System.Linq.Enumerable.Count(parcelManager.ActiveParcels) : 0)}";
