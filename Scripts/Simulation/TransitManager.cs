@@ -71,6 +71,10 @@ public class TransitVehicle
     public float StateTimer = 0f;
     public bool IsHolding = false;
 
+    /// <summary>
+    /// Computes the 2D world position of this vehicle, evaluating along the connecting road edge's Bézier curve
+    /// with right-hand driving lane offset.
+    /// </summary>
     public Vector2 GetWorldPosition(TransitRoute route, RoadGraph graph)
     {
         if (route.PathNodeIds.Count == 0) return Vector2.Zero;
@@ -93,27 +97,148 @@ public class TransitVehicle
             nextIdx = Mathf.Clamp(nextIdx, 0, route.PathNodeIds.Count - 1);
         }
 
-        var node1 = graph.GetNode(route.PathNodeIds[currIdx]);
-        var node2 = graph.GetNode(route.PathNodeIds[nextIdx]);
+        int fromId = route.PathNodeIds[currIdx];
+        int toId = route.PathNodeIds[nextIdx];
 
+        var node1 = graph.GetNode(fromId);
+        var node2 = graph.GetNode(toId);
         if (node1 == null || node2 == null) return node1?.WorldPosition ?? Vector2.Zero;
 
-        Vector2 basePos = node1.WorldPosition.Lerp(node2.WorldPosition, ProgressToNext);
+        float t = Mathf.Clamp(ProgressToNext, 0f, 1f);
 
-        // Right-hand traffic lane offset
+        // Find connecting road edge and follow its curve
+        int edgeId = graph.FindEdgeId(fromId, toId);
+        var edge = (edgeId >= 0 && edgeId < graph.Edges.Count) ? graph.Edges[edgeId] : null;
+
+        if (edge != null && edge.Curve != null)
+        {
+            Vector2 basePos = edge.Curve.Evaluate(t);
+            Vector2 normal = edge.Curve.GetNormal(t);
+            return basePos + normal * 5.0f;
+        }
+
+        Vector2 fallbackPos = node1.WorldPosition.Lerp(node2.WorldPosition, t);
         Vector2 dir = (node2.WorldPosition - node1.WorldPosition).Normalized();
         if (dir != Vector2.Zero)
         {
             Vector2 rightNormal = new Vector2(-dir.Y, dir.X);
-            basePos += rightNormal * 5.0f;
+            fallbackPos += rightNormal * 5.0f;
         }
 
-        return basePos;
+        return fallbackPos;
+    }
+
+    /// <summary>
+    /// Computes the heading rotation angle in radians of this transit vehicle along the connecting edge curve tangent.
+    /// </summary>
+    public float GetRotation(TransitRoute route, RoadGraph graph)
+    {
+        if (route == null || route.PathNodeIds.Count == 0 || graph == null) return 0f;
+        if (route.PathNodeIds.Count == 1) return 0f;
+
+        int currIdx = Mathf.Clamp(CurrentPathIndex, 0, route.PathNodeIds.Count - 1);
+        int nextIdx;
+
+        if (route.IsLoop)
+        {
+            nextIdx = (currIdx + 1) % route.PathNodeIds.Count;
+        }
+        else
+        {
+            nextIdx = Forward ? currIdx + 1 : currIdx - 1;
+            nextIdx = Mathf.Clamp(nextIdx, 0, route.PathNodeIds.Count - 1);
+        }
+
+        int fromId = route.PathNodeIds[currIdx];
+        int toId = route.PathNodeIds[nextIdx];
+
+        int edgeId = graph.FindEdgeId(fromId, toId);
+        var edge = (edgeId >= 0 && edgeId < graph.Edges.Count) ? graph.Edges[edgeId] : null;
+
+        float t = Mathf.Clamp(ProgressToNext, 0f, 1f);
+
+        if (edge != null && edge.Curve != null)
+        {
+            return edge.Curve.GetTangent(t).Angle();
+        }
+
+        var node1 = graph.GetNode(fromId);
+        var node2 = graph.GetNode(toId);
+        if (node1 != null && node2 != null)
+        {
+            Vector2 delta = node2.WorldPosition - node1.WorldPosition;
+            if (delta.LengthSquared() > 1e-4f)
+            {
+                return delta.Angle();
+            }
+        }
+
+        return 0f;
     }
 }
 
 public class TransitManager
 {
+    public const float DefaultStopShoulderOffset = 8.5f;
+
+    /// <summary>
+    /// Computes the world position of a designated bus stop along the outer road shoulder using curve normal offsets.
+    /// </summary>
+    public static Vector2 GetStopWorldPosition(int stopNodeId, TransitRoute route, RoadGraph graph, float shoulderOffset = DefaultStopShoulderOffset)
+    {
+        if (graph == null) return Vector2.Zero;
+        var node = graph.GetNode(stopNodeId);
+        if (node == null) return Vector2.Zero;
+
+        if (route != null && route.PathNodeIds.Count > 1)
+        {
+            int idx = route.PathNodeIds.IndexOf(stopNodeId);
+            if (idx >= 0)
+            {
+                // Find incident edge along the route
+                int fromId = -1, toId = -1;
+                float t = 0f;
+
+                if (idx < route.PathNodeIds.Count - 1)
+                {
+                    fromId = route.PathNodeIds[idx];
+                    toId = route.PathNodeIds[idx + 1];
+                    t = 0.0f; // Start of outgoing edge
+                }
+                else if (idx > 0)
+                {
+                    fromId = route.PathNodeIds[idx - 1];
+                    toId = route.PathNodeIds[idx];
+                    t = 1.0f; // End of incoming edge
+                }
+
+                if (fromId != -1 && toId != -1)
+                {
+                    int edgeId = graph.FindEdgeId(fromId, toId);
+                    var edge = (edgeId >= 0 && edgeId < graph.Edges.Count) ? graph.Edges[edgeId] : null;
+                    if (edge != null && edge.Curve != null)
+                    {
+                        Vector2 normal = edge.Curve.GetNormal(t);
+                        return node.WorldPosition + normal * shoulderOffset;
+                    }
+                }
+            }
+        }
+
+        // Fallback: search any incident edge in the graph
+        if (graph.AdjacencyEdges.TryGetValue(stopNodeId, out var edgeIds) && edgeIds.Count > 0)
+        {
+            var edge = graph.Edges[edgeIds[0]];
+            if (edge != null && edge.Curve != null)
+            {
+                Vector2 normal = edge.Curve.GetNormal(0f);
+                return node.WorldPosition + normal * shoulderOffset;
+            }
+        }
+
+        return node.WorldPosition;
+    }
+
     public List<TransitRoute> Routes = new List<TransitRoute>();
     public List<TransitVehicle> Vehicles = new List<TransitVehicle>();
     public Dictionary<int, TransitStop> Stops = new Dictionary<int, TransitStop>();
@@ -780,7 +905,7 @@ public class TransitManager
             int nextNodeId = route.PathNodeIds[nextIdx];
 
             // 3. Check traffic light when approaching intersection
-            if (vehicle.ProgressToNext > 0.82f)
+            if (trafficLights != null && vehicle.ProgressToNext > 0.82f)
             {
                 var currNode = graph.GetNode(currNodeId);
                 if (currNode != null && !trafficLights.IsGreen(nextNodeId, currNode.WorldPosition))
@@ -943,49 +1068,138 @@ public class TransitManager
         }
     }
 
-    public float GetTransitCoverage(CityGrid grid)
+    /// <summary>
+    /// Calculates the fraction of residential capacity or units (grid zones and roadside parcels)
+    /// covered within walking distance of active public transit stops.
+    /// </summary>
+    public float GetTransitCoverage(CityGrid grid, RoadGraph graph = null, ParcelManager parcelManager = null)
     {
-        int residentialZones = 0;
-        int coveredResidentialZones = 0;
+        if (Stops.Count == 0) return 0f;
 
-        for (int i = 0; i < grid.ZoneCount; i++)
+        int totalResidential = 0;
+        int coveredResidential = 0;
+
+        float cellSize = grid?.CellSize ?? 64f;
+        float maxWalkDist = 3f * cellSize;
+
+        // 1. Grid residential zones
+        if (grid != null)
         {
-            var zone = grid.GetZone(i);
-            if (zone.Type == ZoneType.Residential)
+            for (int i = 0; i < grid.ZoneCount; i++)
             {
-                residentialZones++;
+                var zone = grid.GetZone(i);
+                if (zone == null || zone.Type != ZoneType.Residential) continue;
+
+                totalResidential++;
                 bool isCovered = false;
 
                 foreach (var stop in Stops.Values)
                 {
-                    var stopZone = grid.GetZone(stop.ZoneId);
-                    if (stopZone == null) continue;
+                    // Guard: only query grid zone if stop.ZoneId is within valid grid array bounds
+                    if (stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
+                    {
+                        var stopZone = grid.GetZone(stop.ZoneId);
+                        if (stopZone != null)
+                        {
+                            int dist = Mathf.Abs(zone.GridPos.X - stopZone.GridPos.X) + Mathf.Abs(zone.GridPos.Y - stopZone.GridPos.Y);
+                            if (dist <= 3)
+                            {
+                                isCovered = true;
+                                break;
+                            }
+                        }
+                    }
 
-                    int dist = Mathf.Abs(zone.GridPos.X - stopZone.GridPos.X) + Mathf.Abs(zone.GridPos.Y - stopZone.GridPos.Y);
-                    if (dist <= 3)
+                    // Vector stop fallback or world-position distance
+                    Vector2 stopPos = Vector2.Zero;
+                    bool hasPos = false;
+                    if (graph != null)
+                    {
+                        var stopNode = graph.GetNode(stop.NodeId);
+                        if (stopNode != null)
+                        {
+                            stopPos = stopNode.WorldPosition;
+                            hasPos = true;
+                        }
+                    }
+                    else if (stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
+                    {
+                        stopPos = grid.GetWorldCenter(stop.ZoneId);
+                        hasPos = true;
+                    }
+
+                    if (hasPos && stopPos.DistanceTo(grid.GetWorldCenter(i)) <= maxWalkDist)
                     {
                         isCovered = true;
                         break;
                     }
                 }
 
-                if (isCovered) coveredResidentialZones++;
+                if (isCovered) coveredResidential++;
             }
         }
 
-        if (residentialZones == 0) return 0f;
-        return (float)coveredResidentialZones / residentialZones;
+        // 2. Roadside residential parcels from ParcelManager
+        if (parcelManager != null && parcelManager.Parcels != null)
+        {
+            var parcels = parcelManager.Parcels;
+            for (int i = 0; i < parcels.Count; i++)
+            {
+                var parcel = parcels[i];
+                if (parcel.ZoneType != ZoneType.Residential) continue;
+
+                totalResidential++;
+                bool isCovered = false;
+
+                foreach (var stop in Stops.Values)
+                {
+                    Vector2 stopPos = Vector2.Zero;
+                    bool hasPos = false;
+
+                    if (graph != null)
+                    {
+                        var stopNode = graph.GetNode(stop.NodeId);
+                        if (stopNode != null)
+                        {
+                            stopPos = stopNode.WorldPosition;
+                            hasPos = true;
+                        }
+                    }
+
+                    if (!hasPos && grid != null && stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
+                    {
+                        stopPos = grid.GetWorldCenter(stop.ZoneId);
+                        hasPos = true;
+                    }
+
+                    if (!hasPos) continue;
+
+                    if (parcel.Center.DistanceTo(stopPos) <= maxWalkDist ||
+                        parcel.AccessPoint.DistanceTo(stopPos) <= maxWalkDist)
+                    {
+                        isCovered = true;
+                        break;
+                    }
+                }
+
+                if (isCovered) coveredResidential++;
+            }
+        }
+
+        if (totalResidential == 0) return 0f;
+        return (float)coveredResidential / totalResidential;
     }
 
     /// <summary>
-    /// Returns the set of all zone IDs within walking distance (Manhattan distance <= maxDistance)
-    /// of any active transit stop.
+    /// Returns the set of all zone IDs within walking distance (Manhattan distance <= maxDistance,
+    /// or world distance <= maxDistance * grid.CellSize) of any active transit stop.
     /// </summary>
-    public HashSet<int> GetCoveredZoneIds(CityGrid grid, int maxDistance = 3)
+    public HashSet<int> GetCoveredZoneIds(CityGrid grid, int maxDistance = 3, RoadGraph graph = null, ParcelManager parcelManager = null)
     {
         var covered = new HashSet<int>();
         if (Stops.Count == 0 || grid == null) return covered;
 
+        float maxWalkDist = maxDistance * grid.CellSize;
         var activeZoneIds = grid.ActiveZoneIds;
         for (int i = 0; i < activeZoneIds.Count; i++)
         {
@@ -993,13 +1207,44 @@ public class TransitManager
             var zone = grid.GetZone(zoneId);
             if (zone == null || zone.Type == ZoneType.Empty) continue;
 
+            Vector2 zonePos = grid.GetWorldCenter(zoneId);
+
             foreach (var stop in Stops.Values)
             {
-                var stopZone = grid.GetZone(stop.ZoneId);
-                if (stopZone == null) continue;
+                // Safely guard grid.GetZone: only call when stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount
+                if (stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
+                {
+                    var stopZone = grid.GetZone(stop.ZoneId);
+                    if (stopZone != null)
+                    {
+                        int dist = Mathf.Abs(zone.GridPos.X - stopZone.GridPos.X) + Mathf.Abs(zone.GridPos.Y - stopZone.GridPos.Y);
+                        if (dist <= maxDistance)
+                        {
+                            covered.Add(zoneId);
+                            break;
+                        }
+                    }
+                }
 
-                int dist = Mathf.Abs(zone.GridPos.X - stopZone.GridPos.X) + Mathf.Abs(zone.GridPos.Y - stopZone.GridPos.Y);
-                if (dist <= maxDistance)
+                // Vector stop or world-position distance resolution
+                Vector2 stopPos = Vector2.Zero;
+                bool hasPos = false;
+                if (graph != null)
+                {
+                    var stopNode = graph.GetNode(stop.NodeId);
+                    if (stopNode != null)
+                    {
+                        stopPos = stopNode.WorldPosition;
+                        hasPos = true;
+                    }
+                }
+                else if (stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
+                {
+                    stopPos = grid.GetWorldCenter(stop.ZoneId);
+                    hasPos = true;
+                }
+
+                if (hasPos && stopPos.DistanceTo(zonePos) <= maxWalkDist)
                 {
                     covered.Add(zoneId);
                     break;
@@ -1007,5 +1252,13 @@ public class TransitManager
             }
         }
         return covered;
+    }
+
+    /// <summary>
+    /// Overload for GetCoveredZoneIds accepting RoadGraph and optional ParcelManager before maxDistance.
+    /// </summary>
+    public HashSet<int> GetCoveredZoneIds(CityGrid grid, RoadGraph graph, ParcelManager parcelManager = null, int maxDistance = 3)
+    {
+        return GetCoveredZoneIds(grid, maxDistance, graph, parcelManager);
     }
 }

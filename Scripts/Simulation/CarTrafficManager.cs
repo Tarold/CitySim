@@ -11,16 +11,31 @@ public class VisualCar
     public float Speed;
     public Color CarColor;
     public bool IsStopped;
+    public Vector2 GetWorldPosition(RoadGraph graph, float laneOffset = 4.5f)
+    {
+        if (graph == null || EdgeId < 0 || EdgeId >= graph.Edges.Count) return Vector2.Zero;
+        var edge = graph.Edges[EdgeId];
+        return CarTrafficManager.GetCarWorldPosition(edge, Progress, laneOffset, graph);
+    }
+
+    public float GetRotation(RoadGraph graph)
+    {
+        if (graph == null || EdgeId < 0 || EdgeId >= graph.Edges.Count) return 0f;
+        var edge = graph.Edges[EdgeId];
+        return CarTrafficManager.GetCarRotation(edge, Progress, graph);
+    }
 }
 
 public class CarTrafficManager
 {
     public const int MaxCars = 160;
     public const float DemandThreshold = 0.05f;
+    public const float DefaultLaneOffset = 4.5f;
 
     public List<VisualCar> Cars = new List<VisualCar>();
     private Random _random = new Random(42);
     private List<int> _busyEdgeIds = new List<int>();
+    private ParcelManager _parcelManager;
 
     private static readonly Color[] Palette = new Color[]
     {
@@ -32,6 +47,91 @@ public class CarTrafficManager
         new Color(0.88f, 0.75f, 0.18f), // Taxi Yellow
         new Color(0.35f, 0.60f, 0.35f)  // Green
     };
+
+    /// <summary>
+    /// Computes the 2D world position for a vehicle along the specified road edge at parameter [0, 1].
+    /// Applies right-hand driving lane offset perpendicular to the curve.
+    /// </summary>
+    public static Vector2 GetCarWorldPosition(RoadEdge edge, float progress, float laneOffset = DefaultLaneOffset, RoadGraph graph = null)
+    {
+        if (edge == null) return Vector2.Zero;
+        float t = Mathf.Clamp(progress, 0.0f, 1.0f);
+
+        if (edge.Curve != null)
+        {
+            Vector2 basePos = edge.Curve.Evaluate(t);
+            Vector2 normal = edge.Curve.GetNormal(t);
+            return basePos + normal * laneOffset;
+        }
+
+        if (graph != null)
+        {
+            var fromNode = graph.GetNode(edge.FromId);
+            var toNode = graph.GetNode(edge.ToId);
+            if (fromNode != null && toNode != null)
+            {
+                Vector2 basePos = fromNode.WorldPosition.Lerp(toNode.WorldPosition, t);
+                Vector2 delta = toNode.WorldPosition - fromNode.WorldPosition;
+                if (delta.LengthSquared() > 1e-4f)
+                {
+                    Vector2 dir = delta.Normalized();
+                    Vector2 normal = new Vector2(-dir.Y, dir.X);
+                    return basePos + normal * laneOffset;
+                }
+                return basePos;
+            }
+        }
+
+        return Vector2.Zero;
+    }
+
+    /// <summary>
+    /// Computes the heading rotation angle in radians for a vehicle along the specified road edge at parameter [0, 1].
+    /// Accurately aligned with the curve tangent vector.
+    /// </summary>
+    public static float GetCarRotation(RoadEdge edge, float progress, RoadGraph graph = null)
+    {
+        if (edge == null) return 0f;
+        float t = Mathf.Clamp(progress, 0.0f, 1.0f);
+
+        if (edge.Curve != null)
+        {
+            return edge.Curve.GetTangent(t).Angle();
+        }
+
+        if (graph != null)
+        {
+            var fromNode = graph.GetNode(edge.FromId);
+            var toNode = graph.GetNode(edge.ToId);
+            if (fromNode != null && toNode != null)
+            {
+                Vector2 delta = toNode.WorldPosition - fromNode.WorldPosition;
+                if (delta.LengthSquared() > 1e-4f)
+                {
+                    return delta.Angle();
+                }
+            }
+        }
+
+        return 0f;
+    }
+
+    /// <summary>
+    /// Instantiates and registers a visual car on the specified road edge.
+    /// </summary>
+    public VisualCar CreateCar(int edgeId, float progress = 0f, float speed = 50f, Color? color = null)
+    {
+        var car = new VisualCar
+        {
+            EdgeId = edgeId,
+            Progress = progress,
+            Speed = speed,
+            CarColor = color ?? Palette[_random.Next(Palette.Length)],
+            IsStopped = false
+        };
+        Cars.Add(car);
+        return car;
+    }
 
     public static bool HasDemand(RoadEdge edge)
     {
@@ -78,13 +178,19 @@ public class CarTrafficManager
         return Mathf.Clamp(target, 1, MaxCars);
     }
 
-    public void Initialize(RoadGraph graph)
+    public void Initialize(RoadGraph graph, ParcelManager parcelManager = null)
     {
         Cars.Clear();
         _busyEdgeIds.Clear();
+        _parcelManager = parcelManager;
 
         if (graph == null || graph.Edges.Count == 0) return;
         RefreshBusyEdges(graph);
+    }
+
+    public void SetParcelManager(ParcelManager parcelManager)
+    {
+        _parcelManager = parcelManager;
     }
 
     public void RefreshBusyEdges(RoadGraph graph)
@@ -123,8 +229,10 @@ public class CarTrafficManager
         }
     }
 
-    public void Update(float delta, float gameSpeed, RoadGraph graph, TrafficLightManager trafficLights)
+    public void Update(float delta, float gameSpeed, RoadGraph graph, TrafficLightManager trafficLights, ParcelManager parcelManager = null)
     {
+        if (parcelManager != null) _parcelManager = parcelManager;
+
         if (graph == null || graph.Edges.Count == 0)
         {
             Cars.Clear();
@@ -133,8 +241,6 @@ public class CarTrafficManager
 
         RefreshBusyEdges(graph);
 
-        // In 100% flow-based architecture, visualization is rendered directly from edge flows (Zero-Agent).
-        // If any legacy car structs are added by external unit tests, cleanly maintain them:
         if (Cars.Count == 0) return;
 
         float speedMult = Mathf.Clamp(gameSpeed, 0.1f, 10.0f);
@@ -159,6 +265,33 @@ public class CarTrafficManager
                     Cars.RemoveAt(i);
                     continue;
                 }
+            }
+
+            // Check traffic light when approaching intersection
+            if (trafficLights != null && car.Progress > 0.82f)
+            {
+                var fromNode = graph.GetNode(edge.FromId);
+                Vector2 fromPos = fromNode != null ? fromNode.WorldPosition : Vector2.Zero;
+                if (!trafficLights.IsGreen(edge.ToId, fromPos))
+                {
+                    car.IsStopped = true;
+                    continue;
+                }
+            }
+
+            car.IsStopped = false;
+            float edgeLen = edge.Length > 0.1f ? edge.Length : (edge.Curve != null ? edge.Curve.Length : 50f);
+            float effectiveSpeed = car.Speed > 0f ? car.Speed : edge.FreeFlowSpeed;
+            if (effectiveSpeed <= 0f) effectiveSpeed = 40f;
+
+            float tMax = (graph != null) ? graph.GetEdgeTrafficExtent(edge, _parcelManager) : 1.0f;
+
+            car.Progress += (effectiveSpeed * delta * speedMult) / Mathf.Max(edgeLen, 1f);
+
+            if (car.Progress >= tMax)
+            {
+                car.Progress = tMax;
+                TransitionToNextEdge(car, edge, graph);
             }
         }
     }
@@ -213,7 +346,9 @@ public class CarTrafficManager
         if (candidate >= 0 && candidate < graph.Edges.Count && HasDemand(graph.Edges[candidate]))
         {
             car.EdgeId = candidate;
-            car.Progress = (float)_random.NextDouble() * 0.3f;
+            float candidateTMax = (graph != null) ? graph.GetEdgeTrafficExtent(graph.Edges[candidate], _parcelManager) : 1.0f;
+            float spawnProgress = (float)_random.NextDouble() * 0.3f;
+            car.Progress = Mathf.Min(spawnProgress, candidateTMax * 0.8f);
             car.Speed = graph.Edges[candidate].FreeFlowSpeed;
             car.IsStopped = false;
             return true;

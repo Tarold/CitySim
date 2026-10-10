@@ -22,6 +22,7 @@ public class RoadEdge
     public float FreeFlowSpeed;
     public float CurrentVolume;
     public int Lanes;
+    public CurveSegment Curve;
 
     // Pedestrian flow attributes
     public float PedestrianVolume;
@@ -57,8 +58,51 @@ public class RoadGraph
     public Dictionary<int, List<int>> AdjacencyEdges = new Dictionary<int, List<int>>();
     public Dictionary<(int, int), List<int>> PathCache = new Dictionary<(int, int), List<int>>();
     public Dictionary<(int, int), List<int>> WalkingPathCache = new Dictionary<(int, int), List<int>>();
+    private readonly Dictionary<int, (int FromId, int ToId, RoadNode Junction)> _splitInfo =
+        new Dictionary<int, (int, int, RoadNode)>();
+    private readonly Dictionary<int, int> _splitReverseEdges = new Dictionary<int, int>();
+
+    public event Action<RoadEdge> EdgeAdded;
+    public event Action<int> EdgeRemoved;
+    public event Action<int, RoadNode> EdgeSplit;
 
     public RoadNode GetNode(int id) => NodeMap.TryGetValue(id, out var n) ? n : null;
+
+    /// <summary>
+    /// Retrieves the split information (fromId, toId, junction) for a split edge, if any.
+    /// </summary>
+    public (int FromId, int ToId, RoadNode Junction)? GetSplitInfo(int edgeId)
+    {
+        return _splitInfo.TryGetValue(edgeId, out var info) ? info : null;
+    }
+
+    /// <summary>
+    /// Retrieves the junction node created by splitting an edge, if any.
+    /// </summary>
+    public RoadNode GetSplitJunction(int edgeId)
+    {
+        return _splitInfo.TryGetValue(edgeId, out var info) ? info.Junction : null;
+    }
+
+    /// <summary>
+    /// Returns the reverse edge ID for the given edge, even if the edge was disconnected by a split.
+    /// </summary>
+    public int GetReverseEdgeId(int edgeId)
+    {
+        if (edgeId >= 0 && edgeId < Edges.Count)
+        {
+            var edge = Edges[edgeId];
+            if (edge.FromId != -1 && edge.ToId != -1)
+            {
+                return FindEdgeId(edge.ToId, edge.FromId);
+            }
+        }
+        if (_splitReverseEdges.TryGetValue(edgeId, out int revId))
+        {
+            return revId;
+        }
+        return -1;
+    }
 
     public void BuildFromGrid(CityGrid grid)
     {
@@ -67,6 +111,8 @@ public class RoadGraph
         NodeMap.Clear();
         AdjacencyEdges.Clear();
         PathCache.Clear();
+        _splitInfo.Clear();
+        _splitReverseEdges.Clear();
 
         for (int i = 0; i < grid.ZoneCount; i++)
         {
@@ -123,19 +169,25 @@ public class RoadGraph
                       z2.Type == ZoneType.Commercial || z2.Type == ZoneType.Industrial;
         float cap = isMain ? 2000f : 1000f;
 
+        var n1 = NodeMap[z1.Id];
+        var n2 = NodeMap[z2.Id];
+        var curveFwd = new CurveSegment(n1.WorldPosition, n2.WorldPosition);
+        var curveRev = curveFwd.GetReversed();
+
         var e1 = new RoadEdge
         {
             Id = edgeIdCounter++,
             FromId = z1.Id,
             ToId = z2.Id,
-            Length = length,
+            Length = curveFwd.Length,
             Capacity = cap,
             FreeFlowSpeed = 50f,
             Lanes = 2,
             CurrentVolume = 0f,
             PedestrianCapacity = 1800f,
             WalkingSpeed = 5.0f,
-            PedestrianVolume = 0f
+            PedestrianVolume = 0f,
+            Curve = curveFwd
         };
 
         var e2 = new RoadEdge
@@ -143,14 +195,15 @@ public class RoadGraph
             Id = edgeIdCounter++,
             FromId = z2.Id,
             ToId = z1.Id,
-            Length = length,
+            Length = curveRev.Length,
             Capacity = cap,
             FreeFlowSpeed = 50f,
             Lanes = 2,
             CurrentVolume = 0f,
             PedestrianCapacity = 1800f,
             WalkingSpeed = 5.0f,
-            PedestrianVolume = 0f
+            PedestrianVolume = 0f,
+            Curve = curveRev
         };
 
         Edges.Add(e1);
@@ -495,9 +548,111 @@ public class RoadGraph
     public bool HasEdge(int fromId, int toId) => FindEdgeId(fromId, toId) != -1;
 
     /// <summary>
-    /// Establishes a bidirectional <see cref="RoadEdge"/> between two adjacent
-    /// zone nodes. Does nothing if the connection already exists or either node
-    /// is unknown.
+    /// Computes the next unique node identifier.
+    /// </summary>
+    public int GetNextNodeId()
+    {
+        int maxId = 0;
+        foreach (var k in NodeMap.Keys)
+        {
+            if (k >= maxId) maxId = k + 1;
+        }
+        return maxId;
+    }
+
+    /// <summary>
+    /// Creates and registers a new RoadNode at the specified continuous 2D world position.
+    /// </summary>
+    public RoadNode CreateNode(Vector2 worldPosition, int zoneId = -1)
+    {
+        int id = zoneId >= 0 && !NodeMap.ContainsKey(zoneId) ? zoneId : GetNextNodeId();
+        var node = new RoadNode
+        {
+            Id = id,
+            ZoneId = zoneId,
+            WorldPosition = worldPosition
+        };
+        Nodes.Add(node);
+        NodeMap[id] = node;
+        if (!AdjacencyEdges.ContainsKey(id))
+            AdjacencyEdges[id] = new List<int>();
+        return node;
+    }
+
+    /// <summary>
+    /// Establishes a bidirectional curved road connection between two road nodes.
+    /// Sets true arc length and symmetrical curve geometry for both directions.
+    /// </summary>
+    public bool AddCurvedRoadSegment(int fromNodeId, int toNodeId, CurveSegment curve, float capacity = 1000f)
+    {
+        if (!NodeMap.ContainsKey(fromNodeId) || !NodeMap.ContainsKey(toNodeId))
+            return false;
+
+        if (HasEdge(fromNodeId, toNodeId))
+            return false;
+
+        var fromNode = NodeMap[fromNodeId];
+        var toNode = NodeMap[toNodeId];
+
+        if (curve == null)
+        {
+            curve = new CurveSegment(fromNode.WorldPosition, toNode.WorldPosition);
+        }
+
+        int nextId = Math.Max(Edges.Count, Edges.Count > 0 ? Edges.Max(e => e.Id) + 1 : 0);
+
+        var e1 = new RoadEdge
+        {
+            Id = nextId,
+            FromId = fromNodeId,
+            ToId = toNodeId,
+            Length = curve.Length,
+            Capacity = capacity,
+            FreeFlowSpeed = 50f,
+            Lanes = 2,
+            CurrentVolume = 0f,
+            PedestrianCapacity = 1800f,
+            WalkingSpeed = 5.0f,
+            PedestrianVolume = 0f,
+            Curve = curve
+        };
+
+        var e2 = new RoadEdge
+        {
+            Id = nextId + 1,
+            FromId = toNodeId,
+            ToId = fromNodeId,
+            Length = curve.Length,
+            Capacity = capacity,
+            FreeFlowSpeed = 50f,
+            Lanes = 2,
+            CurrentVolume = 0f,
+            PedestrianCapacity = 1800f,
+            WalkingSpeed = 5.0f,
+            PedestrianVolume = 0f,
+            Curve = curve.GetReversed()
+        };
+
+        Edges.Add(e1);
+        Edges.Add(e2);
+
+        if (!AdjacencyEdges.ContainsKey(fromNodeId))
+            AdjacencyEdges[fromNodeId] = new List<int>();
+        if (!AdjacencyEdges.ContainsKey(toNodeId))
+            AdjacencyEdges[toNodeId] = new List<int>();
+
+        AdjacencyEdges[fromNodeId].Add(e1.Id);
+        AdjacencyEdges[toNodeId].Add(e2.Id);
+
+        EdgeAdded?.Invoke(e1);
+        EdgeAdded?.Invoke(e2);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Establishes a bidirectional straight <see cref="RoadEdge"/> between two adjacent
+    /// zone nodes. Does nothing if the connection already exists or either node is unknown.
     /// </summary>
     /// <param name="fromZoneId">Origin zone ID.</param>
     /// <param name="toZoneId">Destination zone ID.</param>
@@ -505,62 +660,145 @@ public class RoadGraph
     /// <returns><c>true</c> if the segment was created; <c>false</c> otherwise.</returns>
     public bool AddRoadSegment(int fromZoneId, int toZoneId, float capacity = 1000f)
     {
-        // Both nodes must be present in the graph
         if (!NodeMap.ContainsKey(fromZoneId) || !NodeMap.ContainsKey(toZoneId))
-            return false;
-
-        // No duplicate edges
-        if (HasEdge(fromZoneId, toZoneId))
             return false;
 
         var fromNode = NodeMap[fromZoneId];
         var toNode = NodeMap[toZoneId];
-        float length = fromNode.WorldPosition.DistanceTo(toNode.WorldPosition);
+        var curve = new CurveSegment(fromNode.WorldPosition, toNode.WorldPosition);
 
-        int nextId = Math.Max(Edges.Count, Edges.Count > 0 ? Edges.Max(e => e.Id) + 1 : 0);
+        return AddCurvedRoadSegment(fromZoneId, toZoneId, curve, capacity);
+    }
 
-        var e1 = new RoadEdge
+    /// <summary>
+    /// Splits an existing road edge at the closest point to <paramref name="point"/>,
+    /// cleanly inserting a new junction node and two consecutive bidirectional edge pairs.
+    /// Preserves graph connectivity and invalidates affected path caches.
+    /// </summary>
+    public RoadNode SplitEdgeAtPoint(int edgeId, Vector2 point)
+    {
+        if (edgeId < 0 || edgeId >= Edges.Count) return null;
+        var edge = Edges[edgeId];
+        if (edge.FromId == -1 || edge.ToId == -1) return null;
+
+        var curve = edge.Curve ?? new CurveSegment(
+            NodeMap[edge.FromId].WorldPosition,
+            NodeMap[edge.ToId].WorldPosition
+        );
+
+        var (t, _, _) = curve.GetClosestPoint(point);
+        return SplitEdge(edgeId, t);
+    }
+
+    /// <summary>
+    /// Splits an existing edge at parameter <paramref name="t"/> along its curve,
+    /// inserting a new junction node and preserving graph topology.
+    /// </summary>
+    public RoadNode SplitEdge(int edgeId, float t)
+    {
+        if (edgeId < 0 || edgeId >= Edges.Count) return null;
+        var edge = Edges[edgeId];
+        if (edge.FromId == -1 || edge.ToId == -1) return null;
+
+        t = Mathf.Clamp(t, 0.01f, 0.99f);
+
+        int fromId = edge.FromId;
+        int toId = edge.ToId;
+        float capacity = edge.Capacity;
+
+        var curve = edge.Curve ?? new CurveSegment(
+            NodeMap[fromId].WorldPosition,
+            NodeMap[toId].WorldPosition
+        );
+
+        var (leftCurve, rightCurve) = curve.Split(t);
+        Vector2 splitPos = curve.Evaluate(t);
+
+        // 1. Create junction node at split location
+        var junction = CreateNode(splitPos, -1);
+
+        // 2. Identify reverse edge ID if it exists
+        int revId = FindEdgeId(toId, fromId);
+
+        // Register split info and reverse edge mapping BEFORE disconnection
+        _splitInfo[edgeId] = (fromId, toId, junction);
+        if (revId != -1)
         {
-            Id = nextId,
-            FromId = fromZoneId,
-            ToId = toZoneId,
-            Length = length,
-            Capacity = capacity,
-            FreeFlowSpeed = 50f,
-            Lanes = 2,
-            CurrentVolume = 0f,
-            PedestrianCapacity = 1800f,
-            WalkingSpeed = 5.0f,
-            PedestrianVolume = 0f
-        };
+            _splitInfo[revId] = (toId, fromId, junction);
+            _splitReverseEdges[edgeId] = revId;
+            _splitReverseEdges[revId] = edgeId;
+        }
 
-        var e2 = new RoadEdge
+        // 3. Disconnect original forward edge
+        if (AdjacencyEdges.TryGetValue(fromId, out var fwdList))
+            fwdList.Remove(edgeId);
+
+        Edges[edgeId].FromId = -1;
+        Edges[edgeId].ToId = -1;
+        Edges[edgeId].Capacity = 0f;
+        Edges[edgeId].CurrentVolume = 0f;
+
+        // 4. Disconnect original reverse edge
+        if (revId != -1)
         {
-            Id = nextId + 1,
-            FromId = toZoneId,
-            ToId = fromZoneId,
-            Length = length,
-            Capacity = capacity,
-            FreeFlowSpeed = 50f,
-            Lanes = 2,
-            CurrentVolume = 0f,
-            PedestrianCapacity = 1800f,
-            WalkingSpeed = 5.0f,
-            PedestrianVolume = 0f
-        };
+            if (AdjacencyEdges.TryGetValue(toId, out var revList))
+                revList.Remove(revId);
 
-        Edges.Add(e1);
-        Edges.Add(e2);
+            Edges[revId].FromId = -1;
+            Edges[revId].ToId = -1;
+            Edges[revId].Capacity = 0f;
+            Edges[revId].CurrentVolume = 0f;
+        }
 
-        if (!AdjacencyEdges.ContainsKey(fromZoneId))
-            AdjacencyEdges[fromZoneId] = new List<int>();
-        if (!AdjacencyEdges.ContainsKey(toZoneId))
-            AdjacencyEdges[toZoneId] = new List<int>();
+        // 5. Invalidate path caches referencing the split edges
+        InvalidatePathsWithEdges(edgeId, revId);
 
-        AdjacencyEdges[fromZoneId].Add(e1.Id);
-        AdjacencyEdges[toZoneId].Add(e2.Id);
+        // 6. Connect fromId <-> junction
+        AddCurvedRoadSegment(fromId, junction.Id, leftCurve, capacity);
 
-        return true;
+        // 7. Connect junction <-> toId
+        AddCurvedRoadSegment(junction.Id, toId, rightCurve, capacity);
+
+        EdgeSplit?.Invoke(edgeId, junction);
+        if (revId != -1)
+        {
+            EdgeSplit?.Invoke(revId, junction);
+        }
+
+        return junction;
+    }
+
+    private void InvalidatePathsWithEdges(int eid1, int eid2)
+    {
+        var keysToRemove = new List<(int, int)>();
+        foreach (var kvp in PathCache)
+        {
+            foreach (var pid in kvp.Value)
+            {
+                if (pid == eid1 || (eid2 != -1 && pid == eid2))
+                {
+                    keysToRemove.Add(kvp.Key);
+                    break;
+                }
+            }
+        }
+        foreach (var key in keysToRemove)
+            PathCache.Remove(key);
+
+        var walkingKeysToRemove = new List<(int, int)>();
+        foreach (var kvp in WalkingPathCache)
+        {
+            foreach (var pid in kvp.Value)
+            {
+                if (pid == eid1 || (eid2 != -1 && pid == eid2))
+                {
+                    walkingKeysToRemove.Add(kvp.Key);
+                    break;
+                }
+            }
+        }
+        foreach (var key in walkingKeysToRemove)
+            WalkingPathCache.Remove(key);
     }
 
     /// <summary>
@@ -604,35 +842,10 @@ public class RoadGraph
         }
 
         // Invalidate affected path cache entries
-        var keysToRemove = new List<(int, int)>();
-        foreach (var kvp in PathCache)
-        {
-            foreach (var pid in kvp.Value)
-            {
-                if (pid == eidForward || pid == eidReverse)
-                {
-                    keysToRemove.Add(kvp.Key);
-                    break;
-                }
-            }
-        }
-        foreach (var key in keysToRemove)
-            PathCache.Remove(key);
+        InvalidatePathsWithEdges(eidForward, eidReverse);
 
-        var walkingKeysToRemove = new List<(int, int)>();
-        foreach (var kvp in WalkingPathCache)
-        {
-            foreach (var pid in kvp.Value)
-            {
-                if (pid == eidForward || pid == eidReverse)
-                {
-                    walkingKeysToRemove.Add(kvp.Key);
-                    break;
-                }
-            }
-        }
-        foreach (var key in walkingKeysToRemove)
-            WalkingPathCache.Remove(key);
+        if (eidForward != -1) EdgeRemoved?.Invoke(eidForward);
+        if (eidReverse != -1) EdgeRemoved?.Invoke(eidReverse);
 
         return true;
     }
@@ -754,5 +967,77 @@ public class RoadGraph
     public int GetNodeDegree(int nodeId)
     {
         return AdjacencyEdges.TryGetValue(nodeId, out var edges) ? edges.Count : 0;
+    }
+
+    /// <summary>
+    /// Computes the active traffic extent [0, T_max] along a road edge.
+    /// If the edge's destination node connects to other roads (degree &gt; 1), T_max = 1.0f.
+    /// If the destination node is a dead end (degree &lt;= 1 with no further outgoing roads),
+    /// clamps flow to the furthest active parcel parameter along that edge:
+    /// T_max = clamp(max({p.NormalizedT | p in Parcels(e), p.ZoneType != Empty} U {0.15f}) + 0.05f, 0.15f, 1.0f).
+    /// </summary>
+    public float GetEdgeTrafficExtent(RoadEdge edge, ParcelManager parcelManager = null)
+    {
+        if (edge == null || edge.FromId == -1 || edge.ToId == -1) return 1.0f;
+
+        // Check if destination node connects to other roads
+        int degree = GetNodeDegree(edge.ToId);
+        bool isDeadEnd = degree <= 1;
+
+        if (!isDeadEnd && AdjacencyEdges.TryGetValue(edge.ToId, out var outgoingEdges))
+        {
+            bool hasOtherDestination = false;
+            for (int i = 0; i < outgoingEdges.Count; i++)
+            {
+                int outEid = outgoingEdges[i];
+                if (outEid >= 0 && outEid < Edges.Count)
+                {
+                    var outEdge = Edges[outEid];
+                    if (outEdge.FromId != -1 && outEdge.ToId != -1 && outEdge.ToId != edge.FromId)
+                    {
+                        hasOtherDestination = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasOtherDestination)
+            {
+                isDeadEnd = true;
+            }
+        }
+
+        if (!isDeadEnd)
+        {
+            return 1.0f;
+        }
+
+        float maxT = 0.15f;
+        if (parcelManager != null)
+        {
+            var parcels = parcelManager.GetParcelsForEdge(edge.Id);
+            for (int i = 0; i < parcels.Count; i++)
+            {
+                var p = parcels[i];
+                if (p.ZoneType != ZoneType.Empty)
+                {
+                    float t = (p.EdgeId == edge.Id) ? p.NormalizedT : (1.0f - p.NormalizedT);
+                    if (t > maxT)
+                    {
+                        maxT = t;
+                    }
+                }
+            }
+        }
+
+        return Mathf.Clamp(maxT + 0.05f, 0.15f, 1.0f);
+    }
+
+    /// <summary>
+    /// Computes the active traffic extent [0, T_max] along a road edge by edge ID.
+    /// </summary>
+    public float GetEdgeTrafficExtent(int edgeId, ParcelManager parcelManager = null)
+    {
+        if (edgeId < 0 || edgeId >= Edges.Count) return 1.0f;
+        return GetEdgeTrafficExtent(Edges[edgeId], parcelManager);
     }
 }

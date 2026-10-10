@@ -11,11 +11,100 @@ public class VisualPedestrian
     public float Speed;
     public Color ClothingColor;
     public int Side; // 1 for right sidewalk, -1 for left sidewalk
+
+    /// <summary>
+    /// Computes the 2D world position of this pedestrian along the curved road sidewalk.
+    /// </summary>
+    public Vector2 GetWorldPosition(RoadGraph graph, float sidewalkOffset = 7.5f)
+    {
+        if (graph == null || EdgeId < 0 || EdgeId >= graph.Edges.Count) return Vector2.Zero;
+        var edge = graph.Edges[EdgeId];
+        return PedestrianManager.GetSidewalkPosition(edge, Progress, Side, sidewalkOffset, graph);
+    }
+
+    /// <summary>
+    /// Computes the heading rotation angle in radians of this pedestrian facing along the curve tangent.
+    /// </summary>
+    public float GetRotation(RoadGraph graph)
+    {
+        if (graph == null || EdgeId < 0 || EdgeId >= graph.Edges.Count) return 0f;
+        var edge = graph.Edges[EdgeId];
+        return PedestrianManager.GetSidewalkRotation(edge, Progress, graph);
+    }
 }
 
 public class PedestrianManager
 {
     public const int MaxPedestrians = 250;
+    public const float DefaultSidewalkOffset = 7.5f;
+
+    /// <summary>
+    /// Computes the 2D world position along a road edge sidewalk at progress parameter [0, 1].
+    /// Offsets perpendicularly using the curve's normal vector.
+    /// </summary>
+    public static Vector2 GetSidewalkPosition(RoadEdge edge, float progress, int side = 1, float sidewalkOffset = DefaultSidewalkOffset, RoadGraph graph = null)
+    {
+        if (edge == null) return Vector2.Zero;
+        float t = Mathf.Clamp(progress, 0.0f, 1.0f);
+
+        if (edge.Curve != null)
+        {
+            Vector2 basePos = edge.Curve.Evaluate(t);
+            Vector2 normal = edge.Curve.GetNormal(t);
+            return basePos + normal * (sidewalkOffset * side);
+        }
+
+        if (graph != null)
+        {
+            var fromNode = graph.GetNode(edge.FromId);
+            var toNode = graph.GetNode(edge.ToId);
+            if (fromNode != null && toNode != null)
+            {
+                Vector2 basePos = fromNode.WorldPosition.Lerp(toNode.WorldPosition, t);
+                Vector2 delta = toNode.WorldPosition - fromNode.WorldPosition;
+                if (delta.LengthSquared() > 1e-4f)
+                {
+                    Vector2 dir = delta.Normalized();
+                    Vector2 normal = new Vector2(-dir.Y, dir.X);
+                    return basePos + normal * (sidewalkOffset * side);
+                }
+                return basePos;
+            }
+        }
+
+        return Vector2.Zero;
+    }
+
+    /// <summary>
+    /// Computes the heading rotation angle in radians along the curved sidewalk tangent.
+    /// </summary>
+    public static float GetSidewalkRotation(RoadEdge edge, float progress, RoadGraph graph = null)
+    {
+        if (edge == null) return 0f;
+        float t = Mathf.Clamp(progress, 0.0f, 1.0f);
+
+        if (edge.Curve != null)
+        {
+            return edge.Curve.GetTangent(t).Angle();
+        }
+
+        if (graph != null)
+        {
+            var fromNode = graph.GetNode(edge.FromId);
+            var toNode = graph.GetNode(edge.ToId);
+            if (fromNode != null && toNode != null)
+            {
+                Vector2 delta = toNode.WorldPosition - fromNode.WorldPosition;
+                if (delta.LengthSquared() > 1e-4f)
+                {
+                    return delta.Angle();
+                }
+            }
+        }
+
+        return 0f;
+    }
+
     public List<VisualPedestrian> Pedestrians = new List<VisualPedestrian>();
     private Random _random = new Random(1234);
     private List<int> _activeEdgeIds = new List<int>();
@@ -30,6 +119,23 @@ public class PedestrianManager
         new Color(0.85f, 0.85f, 0.25f), // Yellow
         new Color(0.65f, 0.35f, 0.75f)  // Purple
     };
+
+    /// <summary>
+    /// Instantiates and registers a visual pedestrian on the specified edge sidewalk.
+    /// </summary>
+    public VisualPedestrian CreatePedestrian(int edgeId, float progress = 0f, float speed = 2.0f, int side = 1, Color? color = null)
+    {
+        var ped = new VisualPedestrian
+        {
+            EdgeId = edgeId,
+            Progress = progress,
+            Speed = speed,
+            Side = side,
+            ClothingColor = color ?? ClothingPalette[_random.Next(ClothingPalette.Length)]
+        };
+        Pedestrians.Add(ped);
+        return ped;
+    }
 
     /// <summary>
     /// Determines whether a road edge has actual pedestrian/urban activity.
@@ -143,8 +249,9 @@ public class PedestrianManager
         _activeEdgeIds = GetActiveUrbanEdgeIds(graph, grid, transit);
 
         // In 100% flow-based architecture, visualization is rendered directly from edge sidewalk flows (Zero-Agent).
-        // If any legacy pedestrian structs are added by external unit tests, cleanly maintain them:
         if (Pedestrians.Count == 0) return;
+
+        float speedMult = Mathf.Clamp(gameSpeed, 0.1f, 10.0f);
 
         for (int i = Pedestrians.Count - 1; i >= 0; i--)
         {
@@ -156,7 +263,19 @@ public class PedestrianManager
                 if (!TryRespawnPedestrian(ped, graph, _activeEdgeIds))
                 {
                     Pedestrians.RemoveAt(i);
+                    continue;
                 }
+            }
+
+            var edge = graph.Edges[ped.EdgeId];
+            float edgeLen = edge.Length > 0.1f ? edge.Length : (edge.Curve != null ? edge.Curve.Length : 50f);
+            float speed = ped.Speed > 0f ? ped.Speed : 2.0f;
+
+            ped.Progress += (speed * delta * speedMult) / Mathf.Max(edgeLen, 1f);
+
+            if (ped.Progress >= 1.0f)
+            {
+                TransitionToNextEdge(ped, edge, graph, grid, transit);
             }
         }
     }

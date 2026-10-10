@@ -92,12 +92,22 @@ public class EconomyManager
     }
 
     /// <summary>
+    /// Sets the player's funds balance directly.
+    /// </summary>
+    /// <param name="amount">The new balance.</param>
+    public void SetBalance(float amount)
+    {
+        Money = amount;
+    }
+
+    /// <summary>
     /// Processes a periodic financial tick, deducting maintenance costs and adding tax revenues.
     /// </summary>
     /// <param name="grid">The city grid used to calculate tax revenues from zones.</param>
     /// <param name="roadGraph">The road graph used to calculate road maintenance expenses.</param>
     /// <param name="transitManager">The transit manager used to calculate transit network expenses.</param>
-    public void ProcessFinancialTick(CityGrid grid, RoadGraph roadGraph, TransitManager transitManager)
+    /// <param name="parcelManager">Optional roadside parcel manager for ribbon parcel tax revenues.</param>
+    public void ProcessFinancialTick(CityGrid grid, RoadGraph roadGraph, TransitManager transitManager, ParcelManager parcelManager = null)
     {
         float expenses = 0f;
         float income = 0f;
@@ -119,7 +129,7 @@ public class EconomyManager
             expenses += 50f / 24f; 
         }
         
-        // 3. Taxes
+        // 3. Taxes from Grid Zones
         for (int i = 0; i < grid.ZoneCount; i++)
         {
             var zone = grid.GetZone(i);
@@ -133,6 +143,13 @@ public class EconomyManager
             {
                 income += (zone.Jobs * TaxPerJob) / 24f;
             }
+        }
+
+        // 4. Taxes from Roadside Parcels
+        if (parcelManager != null)
+        {
+            income += (parcelManager.TotalPopulation * TaxPerPopulation) / 24f;
+            income += (parcelManager.TotalJobs * TaxPerJob) / 24f;
         }
 
         // Apply

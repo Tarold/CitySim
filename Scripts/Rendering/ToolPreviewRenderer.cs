@@ -14,14 +14,48 @@ public partial class ToolPreviewRenderer : Node2D
     private RoadGraph _roadGraph;
     private float _pulseTimer = 0f;
 
+    // Roadside parcel zoning preview state
+    private ParcelManager _parcelManager;
+    private List<RoadsideParcel> _hoveredParcels = new List<RoadsideParcel>();
+    private ZoneType _hoveredParcelZoneType = ZoneType.Empty;
+    private ParcelSide _hoveredParcelSide = ParcelSide.Right;
+
     // Transit route designer draft state
     private List<int> _draftTransitStops = new List<int>();
     private List<int> _draftTransitPath = new List<int>();
     private Color _draftRouteColor = new Color(0.65f, 0.25f, 0.95f);
     private bool _draftIsLoop = false;
+    private RoadSnapResult _transitHoverSnap;
 
     /// <summary>Active tool mode for preview rendering.</summary>
     public InteractionMode Mode { get; private set; } = InteractionMode.Inspect;
+
+    /// <summary>Whether a continuous vector road preview is currently active.</summary>
+    public bool HasRoadBuildPreview { get; private set; } = false;
+
+    /// <summary>The construction step: 0=hovering start, 1=hovering end/straight, 2=bending curvature.</summary>
+    public int RoadBuildStep { get; private set; } = 0;
+
+    /// <summary>Locked start position of the road segment being built.</summary>
+    public Vector2 RoadStartPos { get; private set; }
+
+    /// <summary>Candidate end position of the road segment.</summary>
+    public Vector2 RoadEndPos { get; private set; }
+
+    /// <summary>Curvature bend apex position (for 3-point curved roads).</summary>
+    public Vector2 RoadApexPos { get; private set; }
+
+    /// <summary>The active candidate Bézier curve preview.</summary>
+    public CurveSegment RoadPreviewCurve { get; private set; }
+
+    /// <summary>The active snapping query result.</summary>
+    public RoadSnapResult RoadSnap { get; private set; }
+
+    /// <summary>Estimated construction cost in dollars.</summary>
+    public float RoadCost { get; private set; }
+
+    /// <summary>Whether the player currently has enough funds to build this road.</summary>
+    public bool CanAffordRoad { get; private set; } = true;
 
     /// <summary>The starting zone ID of the pending operation, or -1 if none.</summary>
     public int StartZoneId { get; private set; } = -1;
@@ -50,6 +84,37 @@ public partial class ToolPreviewRenderer : Node2D
     }
 
     /// <summary>
+    /// Sets the parcel manager reference.
+    /// </summary>
+    public void SetParcelManager(ParcelManager parcelManager)
+    {
+        _parcelManager = parcelManager;
+    }
+
+    /// <summary>
+    /// Sets candidate roadside ribbon parcels for zoning hover preview.
+    /// </summary>
+    public void SetHoveredParcels(List<RoadsideParcel> parcels, ZoneType zoneType, ParcelSide side)
+    {
+        _hoveredParcels = parcels != null ? new List<RoadsideParcel>(parcels) : new List<RoadsideParcel>();
+        _hoveredParcelZoneType = zoneType;
+        _hoveredParcelSide = side;
+        QueueRedraw();
+    }
+
+    /// <summary>
+    /// Clears any hovered roadside ribbon parcels.
+    /// </summary>
+    public void ClearHoveredParcels()
+    {
+        if (_hoveredParcels.Count > 0)
+        {
+            _hoveredParcels.Clear();
+            QueueRedraw();
+        }
+    }
+
+    /// <summary>
     /// Updates the draft transit route stops and path for live rendering.
     /// </summary>
     public void SetTransitDraft(List<int> stops, List<int> path, Color color, bool isLoop)
@@ -69,6 +134,52 @@ public partial class ToolPreviewRenderer : Node2D
         _draftTransitStops.Clear();
         _draftTransitPath.Clear();
         _draftIsLoop = false;
+        _transitHoverSnap = default;
+        QueueRedraw();
+    }
+
+    /// <summary>
+    /// Updates the live cursor snap result for transit route stop placement preview.
+    /// </summary>
+    public void SetTransitHoverSnap(RoadSnapResult snap)
+    {
+        _transitHoverSnap = snap;
+        QueueRedraw();
+    }
+
+    /// <summary>
+    /// Configures the live vector road construction preview.
+    /// </summary>
+    public void SetRoadBuildPreview(
+        int step,
+        Vector2 startPos,
+        Vector2 endPos,
+        Vector2 apexPos,
+        CurveSegment curve,
+        RoadSnapResult snap,
+        float cost,
+        bool canAfford)
+    {
+        HasRoadBuildPreview = true;
+        RoadBuildStep = step;
+        RoadStartPos = startPos;
+        RoadEndPos = endPos;
+        RoadApexPos = apexPos;
+        RoadPreviewCurve = curve;
+        RoadSnap = snap;
+        RoadCost = cost;
+        CanAffordRoad = canAfford;
+        QueueRedraw();
+    }
+
+    /// <summary>
+    /// Clears any active vector road construction preview.
+    /// </summary>
+    public void ClearRoadBuildPreview()
+    {
+        HasRoadBuildPreview = false;
+        RoadBuildStep = 0;
+        RoadPreviewCurve = null;
         QueueRedraw();
     }
 
@@ -81,6 +192,8 @@ public partial class ToolPreviewRenderer : Node2D
         StartZoneId = -1;
         ValidTargetZoneIds.Clear();
         ClearTransitDraft();
+        ClearRoadBuildPreview();
+        ClearHoveredParcels();
         QueueRedraw();
     }
 
@@ -127,12 +240,14 @@ public partial class ToolPreviewRenderer : Node2D
         HoverZoneId = -1;
         ValidTargetZoneIds.Clear();
         ClearTransitDraft();
+        ClearRoadBuildPreview();
+        ClearHoveredParcels();
         QueueRedraw();
     }
 
     public override void _Process(double delta)
     {
-        if (StartZoneId != -1 || (IsZoningMode(Mode) && HoverZoneId != -1) || Mode == InteractionMode.CreateTransitRoute)
+        if (StartZoneId != -1 || (IsZoningMode(Mode) && (HoverZoneId != -1 || _hoveredParcels.Count > 0)) || Mode == InteractionMode.CreateTransitRoute || HasRoadBuildPreview)
         {
             _pulseTimer += (float)delta * 4f;
             QueueRedraw();
@@ -150,6 +265,68 @@ public partial class ToolPreviewRenderer : Node2D
         // 1. Zoning Modes Live Hover Preview (Residential, Commercial, Industrial, Dezone)
         if (IsZoningMode(Mode))
         {
+            Color fillColor;
+            Color borderColor;
+
+            switch (Mode)
+            {
+                case InteractionMode.ZoneResidential:
+                    fillColor = new Color(0.18f, 0.75f, 0.32f, 0.40f);
+                    borderColor = new Color(0.25f, 1.0f, 0.45f, 0.95f);
+                    break;
+                case InteractionMode.ZoneCommercial:
+                    fillColor = new Color(0.20f, 0.55f, 0.98f, 0.40f);
+                    borderColor = new Color(0.35f, 0.75f, 1.0f, 0.95f);
+                    break;
+                case InteractionMode.ZoneIndustrial:
+                    fillColor = new Color(0.95f, 0.60f, 0.15f, 0.40f);
+                    borderColor = new Color(1.0f, 0.75f, 0.25f, 0.95f);
+                    break;
+                case InteractionMode.Dezone:
+                default:
+                    fillColor = new Color(0.95f, 0.20f, 0.20f, 0.40f);
+                    borderColor = new Color(1.0f, 0.35f, 0.35f, 0.95f);
+                    break;
+            }
+
+            // 1a. Roadside Ribbon Parcel(s) Hover Preview
+            if (_hoveredParcels.Count > 0)
+            {
+                for (int i = 0; i < _hoveredParcels.Count; i++)
+                {
+                    var parcel = _hoveredParcels[i];
+                    if (parcel.Boundary == null || parcel.Boundary.Length < 4) continue;
+
+                    Vector2[] closed = new Vector2[]
+                    {
+                        parcel.Boundary[0], parcel.Boundary[1], parcel.Boundary[2], parcel.Boundary[3], parcel.Boundary[0]
+                    };
+
+                    DrawColoredPolygon(parcel.Boundary, fillColor);
+                    DrawPolyline(closed, borderColor, pulseWidth, true);
+
+                    // Central indicator marker
+                    Vector2 c = parcel.Center;
+                    if (Mode == InteractionMode.Dezone)
+                    {
+                        DrawLine(c + new Vector2(-6, -6), c + new Vector2(6, 6), Colors.White, 3.0f, true);
+                        DrawLine(c + new Vector2(-6, -6), c + new Vector2(6, 6), borderColor, 1.8f, true);
+                        DrawLine(c + new Vector2(6, -6), c + new Vector2(-6, 6), Colors.White, 3.0f, true);
+                        DrawLine(c + new Vector2(6, -6), c + new Vector2(-6, 6), borderColor, 1.8f, true);
+                    }
+                    else
+                    {
+                        DrawLine(c + new Vector2(-6, 0), c + new Vector2(6, 0), Colors.White, 2.5f, true);
+                        DrawLine(c + new Vector2(0, -6), c + new Vector2(0, 6), Colors.White, 2.5f, true);
+                    }
+
+                    // Roadway access guide line
+                    DrawLine(c, parcel.AccessPoint, new Color(borderColor.R, borderColor.G, borderColor.B, 0.45f), 1.5f, true);
+                }
+                return;
+            }
+
+            // 1b. Legacy Grid Cell Hover Preview
             if (HoverZoneId >= 0 && HoverZoneId < _grid.ZoneCount)
             {
                 var hoverZone = _grid.GetZone(HoverZoneId);
@@ -158,30 +335,6 @@ public partial class ToolPreviewRenderer : Node2D
                     Vector2 pos = new Vector2(hoverZone.GridPos.X * cellSize + 1, hoverZone.GridPos.Y * cellSize + 1);
                     Vector2 size = new Vector2(cellSize - 2, cellSize - 2);
                     Rect2 rect = new Rect2(pos, size);
-
-                    Color fillColor;
-                    Color borderColor;
-
-                    switch (Mode)
-                    {
-                        case InteractionMode.ZoneResidential:
-                            fillColor = new Color(0.18f, 0.75f, 0.32f, 0.35f);
-                            borderColor = new Color(0.25f, 1.0f, 0.45f, 0.95f);
-                            break;
-                        case InteractionMode.ZoneCommercial:
-                            fillColor = new Color(0.20f, 0.55f, 0.98f, 0.35f);
-                            borderColor = new Color(0.35f, 0.75f, 1.0f, 0.95f);
-                            break;
-                        case InteractionMode.ZoneIndustrial:
-                            fillColor = new Color(0.95f, 0.60f, 0.15f, 0.35f);
-                            borderColor = new Color(1.0f, 0.75f, 0.25f, 0.95f);
-                            break;
-                        case InteractionMode.Dezone:
-                        default:
-                            fillColor = new Color(0.95f, 0.20f, 0.20f, 0.35f);
-                            borderColor = new Color(1.0f, 0.35f, 0.35f, 0.95f);
-                            break;
-                    }
 
                     // Fill highlight
                     DrawRect(rect, fillColor, true);
@@ -215,14 +368,27 @@ public partial class ToolPreviewRenderer : Node2D
         // 2. Transit Route Designer Live Preview
         if (Mode == InteractionMode.CreateTransitRoute)
         {
-            // 2a. Draw draft route path corridor
+            // 2a. Draw draft route path corridor along curves
             if (_draftTransitPath.Count > 1 && _roadGraph != null)
             {
                 for (int i = 0; i < _draftTransitPath.Count - 1; i++)
                 {
-                    var n1 = _roadGraph.GetNode(_draftTransitPath[i]);
-                    var n2 = _roadGraph.GetNode(_draftTransitPath[i + 1]);
-                    if (n1 != null && n2 != null)
+                    int id1 = _draftTransitPath[i];
+                    int id2 = _draftTransitPath[i + 1];
+                    var n1 = _roadGraph.GetNode(id1);
+                    var n2 = _roadGraph.GetNode(id2);
+                    if (n1 == null || n2 == null) continue;
+
+                    int eid = _roadGraph.FindEdgeId(id1, id2);
+                    var edge = (eid >= 0 && eid < _roadGraph.Edges.Count) ? _roadGraph.Edges[eid] : null;
+
+                    if (edge != null && edge.Curve != null)
+                    {
+                        var pts = edge.Curve.GetSampledPoints(16);
+                        DrawPolyline(pts, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.85f), 5.5f, true);
+                        DrawPolyline(pts, Colors.White, 2.0f, true);
+                    }
+                    else
                     {
                         DrawLine(n1.WorldPosition, n2.WorldPosition, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.85f), 5.5f, true);
                         DrawLine(n1.WorldPosition, n2.WorldPosition, Colors.White, 2.0f, true);
@@ -231,18 +397,73 @@ public partial class ToolPreviewRenderer : Node2D
 
                 if (_draftIsLoop && _draftTransitPath.Count > 2)
                 {
-                    var first = _roadGraph.GetNode(_draftTransitPath[0]);
-                    var last = _roadGraph.GetNode(_draftTransitPath[_draftTransitPath.Count - 1]);
+                    int firstId = _draftTransitPath[0];
+                    int lastId = _draftTransitPath[_draftTransitPath.Count - 1];
+                    var first = _roadGraph.GetNode(firstId);
+                    var last = _roadGraph.GetNode(lastId);
                     if (first != null && last != null)
                     {
-                        DrawLine(last.WorldPosition, first.WorldPosition, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.85f), 5.5f, true);
-                        DrawLine(last.WorldPosition, first.WorldPosition, Colors.White, 2.0f, true);
+                        int eid = _roadGraph.FindEdgeId(lastId, firstId);
+                        var loopEdge = (eid >= 0 && eid < _roadGraph.Edges.Count) ? _roadGraph.Edges[eid] : null;
+
+                        if (loopEdge != null && loopEdge.Curve != null)
+                        {
+                            var pts = loopEdge.Curve.GetSampledPoints(16);
+                            DrawPolyline(pts, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.85f), 5.5f, true);
+                            DrawPolyline(pts, Colors.White, 2.0f, true);
+                        }
+                        else
+                        {
+                            DrawLine(last.WorldPosition, first.WorldPosition, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.85f), 5.5f, true);
+                            DrawLine(last.WorldPosition, first.WorldPosition, Colors.White, 2.0f, true);
+                        }
                     }
                 }
             }
 
-            // 2b. Draw hover target indicator over valid road node
-            if (HoverZoneId != -1 && _roadGraph != null && _roadGraph.NodeMap.ContainsKey(HoverZoneId))
+            // 2b. Draw hover target indicator over snapped road node or mid-road edge
+            if (_transitHoverSnap.Type == SnapType.Node || _transitHoverSnap.Type == SnapType.Edge)
+            {
+                Vector2 hoverPos = _transitHoverSnap.Position;
+                float ringRadius = 11f + Mathf.Sin(_pulseTimer) * 2.5f;
+                Color snapColor = _transitHoverSnap.Type == SnapType.Edge
+                    ? new Color(0.2f, 0.95f, 0.65f, 0.95f)
+                    : _draftRouteColor;
+
+                // Pulsing hover target circle
+                DrawArc(hoverPos, ringRadius, 0, Mathf.Tau, 24, snapColor, 2.8f, true);
+                DrawCircle(hoverPos, 5.5f, snapColor);
+                DrawCircle(hoverPos, 2.5f, Colors.White);
+
+                // Connector guide line to last stop
+                if (_draftTransitStops.Count > 0 && !_draftIsLoop)
+                {
+                    int lastStopId = _draftTransitStops[_draftTransitStops.Count - 1];
+                    var lastNode = _roadGraph?.GetNode(lastStopId);
+                    if (lastNode != null)
+                    {
+                        DrawLine(lastNode.WorldPosition, hoverPos, new Color(_draftRouteColor.R, _draftRouteColor.G, _draftRouteColor.B, 0.45f), 2.2f, true);
+                    }
+                }
+
+                // Hover badge label
+                string badgeLabel = _transitHoverSnap.Type == SnapType.Edge
+                    ? $"🚏 Mid-Road Stop (New #{_draftTransitStops.Count + 1})"
+                    : $"🚏 Stop #{_draftTransitStops.Count + 1}";
+
+                DrawRect(new Rect2(hoverPos.X + 10, hoverPos.Y - 18, 140, 22), new Color(0.05f, 0.08f, 0.12f, 0.85f), true);
+                DrawRect(new Rect2(hoverPos.X + 10, hoverPos.Y - 18, 140, 22), snapColor, false, 1.0f);
+                DrawString(
+                    ThemeDB.FallbackFont,
+                    hoverPos + new Vector2(16, -3),
+                    badgeLabel,
+                    HorizontalAlignment.Left,
+                    -1,
+                    10,
+                    Colors.White
+                );
+            }
+            else if (HoverZoneId != -1 && _roadGraph != null && _roadGraph.NodeMap.ContainsKey(HoverZoneId))
             {
                 var hoverNode = _roadGraph.GetNode(HoverZoneId);
                 if (hoverNode != null)
@@ -250,11 +471,9 @@ public partial class ToolPreviewRenderer : Node2D
                     Vector2 hoverPos = hoverNode.WorldPosition;
                     float ringRadius = 10f + Mathf.Sin(_pulseTimer) * 2.5f;
 
-                    // Pulsing hover target circle
                     DrawArc(hoverPos, ringRadius, 0, Mathf.Tau, 24, _draftRouteColor, 2.5f, true);
                     DrawCircle(hoverPos, 4.0f, Colors.White);
 
-                    // If we have an existing stop, draw a faint connector line to hovered node
                     if (_draftTransitStops.Count > 0 && !_draftIsLoop)
                     {
                         int lastStopId = _draftTransitStops[_draftTransitStops.Count - 1];
@@ -280,13 +499,13 @@ public partial class ToolPreviewRenderer : Node2D
                     if (stopNode != null)
                     {
                         Vector2 sPos = stopNode.WorldPosition;
-                        DrawCircle(sPos, 8.5f, _draftRouteColor);
-                        DrawArc(sPos, 8.5f, 0, Mathf.Tau, 20, Colors.White, 2.0f, true);
+                        DrawCircle(sPos, 9.5f, _draftRouteColor);
+                        DrawArc(sPos, 9.5f, 0, Mathf.Tau, 20, Colors.White, 2.0f, true);
 
                         if (s == 0)
                         {
                             // Gold origin station ring
-                            DrawArc(sPos, 12.5f, 0, Mathf.Tau, 20, Colors.Gold, 2.2f, true);
+                            DrawArc(sPos, 14.0f, 0, Mathf.Tau, 22, Colors.Gold, 2.5f, true);
                         }
 
                         // Stop number
@@ -306,7 +525,14 @@ public partial class ToolPreviewRenderer : Node2D
             return;
         }
 
-        // 3. Road Building & Demolition Previews (Requires StartZoneId)
+        // 3. Vector Road Construction Live Preview (BuildRoad & BuildCurvedRoad)
+        if ((Mode == InteractionMode.BuildRoad || Mode == InteractionMode.BuildCurvedRoad) && HasRoadBuildPreview)
+        {
+            DrawVectorRoadPreview(pulseWidth);
+            return;
+        }
+
+        // 4. Demolition Previews (Requires StartZoneId)
         if (StartZoneId == -1)
             return;
 
@@ -381,6 +607,116 @@ public partial class ToolPreviewRenderer : Node2D
                     }
                 }
             }
+        }
+    }
+
+    private void DrawVectorRoadPreview(float pulseWidth)
+    {
+        Vector2 snapPos = RoadSnap.Position;
+
+        // 1. Draw Snapping Indicators
+        if (RoadSnap.Type == SnapType.Node)
+        {
+            float ringR = 10f + Mathf.Sin(_pulseTimer) * 2.5f;
+            DrawArc(snapPos, ringR, 0, Mathf.Tau, 24, new Color(0.2f, 1.0f, 0.65f, 0.95f), 2.5f, true);
+            DrawCircle(snapPos, 4.0f, Colors.White);
+        }
+        else if (RoadSnap.Type == SnapType.Edge)
+        {
+            float ringR = 8f + Mathf.Sin(_pulseTimer) * 2f;
+            DrawCircle(snapPos, 5.0f, new Color(1.0f, 0.85f, 0.2f, 0.95f));
+            DrawCircle(snapPos, 2.5f, Colors.White);
+            DrawArc(snapPos, ringR, 0, Mathf.Tau, 20, new Color(1.0f, 0.85f, 0.2f, 0.85f), 2.0f, true);
+        }
+        else if (RoadSnap.Type == SnapType.Angle && RoadBuildStep >= 1)
+        {
+            Vector2 dir = RoadSnap.GuideDirection;
+            DrawLine(RoadStartPos, RoadStartPos + dir * 350f, new Color(0.3f, 0.85f, 1f, 0.45f), 1.8f, true);
+        }
+        else if (RoadSnap.Type == SnapType.Tangent && RoadBuildStep >= 1)
+        {
+            Vector2 dir = RoadSnap.GuideDirection;
+            DrawLine(RoadStartPos - dir * 40f, RoadStartPos + dir * 250f, new Color(0.2f, 1.0f, 0.85f, 0.50f), 2.2f, true);
+        }
+
+        // 2. Draw Start Anchor (locked in Step 1 or 2)
+        if (RoadBuildStep >= 1)
+        {
+            DrawCircle(RoadStartPos, 4.5f, new Color(0.2f, 1f, 0.6f, 0.95f));
+            DrawArc(RoadStartPos, 8.5f, 0, Mathf.Tau, 16, Colors.White, 2.0f, true);
+        }
+
+        // 3. Draw Road Preview Curve Ribbon & Dashed Lane Line
+        if (RoadPreviewCurve != null && RoadPreviewCurve.Length > 2f)
+        {
+            var pts = RoadPreviewCurve.GetSampledPoints(24);
+            Color baseColor = CanAffordRoad ? new Color(0.20f, 0.85f, 0.45f, 0.85f) : new Color(1.0f, 0.25f, 0.25f, 0.85f);
+            Color borderColor = CanAffordRoad ? new Color(0.12f, 0.65f, 0.35f, 0.95f) : new Color(0.7f, 0.15f, 0.15f, 0.95f);
+
+            // Outer outline
+            DrawPolyline(pts, borderColor, 6.5f, true);
+            // Asphalt surface
+            DrawPolyline(pts, baseColor, 4.5f, true);
+
+            // Center dashed line
+            float cLen = RoadPreviewCurve.Length;
+            if (cLen > 12f)
+            {
+                float cyc = 11f;
+                int dCount = Mathf.FloorToInt(cLen / cyc);
+                for (int i = 0; i < dCount; i++)
+                {
+                    float s1 = i * cyc + 1f;
+                    float s2 = s1 + 5.5f;
+                    if (s2 >= cLen) break;
+                    Vector2 p1 = RoadPreviewCurve.Evaluate(s1 / cLen);
+                    Vector2 p2 = RoadPreviewCurve.Evaluate(s2 / cLen);
+                    DrawLine(p1, p2, Colors.White, 1.2f, true);
+                }
+            }
+        }
+
+        // 4. Draw Curvature Apex Handle (when in Step 2)
+        if (RoadBuildStep == 2)
+        {
+            DrawCircle(RoadApexPos, 5.0f, Colors.Gold);
+            DrawArc(RoadApexPos, 8.5f, 0, Mathf.Tau, 16, Colors.White, 1.8f, true);
+        }
+
+        // 5. Draw Live HUD Box near cursor
+        Vector2 hudPos = snapPos + new Vector2(16, -30);
+        float roadLen = RoadPreviewCurve?.Length ?? 0f;
+        float minRadius = RoadPreviewCurve?.GetMinimumRadiusOfCurvature(16) ?? float.MaxValue;
+
+        string line1 = $"📏 {roadLen:F0} m";
+        if (minRadius < 30f)
+        {
+            line1 += $"  ⚠️ Sharp Turn (R:{minRadius:F0}m)";
+        }
+        else if (Mode == InteractionMode.BuildCurvedRoad && RoadBuildStep == 2)
+        {
+            line1 += $"  〰️ Smooth (R:{minRadius:F0}m)";
+        }
+
+        string line2 = CanAffordRoad
+            ? $"💰 ${RoadCost:F0}"
+            : $"💰 ${RoadCost:F0} (⚠️ Insufficient funds)";
+
+        string line3 = RoadSnap.Type != SnapType.None ? $"📍 {RoadSnap.Description}" : null;
+
+        float boxWidth = 240f;
+        float boxHeight = line3 != null ? 52f : 36f;
+
+        DrawRect(new Rect2(hudPos.X - 6, hudPos.Y - 14, boxWidth, boxHeight), new Color(0.04f, 0.06f, 0.10f, 0.88f), true);
+        DrawRect(new Rect2(hudPos.X - 6, hudPos.Y - 14, boxWidth, boxHeight), new Color(0.25f, 0.45f, 0.65f, 0.75f), false, 1.0f);
+
+        DrawString(ThemeDB.FallbackFont, hudPos + new Vector2(0, 0), line1, HorizontalAlignment.Left, -1, 11, Colors.White);
+        Color costColor = CanAffordRoad ? new Color(0.3f, 1f, 0.5f) : new Color(1f, 0.35f, 0.35f);
+        DrawString(ThemeDB.FallbackFont, hudPos + new Vector2(0, 15), line2, HorizontalAlignment.Left, -1, 11, costColor);
+
+        if (line3 != null)
+        {
+            DrawString(ThemeDB.FallbackFont, hudPos + new Vector2(0, 30), line3, HorizontalAlignment.Left, -1, 10, new Color(0.4f, 0.85f, 1f));
         }
     }
 }

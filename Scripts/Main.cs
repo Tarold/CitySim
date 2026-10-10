@@ -1,5 +1,6 @@
 using Godot;
 using System.Collections.Generic;
+using System.Linq;
 using CitySim.Simulation;
 using CitySim.Rendering;
 using CitySim.UI;
@@ -18,6 +19,7 @@ public partial class Main : Node2D
     private TrafficLightManager _trafficLights;
     private CarTrafficManager _carTrafficManager;
     private PedestrianManager _pedestrianManager;
+    private ParcelManager _parcelManager;
     
     private CityRenderer _cityRenderer;
     private RoadRenderer _roadRenderer;
@@ -37,9 +39,20 @@ public partial class Main : Node2D
     private EconomyManager _economyManager;
     
     private bool _isDragging = false;
+    private bool _isZoningDragging = false;
     private int _selectedZoneId = -1;
+    private int _selectedParcelId = -1;
     private InteractionMode _currentMode = InteractionMode.Inspect;
     private int _pendingStartZoneId = -1;
+
+    // Vector Road Construction state
+    private int _roadBuildStep = 0;
+    private RoadNode _roadStartNode;
+    private Vector2 _roadStartPoint;
+    private RoadNode _roadEndNode;
+    private Vector2 _roadEndPoint;
+    private RoadSnapResult _pendingEndSnap;
+    private RoadSnapResult _currentCursorSnap;
 
     // Transit Route Designer draft state
     private List<int> _draftTransitStops = new List<int>();
@@ -51,14 +64,22 @@ public partial class Main : Node2D
     public override void _Ready()
     {
         _grid = new CityGrid(20, 20, 64f);
+        _roadGraph = new RoadGraph();
+        _parcelManager = new ParcelManager();
+        _transitManager = new TransitManager();
+        _economyManager = new EconomyManager();
+        _parcelManager.Initialize(_roadGraph);
         
         if (LoadTutorialMode)
         {
-            _grid.GenerateDefaultCity();
+            TutorialCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
         }
-        
-        _roadGraph = new RoadGraph();
-        _roadGraph.BuildFromGrid(_grid);
+        else
+        {
+            _roadGraph.BuildFromGrid(_grid);
+            _transitManager.CreateDefaultRoutes(_grid, _roadGraph);
+            _parcelManager.RefreshParcels(_roadGraph);
+        }
         
         _distanceMatrix = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
         _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
@@ -66,28 +87,24 @@ public partial class Main : Node2D
         
         _odMatrix = new ODMatrix(_grid.ZoneCount);
         _trafficEngine = new TrafficEngine();
-        _economyManager = new EconomyManager();
         
         _trafficLights = new TrafficLightManager();
         _trafficLights.BuildIntersections(_roadGraph);
         
         _carTrafficManager = new CarTrafficManager();
-        _carTrafficManager.Initialize(_roadGraph);
-        
-        _transitManager = new TransitManager();
-        _transitManager.CreateDefaultRoutes(_grid, _roadGraph);
+        _carTrafficManager.Initialize(_roadGraph, _parcelManager);
         
         _pedestrianManager = new PedestrianManager();
         _pedestrianManager.Initialize(_roadGraph, _grid, _transitManager);
-        
+
         _camera = new Camera2D();
-        _camera.Position = new Vector2(_grid.Width * _grid.CellSize / 2f, _grid.Height * _grid.CellSize / 2f);
+        _camera.Position = new Vector2(672f, 672f);
         _camera.Zoom = new Vector2(0.85f, 0.85f);
         AddChild(_camera);
         
         _cityRenderer = new CityRenderer();
         AddChild(_cityRenderer);
-        _cityRenderer.Initialize(_grid);
+        _cityRenderer.Initialize(_grid, _parcelManager);
         
         _roadRenderer = new RoadRenderer();
         AddChild(_roadRenderer);
@@ -95,15 +112,16 @@ public partial class Main : Node2D
 
         _commuteOverlay = new CommuteOverlayRenderer();
         AddChild(_commuteOverlay);
-        _commuteOverlay.Initialize(_grid, _odMatrix, _roadGraph);
+        _commuteOverlay.Initialize(_grid, _odMatrix, _roadGraph, _parcelManager);
         
         _vehicleRenderer = new VehicleRenderer();
         AddChild(_vehicleRenderer);
-        _vehicleRenderer.Initialize(_transitManager, _carTrafficManager, _pedestrianManager, _roadGraph);
+        _vehicleRenderer.Initialize(_transitManager, _carTrafficManager, _pedestrianManager, _roadGraph, _parcelManager);
 
         _previewRenderer = new ToolPreviewRenderer();
         AddChild(_previewRenderer);
         _previewRenderer.Initialize(_grid, _roadGraph);
+        _previewRenderer.SetParcelManager(_parcelManager);
         
         _gameUI = new GameUI();
         AddChild(_gameUI);
@@ -135,7 +153,7 @@ public partial class Main : Node2D
         _gameUI.RouteDeleted += OnRouteDeleted;
         
         RecalculateODMatrix();
-        _gameUI.ShowCityOverview(_grid, _odMatrix);
+        _gameUI.ShowCityOverview(_grid, _odMatrix, _parcelManager);
     }
 
     private void OnInteractionModeChanged(int modeInt)
@@ -159,16 +177,24 @@ public partial class Main : Node2D
     private void ClearInspectSelection()
     {
         _selectedZoneId = -1;
+        _selectedParcelId = -1;
         _cityRenderer.SetSelectedZone(-1);
+        _cityRenderer.SetSelectedParcel(-1);
         _commuteOverlay.SelectZone(-1, _distanceMatrix, _roadGraph);
-        _gameUI.ShowCityOverview(_grid, _odMatrix);
+        _commuteOverlay.SelectParcel(-1, _parcelManager, _roadGraph);
+        _gameUI.ShowCityOverview(_grid, _odMatrix, _parcelManager);
     }
 
     private void CancelPendingOperation()
     {
+        _roadBuildStep = 0;
+        _roadStartNode = null;
+        _roadEndNode = null;
         _pendingStartZoneId = -1;
         CancelTransitDraft();
-        _previewRenderer.ClearPreview();
+        _previewRenderer?.ClearRoadBuildPreview();
+        _previewRenderer?.ClearPreview();
+        _cityRenderer?.Refresh();
     }
 
     private void CancelTransitDraft()
@@ -182,7 +208,7 @@ public partial class Main : Node2D
     
     private void RecalculateODMatrix()
     {
-        var coveredZones = _transitManager.GetCoveredZoneIds(_grid);
+        var coveredZones = _transitManager.GetCoveredZoneIds(_grid, 3, _roadGraph, _parcelManager);
         float avgPrice = 12f;
         if (_transitManager.Routes.Count > 0)
         {
@@ -191,14 +217,19 @@ public partial class Main : Node2D
             avgPrice = total / _transitManager.Routes.Count;
         }
 
-        _odMatrix.Recalculate(_gameHour, _grid, _distanceMatrix, _transitManager.Routes.Count > 0, coveredZones, avgPrice, _walkingDistanceMatrix, _transitManager);
+        _odMatrix.Recalculate(_gameHour, _grid, _distanceMatrix, _transitManager.Routes.Count > 0, coveredZones, avgPrice, _walkingDistanceMatrix, _transitManager, _parcelManager, _roadGraph);
         _trafficEngine.AssignFlows(_odMatrix, _roadGraph, _grid, _transitManager);
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
         _carTrafficManager.RefreshBusyEdges(_roadGraph);
         _lastODRecalcHour = _gameHour;
 
-        // Refresh selected zone overlay
-        if (_selectedZoneId != -1)
+        // Refresh selected parcel or zone overlay
+        if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
+        {
+            _commuteOverlay.SelectParcel(_selectedParcelId, _parcelManager, _roadGraph);
+            _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _odMatrix, _grid);
+        }
+        else if (_selectedZoneId != -1)
         {
             _commuteOverlay.SelectZone(_selectedZoneId, _distanceMatrix, _roadGraph);
             var zone = _grid.GetZone(_selectedZoneId);
@@ -232,13 +263,13 @@ public partial class Main : Node2D
 
         if (Mathf.Abs(_gameHour - _lastFinancialTickHour) >= 1f)
         {
-            _economyManager.ProcessFinancialTick(_grid, _roadGraph, _transitManager);
+            _economyManager.ProcessFinancialTick(_grid, _roadGraph, _transitManager, _parcelManager);
             _lastFinancialTickHour = _gameHour;
         }
         
         // Update simulation sub-systems
         _trafficLights.Update(dt, _gameSpeed);
-        _carTrafficManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights);
+        _carTrafficManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights, _parcelManager);
         _transitManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights, _gameHour);
         _pedestrianManager.Update(dt, _gameSpeed, _roadGraph, _grid, _transitManager);
         
@@ -249,15 +280,18 @@ public partial class Main : Node2D
         foreach (var v in _transitManager.Vehicles) transitRidership += v.Passengers;
         
         // Update HUD
+        int totalPop = _grid.TotalPopulation() + (_parcelManager?.TotalPopulation ?? 0);
+        int totalJobs = _grid.TotalJobs() + (_parcelManager?.TotalJobs ?? 0);
         _gameUI.UpdateTime(_gameHour, _gameDay);
         _gameUI.UpdateStats(
-            _grid.TotalPopulation(),
+            totalPop,
             _odMatrix.TotalTrips,
             _trafficEngine.GetAverageCongestion(_roadGraph),
             transitRidership,
-            _transitManager.GetTransitCoverage(_grid),
+            _transitManager.GetTransitCoverage(_grid, _roadGraph, _parcelManager),
             ODMatrix.GetDemandMultiplier(_gameHour),
-            ODMatrix.GetDirectionalBias(_gameHour)
+            ODMatrix.GetDirectionalBias(_gameHour),
+            totalJobs
         );
         
         _gameUI.UpdateEconomy(_economyManager.Money, _economyManager.LastDelta);
@@ -324,12 +358,37 @@ public partial class Main : Node2D
                 }
             }
 
-            if (uiNeedsUpdate && _selectedZoneId != -1)
+            if (_parcelManager != null)
             {
-                var selectedZone = _grid.GetZone(_selectedZoneId);
-                if (selectedZone.Type == ZoneType.Residential)
+                foreach (var parcel in _parcelManager.Parcels)
                 {
-                    _gameUI.ShowZoneInfographics(selectedZone, _grid, _odMatrix, _distanceMatrix);
+                    if (parcel.ZoneType == ZoneType.Residential && parcel.Population < parcel.ResidentialCap)
+                    {
+                        if (parcel.EdgeId >= 0 && parcel.EdgeId < _roadGraph.Edges.Count && _roadGraph.Edges[parcel.EdgeId].FromId != -1)
+                        {
+                            parcel.Population = Mathf.Min(parcel.ResidentialCap, parcel.Population + 4);
+                            uiNeedsUpdate = true;
+                        }
+                    }
+                }
+            }
+
+            if (uiNeedsUpdate)
+            {
+                if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
+                {
+                    if (selectedParcel.ZoneType == ZoneType.Residential)
+                    {
+                        _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _odMatrix, _grid);
+                    }
+                }
+                else if (_selectedZoneId != -1)
+                {
+                    var selectedZone = _grid.GetZone(_selectedZoneId);
+                    if (selectedZone.Type == ZoneType.Residential)
+                    {
+                        _gameUI.ShowZoneInfographics(selectedZone, _grid, _odMatrix, _distanceMatrix);
+                    }
                 }
             }
         }
@@ -351,12 +410,21 @@ public partial class Main : Node2D
             {
                 _isDragging = mb.Pressed;
             }
-            else if (mb.ButtonIndex == MouseButton.Left && mb.Pressed)
+            else if (mb.ButtonIndex == MouseButton.Left)
             {
-                HandleMapClick();
+                if (mb.Pressed)
+                {
+                    _isZoningDragging = ToolPreviewRenderer.IsZoningMode(_currentMode);
+                    HandleMapClick();
+                }
+                else
+                {
+                    _isZoningDragging = false;
+                }
             }
             else if (mb.ButtonIndex == MouseButton.Right && mb.Pressed)
             {
+                _isZoningDragging = false;
                 HandleRightClick();
             }
         }
@@ -369,12 +437,85 @@ public partial class Main : Node2D
             else if (_currentMode != InteractionMode.Inspect)
             {
                 UpdateHoverTarget();
+                if (_isZoningDragging && ToolPreviewRenderer.IsZoningMode(_currentMode))
+                {
+                    HandleMapClick();
+                }
+            }
+        }
+        else if (@event is InputEventKey)
+        {
+            if (_currentMode == InteractionMode.BuildRoad || _currentMode == InteractionMode.BuildCurvedRoad || ToolPreviewRenderer.IsZoningMode(_currentMode))
+            {
+                UpdateHoverTarget();
             }
         }
     }
 
+    private static ZoneType GetZoneTypeForMode(InteractionMode mode) => mode switch
+    {
+        InteractionMode.ZoneResidential => ZoneType.Residential,
+        InteractionMode.ZoneCommercial  => ZoneType.Commercial,
+        InteractionMode.ZoneIndustrial  => ZoneType.Industrial,
+        _                               => ZoneType.Empty
+    };
+
     private void UpdateHoverTarget()
     {
+        if (_currentMode == InteractionMode.BuildRoad || _currentMode == InteractionMode.BuildCurvedRoad)
+        {
+            UpdateRoadBuildHover();
+            return;
+        }
+
+        if (_currentMode == InteractionMode.CreateTransitRoute)
+        {
+            Vector2 mouse = GetGlobalMousePosition();
+            var snap = RoadSnappingEngine.FindSnap(mouse, _roadGraph, snapRadius: 28f);
+            _previewRenderer.SetTransitHoverSnap(snap);
+
+            if (snap.Type == SnapType.Node && snap.SnappedNode != null)
+            {
+                _gameUI.SetToolHint($"🚏 [Transit Stop] Snapped to Node #{snap.SnappedNode.Id}. Click to add stop.", new Color(0.3f, 0.95f, 1f));
+            }
+            else if (snap.Type == SnapType.Edge && snap.SnappedEdge != null)
+            {
+                _gameUI.SetToolHint($"🚏 [Transit Stop] Snapped to Mid-Road (Edge #{snap.SnappedEdge.Id}). Click to insert mid-road stop.", new Color(0.3f, 1f, 0.7f));
+            }
+            else
+            {
+                _gameUI.SetToolHint("🚌 [Transit Designer] Click on a road edge or intersection to place a transit stop.", new Color(0.4f, 0.8f, 1f));
+            }
+            return;
+        }
+
+        if (ToolPreviewRenderer.IsZoningMode(_currentMode) && _parcelManager != null)
+        {
+            Vector2 mouse = GetGlobalMousePosition();
+            bool fullSide = Input.IsKeyPressed(Key.Shift);
+            var query = _parcelManager.QueryZoningTarget(mouse, _roadGraph, fullSide);
+
+            if (query.SideParcels.Count > 0)
+            {
+                _previewRenderer.SetHoverZone(-1);
+                ZoneType targetType = GetZoneTypeForMode(_currentMode);
+                _previewRenderer.SetHoveredParcels(query.SideParcels, targetType, query.Side);
+
+                string sideStr = query.Side == ParcelSide.Left ? "Left" : "Right";
+                string targetStr = fullSide ? $"Entire {sideStr} Side ({query.SideParcels.Count} parcels)" : $"Parcel on {sideStr} Side";
+                int changedCount = query.SideParcels.Count(p => p.ZoneType != targetType);
+                float cost = changedCount * EconomyManager.ZoningCost;
+                string costStr = _currentMode == InteractionMode.Dezone ? "Free" : $"${cost:F0}";
+
+                _gameUI.SetToolHint($"🏡 [{_currentMode}] Hovering {targetStr}. Cost: {costStr}. (Hold Shift for entire side)", new Color(0.3f, 0.95f, 0.65f));
+                return;
+            }
+            else
+            {
+                _previewRenderer.ClearHoveredParcels();
+            }
+        }
+
         Vector2 mouseWorld = GetGlobalMousePosition();
         int gx = Mathf.FloorToInt(mouseWorld.X / _grid.CellSize);
         int gy = Mathf.FloorToInt(mouseWorld.Y / _grid.CellSize);
@@ -392,6 +533,24 @@ public partial class Main : Node2D
 
     private void HandleRightClick()
     {
+        if (_currentMode == InteractionMode.BuildRoad || _currentMode == InteractionMode.BuildCurvedRoad)
+        {
+            if (_roadBuildStep > 0)
+            {
+                _roadBuildStep = 0;
+                _roadStartNode = null;
+                _roadEndNode = null;
+                _previewRenderer.ClearRoadBuildPreview();
+                _gameUI.SetToolHint("🛣️ Road construction cancelled. Click to set new start point.", new Color(1f, 0.8f, 0.4f));
+            }
+            else
+            {
+                _gameUI.SetInteractionMode(InteractionMode.Inspect);
+            }
+            _cityRenderer?.Refresh();
+            return;
+        }
+
         if (_currentMode == InteractionMode.CreateTransitRoute)
         {
             if (_draftTransitStops.Count > 0)
@@ -403,6 +562,7 @@ public partial class Main : Node2D
             {
                 _gameUI.SetInteractionMode(InteractionMode.Inspect);
             }
+            _cityRenderer?.Refresh();
             return;
         }
 
@@ -415,6 +575,7 @@ public partial class Main : Node2D
         {
             _gameUI.SetInteractionMode(InteractionMode.Inspect);
         }
+        _cityRenderer?.Refresh();
     }
 
     private void HandleMapClick()
@@ -429,7 +590,8 @@ public partial class Main : Node2D
                 HandleInspectClick(gx, gy);
                 break;
             case InteractionMode.BuildRoad:
-                HandleBuildRoadClick(gx, gy);
+            case InteractionMode.BuildCurvedRoad:
+                HandleRoadBuildClick();
                 break;
             case InteractionMode.Demolish:
                 HandleDemolishClick(gx, gy);
@@ -447,13 +609,34 @@ public partial class Main : Node2D
                 HandleDezoneClick(gx, gy);
                 break;
             case InteractionMode.CreateTransitRoute:
-                HandleCreateTransitRouteClick(gx, gy);
+                HandleCreateTransitRouteClick(mouseWorld);
                 break;
         }
     }
 
     private void HandleInspectClick(int gx, int gy)
     {
+        Vector2 mouseWorld = GetGlobalMousePosition();
+
+        // 1. Check roadside ribbon parcels first (higher precision click on continuous lot)
+        RoadsideParcel clickedParcel = _parcelManager?.GetParcelAt(mouseWorld);
+        if (clickedParcel == null && _parcelManager != null)
+        {
+            clickedParcel = _parcelManager.FindClosestParcel(mouseWorld, 24f);
+        }
+
+        if (clickedParcel != null && clickedParcel.ZoneType != ZoneType.Empty)
+        {
+            _selectedZoneId = -1;
+            _selectedParcelId = clickedParcel.Id;
+            _cityRenderer.SetSelectedZone(-1);
+            _cityRenderer.SetSelectedParcel(clickedParcel.Id);
+            _commuteOverlay.SelectParcel(clickedParcel.Id, _parcelManager, _roadGraph);
+            _gameUI.ShowParcelInfographics(clickedParcel, _parcelManager, _odMatrix, _grid);
+            return;
+        }
+
+        // 2. Fallback to legacy grid zones
         if (gx >= 0 && gx < _grid.Width && gy >= 0 && gy < _grid.Height)
         {
             int zoneId = _grid.GetZoneId(gx, gy);
@@ -461,7 +644,9 @@ public partial class Main : Node2D
 
             if (zone != null && zone.Type != ZoneType.Empty)
             {
+                _selectedParcelId = -1;
                 _selectedZoneId = zoneId;
+                _cityRenderer.SetSelectedParcel(-1);
                 _cityRenderer.SetSelectedZone(zoneId);
                 _commuteOverlay.SelectZone(zoneId, _distanceMatrix, _roadGraph);
                 _gameUI.ShowZoneInfographics(zone, _grid, _odMatrix, _distanceMatrix);
@@ -469,101 +654,275 @@ public partial class Main : Node2D
             }
         }
 
-        // Clicked outside or empty zone: reset to overview
+        // Clicked outside or empty zone/parcel: reset to overview
         ClearInspectSelection();
     }
 
-    private void HandleBuildRoadClick(int gx, int gy)
+    private void UpdateRoadBuildHover()
     {
-        if (gx < 0 || gx >= _grid.Width || gy < 0 || gy >= _grid.Height)
+        Vector2 mouseWorld = GetGlobalMousePosition();
+        bool forceAngle = Input.IsKeyPressed(Key.Shift);
+
+        if (_roadBuildStep == 0)
         {
-            return;
+            _currentCursorSnap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, null, null, forceAngle);
+            _previewRenderer.SetRoadBuildPreview(
+                0,
+                _currentCursorSnap.Position,
+                _currentCursorSnap.Position,
+                _currentCursorSnap.Position,
+                null,
+                _currentCursorSnap,
+                0f,
+                true
+            );
         }
-
-        int zoneId = _grid.GetZoneId(gx, gy);
-        var zone = _grid.GetZone(zoneId);
-
-        if (zone == null)
+        else if (_roadBuildStep == 1)
         {
-            return;
+            _currentCursorSnap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, _roadStartPoint, _roadStartNode, forceAngle);
+            var curve = new CurveSegment(_roadStartPoint, _currentCursorSnap.Position);
+            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (curve.Length / 64f)));
+            bool canAfford = _economyManager.CanAfford(cost);
+            _previewRenderer.SetRoadBuildPreview(
+                1,
+                _roadStartPoint,
+                _currentCursorSnap.Position,
+                _currentCursorSnap.Position,
+                curve,
+                _currentCursorSnap,
+                cost,
+                canAfford
+            );
         }
-
-        if (_pendingStartZoneId == -1)
+        else if (_roadBuildStep == 2)
         {
-            // First step: select start zone
-            _pendingStartZoneId = zone.Id;
-            var validTargets = GetValidAdjacentTargets(InteractionMode.BuildRoad, _pendingStartZoneId);
-            _previewRenderer.SetPreview(InteractionMode.BuildRoad, _pendingStartZoneId, validTargets);
-            _gameUI.SetToolHint($"🛣️ [Build Road] Selected start cell at ({gx}, {gy}). Click an adjacent cell to build road (Right-click to cancel).", new Color(0.2f, 1f, 0.7f));
+            var curve = CurveSegment.CreateFromThreePoints(_roadStartPoint, mouseWorld, _roadEndPoint);
+            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (curve.Length / 64f)));
+            bool canAfford = _economyManager.CanAfford(cost);
+            var snap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, null, null, false);
+            _previewRenderer.SetRoadBuildPreview(
+                2,
+                _roadStartPoint,
+                _roadEndPoint,
+                mouseWorld,
+                curve,
+                snap,
+                cost,
+                canAfford
+            );
         }
-        else
+    }
+
+    private void HandleRoadBuildClick()
+    {
+        Vector2 mouseWorld = GetGlobalMousePosition();
+        bool forceAngle = Input.IsKeyPressed(Key.Shift);
+
+        if (_roadBuildStep == 0)
         {
-            // Second step: click adjacent target zone
-            if (zone.Id == _pendingStartZoneId)
+            // Step 1: Click start point
+            _currentCursorSnap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, null, null, forceAngle);
+
+            if (_currentCursorSnap.Type == SnapType.Node)
             {
-                // Clicked same cell: cancel/deselect
-                CancelPendingOperation();
-                _gameUI.SetToolHint("🛣️ [Build Road] Selection cancelled. Click first cell to build road.", new Color(0.4f, 0.95f, 0.6f));
-                return;
+                _roadStartNode = _currentCursorSnap.SnappedNode;
             }
-
-            var startZone = _grid.GetZone(_pendingStartZoneId);
-            int manhattanDist = Mathf.Abs(startZone.GridPos.X - zone.GridPos.X) + Mathf.Abs(startZone.GridPos.Y - zone.GridPos.Y);
-
-            if (manhattanDist != 1)
+            else if (_currentCursorSnap.Type == SnapType.Edge)
             {
-                // Non-adjacent cell: update selection to clicked cell as new start
-                _pendingStartZoneId = zone.Id;
-                var validTargets = GetValidAdjacentTargets(InteractionMode.BuildRoad, _pendingStartZoneId);
-                _previewRenderer.SetPreview(InteractionMode.BuildRoad, _pendingStartZoneId, validTargets);
-                _gameUI.SetToolHint($"⚠️ Cells must be adjacent! New start cell set at ({gx}, {gy}). Click an adjacent cell.", Colors.Yellow);
-                return;
-            }
-
-            // Check if road already exists
-            if (_roadGraph.HasEdge(_pendingStartZoneId, zone.Id) || _roadGraph.HasEdge(zone.Id, _pendingStartZoneId))
-            {
-                // Road already exists: update start cell to clicked cell
-                _pendingStartZoneId = zone.Id;
-                var validTargets = GetValidAdjacentTargets(InteractionMode.BuildRoad, _pendingStartZoneId);
-                _previewRenderer.SetPreview(InteractionMode.BuildRoad, _pendingStartZoneId, validTargets);
-                _gameUI.SetToolHint($"⚠️ Road already exists between these cells! New start cell set at ({gx}, {gy}).", Colors.Yellow);
-                return;
-            }
-
-            if (!_economyManager.CanAfford(EconomyManager.RoadSegmentCost))
-            {
-                CancelPendingOperation();
-                _gameUI.SetToolHint($"⚠️ Insufficient funds! Road segment costs ${EconomyManager.RoadSegmentCost}.", Colors.Coral);
-                return;
-            }
-
-            // Create road segment in both directions
-            _roadGraph.EnsureNode(_pendingStartZoneId, _grid.GetWorldCenter(_pendingStartZoneId));
-            _roadGraph.EnsureNode(zone.Id, _grid.GetWorldCenter(zone.Id));
-            bool added = _roadGraph.AddRoadSegment(_pendingStartZoneId, zone.Id);
-            if (added)
-            {
-                _economyManager.Spend(EconomyManager.RoadSegmentCost);
-                _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-                _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
-                _trafficLights.BuildIntersections(_roadGraph);
-                RecalculateODMatrix();
-                _roadRenderer.Refresh();
-                _cityRenderer.Refresh();
-                _vehicleRenderer.QueueRedraw();
-
-                int sx = startZone.GridPos.X;
-                int sy = startZone.GridPos.Y;
-                CancelPendingOperation();
-                _gameUI.SetToolHint($"✅ Road built between ({sx}, {sy}) and ({gx}, {gy})! Click to build another.", new Color(0.3f, 1f, 0.5f));
+                _roadStartNode = _roadGraph.SplitEdgeAtPoint(_currentCursorSnap.SnappedEdge.Id, _currentCursorSnap.Position);
             }
             else
             {
-                CancelPendingOperation();
-                _gameUI.SetToolHint("⚠️ Failed to build road segment.", Colors.Coral);
+                int gx = Mathf.FloorToInt(_currentCursorSnap.Position.X / _grid.CellSize);
+                int gy = Mathf.FloorToInt(_currentCursorSnap.Position.Y / _grid.CellSize);
+                if (gx >= 0 && gx < _grid.Width && gy >= 0 && gy < _grid.Height)
+                {
+                    int zoneId = _grid.GetZoneId(gx, gy);
+                    var zone = _grid.GetZone(zoneId);
+                    if (zone != null && zone.Type != ZoneType.Empty && _roadGraph.NodeMap.ContainsKey(zoneId))
+                    {
+                        _roadStartNode = _roadGraph.NodeMap[zoneId];
+                    }
+                    else
+                    {
+                        _roadStartNode = _roadGraph.CreateNode(_currentCursorSnap.Position, -1);
+                    }
+                }
+                else
+                {
+                    _roadStartNode = _roadGraph.CreateNode(_currentCursorSnap.Position, -1);
+                }
+            }
+
+            _roadStartPoint = _roadStartNode.WorldPosition;
+            _roadBuildStep = 1;
+            UpdateRoadBuildHover();
+            string stepTotal = _currentMode == InteractionMode.BuildCurvedRoad ? "3" : "2";
+            _gameUI.SetToolHint($"📍 [Step 2/{stepTotal}] Start set. Click end point (Hold Shift for angle snap).", new Color(0.2f, 1f, 0.7f));
+        }
+        else if (_roadBuildStep == 1)
+        {
+            // Step 2: Click end point
+            _currentCursorSnap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, _roadStartPoint, _roadStartNode, forceAngle);
+
+            if (_roadStartPoint.DistanceTo(_currentCursorSnap.Position) < 8.0f)
+            {
+                _gameUI.SetToolHint("⚠️ Road segment too short. Choose a farther point.", Colors.Yellow);
+                return;
+            }
+
+            if (_currentMode == InteractionMode.BuildCurvedRoad)
+            {
+                _roadEndPoint = _currentCursorSnap.Position;
+                _pendingEndSnap = _currentCursorSnap;
+                _roadBuildStep = 2;
+                UpdateRoadBuildHover();
+                _gameUI.SetToolHint("〰️ [Step 3/3] Move cursor to bend curvature, then click to build.", new Color(0.3f, 0.95f, 1f));
+                return;
+            }
+
+            // Straight Road Mode: Build immediately
+            if (_currentCursorSnap.Type == SnapType.Node)
+            {
+                _roadEndNode = _currentCursorSnap.SnappedNode;
+            }
+            else if (_currentCursorSnap.Type == SnapType.Edge)
+            {
+                _roadEndNode = _roadGraph.SplitEdgeAtPoint(_currentCursorSnap.SnappedEdge.Id, _currentCursorSnap.Position);
+            }
+            else
+            {
+                int gx = Mathf.FloorToInt(_currentCursorSnap.Position.X / _grid.CellSize);
+                int gy = Mathf.FloorToInt(_currentCursorSnap.Position.Y / _grid.CellSize);
+                if (gx >= 0 && gx < _grid.Width && gy >= 0 && gy < _grid.Height)
+                {
+                    int zoneId = _grid.GetZoneId(gx, gy);
+                    var zone = _grid.GetZone(zoneId);
+                    if (zone != null && zone.Type != ZoneType.Empty && _roadGraph.NodeMap.ContainsKey(zoneId))
+                    {
+                        _roadEndNode = _roadGraph.NodeMap[zoneId];
+                    }
+                    else
+                    {
+                        _roadEndNode = _roadGraph.CreateNode(_currentCursorSnap.Position, -1);
+                    }
+                }
+                else
+                {
+                    _roadEndNode = _roadGraph.CreateNode(_currentCursorSnap.Position, -1);
+                }
+            }
+
+            if (_roadStartNode.Id == _roadEndNode.Id)
+            {
+                _gameUI.SetToolHint("⚠️ Start and end points must be different.", Colors.Yellow);
+                return;
+            }
+
+            if (_roadGraph.HasEdge(_roadStartNode.Id, _roadEndNode.Id))
+            {
+                _gameUI.SetToolHint("⚠️ Road already exists between these points.", Colors.Yellow);
+                return;
+            }
+
+            var straightCurve = new CurveSegment(_roadStartNode.WorldPosition, _roadEndNode.WorldPosition);
+            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (straightCurve.Length / 64f)));
+
+            if (!_economyManager.CanAfford(cost))
+            {
+                _gameUI.SetToolHint($"⚠️ Insufficient funds! Costs ${cost:F0}.", Colors.Coral);
+                return;
+            }
+
+            bool added = _roadGraph.AddCurvedRoadSegment(_roadStartNode.Id, _roadEndNode.Id, straightCurve);
+            if (added)
+            {
+                _economyManager.Spend(cost);
+                CompleteRoadConstruction();
             }
         }
+        else if (_roadBuildStep == 2)
+        {
+            // Step 3: Click to confirm curve bend apex
+            if (_pendingEndSnap.Type == SnapType.Node)
+            {
+                _roadEndNode = _pendingEndSnap.SnappedNode;
+            }
+            else if (_pendingEndSnap.Type == SnapType.Edge)
+            {
+                _roadEndNode = _roadGraph.SplitEdgeAtPoint(_pendingEndSnap.SnappedEdge.Id, _roadEndPoint);
+            }
+            else
+            {
+                int gx = Mathf.FloorToInt(_roadEndPoint.X / _grid.CellSize);
+                int gy = Mathf.FloorToInt(_roadEndPoint.Y / _grid.CellSize);
+                if (gx >= 0 && gx < _grid.Width && gy >= 0 && gy < _grid.Height)
+                {
+                    int zoneId = _grid.GetZoneId(gx, gy);
+                    var zone = _grid.GetZone(zoneId);
+                    if (zone != null && zone.Type != ZoneType.Empty && _roadGraph.NodeMap.ContainsKey(zoneId))
+                    {
+                        _roadEndNode = _roadGraph.NodeMap[zoneId];
+                    }
+                    else
+                    {
+                        _roadEndNode = _roadGraph.CreateNode(_roadEndPoint, -1);
+                    }
+                }
+                else
+                {
+                    _roadEndNode = _roadGraph.CreateNode(_roadEndPoint, -1);
+                }
+            }
+
+            if (_roadStartNode.Id == _roadEndNode.Id)
+            {
+                _gameUI.SetToolHint("⚠️ Start and end points must be different.", Colors.Yellow);
+                return;
+            }
+
+            if (_roadGraph.HasEdge(_roadStartNode.Id, _roadEndNode.Id))
+            {
+                _gameUI.SetToolHint("⚠️ Road already exists between these points.", Colors.Yellow);
+                return;
+            }
+
+            var curve = CurveSegment.CreateFromThreePoints(_roadStartNode.WorldPosition, mouseWorld, _roadEndNode.WorldPosition);
+            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (curve.Length / 64f)));
+
+            if (!_economyManager.CanAfford(cost))
+            {
+                _gameUI.SetToolHint($"⚠️ Insufficient funds! Costs ${cost:F0}.", Colors.Coral);
+                return;
+            }
+
+            bool added = _roadGraph.AddCurvedRoadSegment(_roadStartNode.Id, _roadEndNode.Id, curve);
+            if (added)
+            {
+                _economyManager.Spend(cost);
+                CompleteRoadConstruction();
+            }
+        }
+    }
+
+    private void CompleteRoadConstruction()
+    {
+        _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+        _trafficLights.BuildIntersections(_roadGraph);
+        _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
+        _pedestrianManager.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
+        RecalculateODMatrix();
+        _parcelManager?.RefreshParcels(_roadGraph);
+        _roadRenderer.Refresh();
+        _cityRenderer.Refresh();
+        _vehicleRenderer.QueueRedraw();
+
+        _roadBuildStep = 0;
+        _roadStartNode = null;
+        _roadEndNode = null;
+        _previewRenderer.ClearRoadBuildPreview();
+        _gameUI.SetToolHint("✅ Road built successfully! Click to build another.", new Color(0.3f, 1f, 0.5f));
     }
 
     private void HandleDemolishClick(int gx, int gy)
@@ -651,6 +1010,7 @@ public partial class Main : Node2D
                 _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
                 _pedestrianManager.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
                 RecalculateODMatrix();
+                _parcelManager?.RefreshParcels(_roadGraph);
                 _roadRenderer.Refresh();
                 _cityRenderer.Refresh();
                 _vehicleRenderer.QueueRedraw();
@@ -670,6 +1030,18 @@ public partial class Main : Node2D
 
     private void HandleZoneClick(int gx, int gy, ZoneType type)
     {
+        Vector2 mouseWorld = GetGlobalMousePosition();
+        bool fullSide = Input.IsKeyPressed(Key.Shift);
+        if (_parcelManager != null)
+        {
+            var query = _parcelManager.QueryZoningTarget(mouseWorld, _roadGraph, fullSide);
+            if (query.SideParcels.Count > 0)
+            {
+                HandleRoadsideZoneClick(query.SideParcels, query.Side, type, fullSide);
+                return;
+            }
+        }
+
         if (gx < 0 || gx >= _grid.Width || gy < 0 || gy >= _grid.Height)
         {
             return;
@@ -717,6 +1089,18 @@ public partial class Main : Node2D
 
     private void HandleDezoneClick(int gx, int gy)
     {
+        Vector2 mouseWorld = GetGlobalMousePosition();
+        bool fullSide = Input.IsKeyPressed(Key.Shift);
+        if (_parcelManager != null)
+        {
+            var query = _parcelManager.QueryZoningTarget(mouseWorld, _roadGraph, fullSide);
+            if (query.SideParcels.Count > 0)
+            {
+                HandleRoadsideDezoneClick(query.SideParcels, query.Side, fullSide);
+                return;
+            }
+        }
+
         if (gx < 0 || gx >= _grid.Width || gy < 0 || gy >= _grid.Height)
         {
             return;
@@ -752,6 +1136,73 @@ public partial class Main : Node2D
         _gameUI.ShowCityOverview(_grid, _odMatrix);
 
         _gameUI.SetToolHint($"🧹 Cleared cell ({gx}, {gy}) back to empty terrain.", new Color(1f, 0.7f, 0.4f));
+    }
+
+    private void HandleRoadsideZoneClick(List<RoadsideParcel> parcels, ParcelSide side, ZoneType type, bool fullSide)
+    {
+        var toZone = parcels.Where(p => p.ZoneType != type).ToList();
+        if (toZone.Count == 0)
+        {
+            _gameUI.SetToolHint($"ℹ️ Selected roadside parcel(s) are already zoned as {type}.", Colors.LightGray);
+            return;
+        }
+
+        float totalCost = toZone.Count * EconomyManager.ZoningCost;
+        if (!_economyManager.CanAfford(totalCost))
+        {
+            _gameUI.SetToolHint($"⚠️ Insufficient funds! Costs ${totalCost:F0} (${EconomyManager.ZoningCost}/parcel).", Colors.Coral);
+            return;
+        }
+
+        _economyManager.Spend(totalCost);
+        foreach (var p in toZone)
+        {
+            _parcelManager.ZoneParcel(p.Id, type, ensureAccessNode: false);
+        }
+
+        _cityRenderer.Refresh();
+        _roadRenderer.Refresh();
+        _previewRenderer.ClearHoveredParcels();
+        UpdateHoverTarget();
+
+        string sideStr = side == ParcelSide.Left ? "Left" : "Right";
+        string typeName = type switch
+        {
+            ZoneType.Residential => "Residential (🏡)",
+            ZoneType.Commercial  => "Commercial (🏢)",
+            ZoneType.Industrial  => "Industrial (🏭)",
+            _ => type.ToString()
+        };
+
+        string msg = toZone.Count == 1
+            ? $"✅ Zoned roadside lot on {sideStr} side as {typeName} (-${EconomyManager.ZoningCost:F0})!"
+            : $"✅ Zoned {toZone.Count} roadside lots on {sideStr} side as {typeName} (-${totalCost:F0})!";
+        _gameUI.SetToolHint(msg, new Color(0.3f, 1f, 0.5f));
+    }
+
+    private void HandleRoadsideDezoneClick(List<RoadsideParcel> parcels, ParcelSide side, bool fullSide)
+    {
+        var toDezone = parcels.Where(p => p.ZoneType != ZoneType.Empty).ToList();
+        if (toDezone.Count == 0)
+        {
+            _gameUI.SetToolHint("ℹ️ Selected roadside parcel(s) are already empty.", Colors.LightGray);
+            return;
+        }
+
+        foreach (var p in toDezone)
+        {
+            _parcelManager.DezoneParcel(p.Id);
+        }
+
+        _cityRenderer.Refresh();
+        _previewRenderer.ClearHoveredParcels();
+        UpdateHoverTarget();
+
+        string sideStr = side == ParcelSide.Left ? "Left" : "Right";
+        string msg = toDezone.Count == 1
+            ? $"🧹 Cleared roadside lot on {sideStr} side back to empty."
+            : $"🧹 Cleared {toDezone.Count} roadside lots on {sideStr} side back to empty.";
+        _gameUI.SetToolHint(msg, new Color(1f, 0.7f, 0.4f));
     }
 
     private List<int> GetValidAdjacentTargets(InteractionMode mode, int zoneId)
@@ -790,43 +1241,81 @@ public partial class Main : Node2D
         return list;
     }
 
-    private void HandleCreateTransitRouteClick(int gx, int gy)
+    private void HandleCreateTransitRouteClick(Vector2 mouseWorld)
     {
-        if (gx < 0 || gx >= _grid.Width || gy < 0 || gy >= _grid.Height)
-        {
-            return;
-        }
+        var snap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, snapRadius: 28f);
+        int stopNodeId = -1;
 
-        int zoneId = _grid.GetZoneId(gx, gy);
-        if (!_roadGraph.NodeMap.ContainsKey(zoneId))
+        if (snap.Type == SnapType.Node && snap.SnappedNode != null)
         {
-            _gameUI.SetToolHint("⚠️ Click a road intersection/node to add a transit stop.", Colors.Coral);
-            return;
+            stopNodeId = snap.SnappedNode.Id;
+        }
+        else if (snap.Type == SnapType.Edge && snap.SnappedEdge != null)
+        {
+            // Mid-road stop insertion: automatically split the edge at the clicked position
+            var newNode = _roadGraph.SplitEdgeAtPoint(snap.SnappedEdge.Id, snap.Position);
+            if (newNode == null)
+            {
+                _gameUI.SetToolHint("⚠️ Failed to insert mid-road stop at this position.", Colors.Coral);
+                return;
+            }
+            stopNodeId = newNode.Id;
+
+            // Rebuild topology and matrices
+            _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
+            _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+            _trafficLights.BuildIntersections(_roadGraph);
+            _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
+            _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
+            _parcelManager?.RefreshParcels(_roadGraph);
+            _roadRenderer.Refresh();
+            _cityRenderer.Refresh();
+            _vehicleRenderer.QueueRedraw();
+        }
+        else
+        {
+            // Fallback: check if clicked on an existing node near cursor
+            int gx = Mathf.FloorToInt(mouseWorld.X / _grid.CellSize);
+            int gy = Mathf.FloorToInt(mouseWorld.Y / _grid.CellSize);
+            if (gx >= 0 && gx < _grid.Width && gy >= 0 && gy < _grid.Height)
+            {
+                int zoneId = _grid.GetZoneId(gx, gy);
+                if (_roadGraph.NodeMap.ContainsKey(zoneId))
+                {
+                    stopNodeId = zoneId;
+                }
+            }
+
+            if (stopNodeId == -1)
+            {
+                _gameUI.SetToolHint("⚠️ Click an intersection or anywhere along a road edge to add a transit stop.", Colors.Coral);
+                return;
+            }
         }
 
         if (_draftTransitStops.Count == 0)
         {
             // First stop: Route origin
-            _draftTransitStops.Add(zoneId);
-            _draftTransitPath.Add(zoneId);
+            _draftTransitStops.Add(stopNodeId);
+            _draftTransitPath.Add(stopNodeId);
             _draftIsLoop = false;
             _previewRenderer.SetTransitDraft(_draftTransitStops, _draftTransitPath, _gameUI.CurrentRouteDesignerColor, _draftIsLoop);
             _gameUI.UpdateRouteDesignerStatus(_draftTransitStops.Count, _draftTransitPath.Count, _draftIsLoop);
-            _gameUI.SetToolHint($"🚏 Origin stop set at ({gx}, {gy}). Click the next road intersection.", new Color(0.2f, 1f, 0.7f));
+            _gameUI.SetToolHint($"🚏 Origin stop set at Node #{stopNodeId}. Click along roads or intersections to add stops.", new Color(0.2f, 1f, 0.7f));
         }
         else
         {
             int lastStop = _draftTransitStops[_draftTransitStops.Count - 1];
-            if (zoneId == lastStop)
+            if (stopNodeId == lastStop)
             {
-                _gameUI.SetToolHint("ℹ️ This node is already the current stop. Click a different road intersection.", Colors.LightGray);
+                _gameUI.SetToolHint("ℹ️ This node is already the current stop. Click a different point along the road.", Colors.LightGray);
                 return;
             }
 
             // Loop closure check: clicking back on origin stop
-            if (zoneId == _draftTransitStops[0] && _draftTransitStops.Count >= 2)
+            if (stopNodeId == _draftTransitStops[0] && _draftTransitStops.Count >= 2)
             {
-                var loopPath = _roadGraph.GetShortestNodePath(lastStop, zoneId);
+                var loopPath = _roadGraph.GetShortestNodePath(lastStop, stopNodeId);
                 if (loopPath == null || loopPath.Count < 2)
                 {
                     _gameUI.SetToolHint("⚠️ No road path found to close loop back to start.", Colors.Coral);
@@ -846,10 +1335,10 @@ public partial class Main : Node2D
             }
 
             // Normal next stop along shortest path
-            var segPath = _roadGraph.GetShortestNodePath(lastStop, zoneId);
+            var segPath = _roadGraph.GetShortestNodePath(lastStop, stopNodeId);
             if (segPath == null || segPath.Count < 2)
             {
-                _gameUI.SetToolHint($"⚠️ No road path found connecting to ({gx}, {gy}). Choose a connected intersection.", Colors.Coral);
+                _gameUI.SetToolHint("⚠️ No road path found connecting to this stop. Choose a connected road.", Colors.Coral);
                 return;
             }
 
@@ -857,7 +1346,7 @@ public partial class Main : Node2D
             {
                 _draftTransitPath.Add(segPath[i]);
             }
-            _draftTransitStops.Add(zoneId);
+            _draftTransitStops.Add(stopNodeId);
             _draftIsLoop = false;
             _previewRenderer.SetTransitDraft(_draftTransitStops, _draftTransitPath, _gameUI.CurrentRouteDesignerColor, _draftIsLoop);
             _gameUI.UpdateRouteDesignerStatus(_draftTransitStops.Count, _draftTransitPath.Count, _draftIsLoop);
@@ -897,6 +1386,7 @@ public partial class Main : Node2D
         _gameUI.UpdateTransitRoutesView();
         _vehicleRenderer.QueueRedraw();
         _roadRenderer.Refresh();
+        _cityRenderer.Refresh();
 
         _gameUI.SetToolHint($"🎉 Route '{newRoute.Name}' launched with {newRoute.FleetSize} buses! Transit coverage updated.", new Color(0.3f, 1f, 0.5f));
     }
@@ -904,6 +1394,7 @@ public partial class Main : Node2D
     private void OnRouteCancelRequested()
     {
         CancelTransitDraft();
+        _cityRenderer.Refresh();
     }
 
     private void OnRouteDeleted(int routeId)

@@ -25,7 +25,9 @@ public enum InteractionMode
     /// <summary>Clear existing zoned cell back to empty terrain.</summary>
     Dezone,
     /// <summary>Design and construct a new public transit route with custom stops.</summary>
-    CreateTransitRoute
+    CreateTransitRoute,
+    /// <summary>Click start, end, and drag/click curvature apex to build curved Bézier roads.</summary>
+    BuildCurvedRoad
 }
 
 public partial class GameUI : CanvasLayer
@@ -239,7 +241,9 @@ public partial class GameUI : CanvasLayer
         topHBox.AddChild(_zoningMenu);
 
         _roadsMenu = new MenuButton { Text = "🛣️ Roads ▾", CustomMinimumSize = new Vector2(100, 36) };
-        _roadsMenu.GetPopup().AddItem("🛣️ Build Road", (int)InteractionMode.BuildRoad);
+        _roadsMenu.GetPopup().AddItem("🛣️ Straight Road", (int)InteractionMode.BuildRoad);
+        _roadsMenu.GetPopup().AddItem("〰️ Curved Road", (int)InteractionMode.BuildCurvedRoad);
+        _roadsMenu.GetPopup().AddSeparator();
         _roadsMenu.GetPopup().AddItem("💥 Demolish", (int)InteractionMode.Demolish);
         _roadsMenu.GetPopup().IdPressed += (id) => SetInteractionMode((InteractionMode)id);
         topHBox.AddChild(_roadsMenu);
@@ -830,27 +834,150 @@ public partial class GameUI : CanvasLayer
         }
     }
 
-    public void ShowCityOverview(CityGrid grid, ODMatrix od)
+    public void ShowParcelInfographics(RoadsideParcel parcel, ParcelManager parcelManager, ODMatrix od, CityGrid grid)
     {
-        _infoTitleLabel.Text = "📊 Шляхи: Місто на 1M+";
+        SwitchToCommuteTab();
+
+        if (parcel == null || parcel.ZoneType == ZoneType.Empty)
+        {
+            ShowCityOverview(grid, od, parcelManager);
+            return;
+        }
+
+        if (parcel.ZoneType == ZoneType.Residential)
+        {
+            _infoTitleLabel.Text = $"🏡 Житлова ділянка #{parcel.Id} (Вулиця #{parcel.EdgeId})";
+            _infoTitleLabel.AddThemeColorOverride("font_color", new Color(0.4f, 0.9f, 0.5f));
+
+            int workers = Mathf.RoundToInt(parcel.Population * 0.50f);
+            var res = CommuteAnalytics.GetResidentialCommuteForParcel(parcel, od, parcelManager, grid);
+
+            _infoStat1Label.Text = $"Населення: {parcel.Population:N0} / {parcel.ResidentialCap:N0} чол.";
+            _infoStat2Label.Text = $"Працездатні: {workers:N0} працівників (поїздок: {res.totalTrips:N0}/год)";
+
+            _infoWorkplaceBreakdown.Text = 
+                $"Де працюють мешканці цієї ділянки:\n" +
+                $"  🏢 Офіси й послуги: {res.comPct:F1}% ({res.comTrips:N0})\n" +
+                $"  🏭 Промисловість: {res.indPct:F1}% ({res.indTrips:N0})";
+
+            _infoModeSplit.Text = $"🚗 На авто: {res.carPct:F1}% ({res.outgoingCar:N0})   🚌 Громадський транспорт: {res.transitPct:F1}% ({res.outgoingTransit:N0})   🚶 Пішки: {res.walkPct:F1}% ({res.outgoingWalk:N0})";
+
+            if (res.destinations.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder("Головні напрямки поїздок:\n");
+                int count = Mathf.Min(3, res.destinations.Count);
+                for (int d = 0; d < count; d++)
+                {
+                    var dest = res.destinations[d];
+                    string icon = dest.Type == ZoneType.Commercial ? "🏢 Офіси" : "🏭 Завод";
+                    sb.AppendLine($"  • {icon} ({dest.DisplayName}): {dest.Trips:N0} поїздок ({dest.Percentage:F1}%)");
+                }
+                _infoTopDestinations.Text = sb.ToString().TrimEnd();
+            }
+            else
+            {
+                _infoTopDestinations.Text = "Головні напрямки поїздок:\n  • Немає активних поїздок до робочих місць";
+            }
+
+            _infoHint.Text = "✨ Підсвічені вулиці на мапі показують точний дорожній шлях мешканців ділянки!";
+        }
+        else if (parcel.ZoneType == ZoneType.Industrial)
+        {
+            _infoTitleLabel.Text = $"🏭 Промділянка #{parcel.Id} (Вулиця #{parcel.EdgeId})";
+            _infoTitleLabel.AddThemeColorOverride("font_color", new Color(1.0f, 0.70f, 0.2f));
+
+            var ind = CommuteAnalytics.GetIncomingCommuteForParcel(parcel, od, parcelManager, grid);
+
+            _infoStat1Label.Text = $"Робочих місць: {parcel.Jobs:N0}";
+            _infoStat2Label.Text = $"Вхідний потік: {ind.totalTrips:N0} робітників/год";
+
+            if (ind.origins.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder("Звідки добираються робітники на цю ділянку:\n");
+                int count = Mathf.Min(3, ind.origins.Count);
+                float shownPct = 0f;
+                for (int o = 0; o < count; o++)
+                {
+                    var orig = ind.origins[o];
+                    shownPct += orig.Percentage;
+                    sb.AppendLine($"  🏡 {orig.DisplayName}: {orig.Trips:N0} поїздок ({orig.Percentage:F1}%)");
+                }
+                if (ind.origins.Count > count)
+                {
+                    float otherPct = Mathf.Max(0f, 100f - shownPct);
+                    sb.AppendLine($"  🔄 Інші житлові райони: {otherPct:F1}%");
+                }
+                _infoWorkplaceBreakdown.Text = sb.ToString().TrimEnd();
+            }
+            else
+            {
+                _infoWorkplaceBreakdown.Text = "Звідки добираються робітники:\n  • Немає активних вхідних поїздок";
+            }
+
+            _infoModeSplit.Text = $"🚗 На авто: {ind.carPct:F1}% ({ind.incomingCar:N0})   🚌 Громадський транспорт: {ind.transitPct:F1}% ({ind.incomingTransit:N0})   🚶 Пішки: {ind.walkPct:F1}% ({ind.incomingWalk:N0})";
+            _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {ind.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {ind.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {ind.incomingWalk:N0} піш/год";
+            _infoHint.Text = "✨ Підсвічені зелені вулиці показують шлях робітників зі спальних районів!";
+        }
+        else if (parcel.ZoneType == ZoneType.Commercial)
+        {
+            _infoTitleLabel.Text = $"🏢 Комерційна ділянка #{parcel.Id} (Вулиця #{parcel.EdgeId})";
+            _infoTitleLabel.AddThemeColorOverride("font_color", new Color(0.3f, 0.7f, 1f));
+
+            var com = CommuteAnalytics.GetIncomingCommuteForParcel(parcel, od, parcelManager, grid);
+
+            _infoStat1Label.Text = $"Офісних місць: {parcel.Jobs:N0} (клієнтська місткість: {parcel.CommercialCap:N0})";
+            _infoStat2Label.Text = $"Вхідний потік: {com.totalTrips:N0} працівників/год";
+
+            if (com.origins.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder("Звідки добираються співробітники:\n");
+                int count = Mathf.Min(3, com.origins.Count);
+                float shownPct = 0f;
+                for (int o = 0; o < count; o++)
+                {
+                    var orig = com.origins[o];
+                    shownPct += orig.Percentage;
+                    sb.AppendLine($"  🏡 {orig.DisplayName}: {orig.Trips:N0} поїздок ({orig.Percentage:F1}%)");
+                }
+                if (com.origins.Count > count)
+                {
+                    float otherPct = Mathf.Max(0f, 100f - shownPct);
+                    sb.AppendLine($"  🔄 Інші житлові райони: {otherPct:F1}%");
+                }
+                _infoWorkplaceBreakdown.Text = sb.ToString().TrimEnd();
+            }
+            else
+            {
+                _infoWorkplaceBreakdown.Text = "Звідки добираються співробітники:\n  • Немає активних вхідних поїздок";
+            }
+
+            _infoModeSplit.Text = $"🚗 На авто: {com.carPct:F1}% ({com.incomingCar:N0})   🚌 Громадський транспорт: {com.transitPct:F1}% ({com.incomingTransit:N0})   🚶 Пішки: {com.walkPct:F1}% ({com.incomingWalk:N0})";
+            _infoTopDestinations.Text = $"Сумарний вхідний трафік:\n  🚗 Автомобільний: {com.incomingCar:N0} авт/год\n  🚌 Громадський транспорт: {com.incomingTransit:N0} пас/год\n  🚶 Пішохідний: {com.incomingWalk:N0} піш/год";
+            _infoHint.Text = "✨ Підсвічені вулиці показують шляхи прибуття співробітників!";
+        }
+    }
+
+    public void ShowCityOverview(CityGrid grid, ODMatrix od, ParcelManager parcelManager = null)
+    {
+        _infoTitleLabel.Text = "📊 Шляхи: Безтайлова симуляція";
         _infoTitleLabel.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.3f));
 
-        var city = CommuteAnalytics.GetCityOverview(grid, od);
+        var city = CommuteAnalytics.GetCityOverview(grid, od, parcelManager);
 
-        int totalPop = grid.TotalPopulation();
+        int totalPop = (grid?.TotalPopulation() ?? 0) + (parcelManager?.TotalPopulation ?? 0);
         _infoStat1Label.Text = $"Населення: {totalPop:N0}";
         _infoStat2Label.Text = $"Робочі місця: {city.totalJobs:N0}";
 
         _infoWorkplaceBreakdown.Text = 
             $"Структура зайнятості міста:\n" +
-            $"  🏢 Офіси й торгівля (Центр): {city.comPct:F1}% ({city.comJobs:N0})\n" +
-            $"  🏭 Важка індустрія (Схід): {city.indPct:F1}% ({city.indJobs:N0})";
+            $"  🏢 Офіси й торгівля: {city.comPct:F1}% ({city.comJobs:N0})\n" +
+            $"  🏭 Промисловість: {city.indPct:F1}% ({city.indJobs:N0})";
 
         _infoModeSplit.Text = $"🚗 На авто: {city.carPct:F1}% ({city.totalCarTrips:N0})   🚌 Громадський транспорт: {city.transitPct:F1}% ({city.totalTransitTrips:N0})   🚶 Пішки: {city.walkPct:F1}% ({city.totalWalkTrips:N0})";
         _infoTopDestinations.Text = 
             $"Загальний обсяг поїздок: {city.totalTrips:N0} поїздок/год\n" +
-            $"Активних зон у мережі: {grid.ActiveZoneIds.Count}";
-        _infoHint.Text = "💡 Клікніть на будь-який сектор мапи, щоб побачити точний дорожній маршрут працівників!";
+            $"Активних зон і ділянок: {(grid?.ActiveZoneIds.Count ?? 0) + (parcelManager != null ? System.Linq.Enumerable.Count(parcelManager.ActiveParcels) : 0)}";
+        _infoHint.Text = "💡 Клікніть на будь-яку ділянку або квартал, щоб побачити точний дорожній маршрут працівників!";
     }
 
     public void UpdateTime(float hour, int day)
@@ -860,9 +987,9 @@ public partial class GameUI : CanvasLayer
         _timeLabel.Text = $"Day {day} | {h:D2}:{m:D2}";
     }
 
-    public void UpdateStats(int population, float totalTrips, float avgCongestion, float transitRidership, float coverage, float demandMult, float dirBias)
+    public void UpdateStats(int population, float totalTrips, float avgCongestion, float transitRidership, float coverage, float demandMult, float dirBias, int totalJobs = -1)
     {
-        _popLabel.Text = $"Pop: {population:N0}";
+        _popLabel.Text = totalJobs >= 0 ? $"Pop: {population:N0} | Jobs: {totalJobs:N0}" : $"Pop: {population:N0}";
         _tripsLabel.Text = $"Trips: {totalTrips:N0}/h";
 
         float congPercent = avgCongestion * 100f;
@@ -931,7 +1058,8 @@ public partial class GameUI : CanvasLayer
         {
             _roadsMenu.Text = mode switch
             {
-                InteractionMode.BuildRoad => "🛣️ Build ▾",
+                InteractionMode.BuildRoad => "🛣️ Straight ▾",
+                InteractionMode.BuildCurvedRoad => "〰️ Curved ▾",
                 InteractionMode.Demolish => "💥 Demolish ▾",
                 _ => "🛣️ Roads ▾"
             };
@@ -1003,7 +1131,10 @@ public partial class GameUI : CanvasLayer
                 SetToolHint("🔍 [Inspect] Click a zone on the map to view commute analytics.", new Color(0.4f, 0.8f, 1f));
                 break;
             case InteractionMode.BuildRoad:
-                SetToolHint("🛣️ [Build Road] Click first cell, then adjacent cell to build road.", new Color(0.4f, 0.95f, 0.6f));
+                SetToolHint("🛣️ [Straight Road] Click start, then end point. Hold Shift for 45° angle snap.", new Color(0.4f, 0.95f, 0.6f));
+                break;
+            case InteractionMode.BuildCurvedRoad:
+                SetToolHint("〰️ [Curved Road] 1st click = start, 2nd click = end, 3rd click = curvature bend apex.", new Color(0.35f, 0.95f, 0.85f));
                 break;
             case InteractionMode.Demolish:
                 SetToolHint("💥 [Demolish] Click first cell, then adjacent connected cell to demolish road.", new Color(1f, 0.5f, 0.4f));

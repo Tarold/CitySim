@@ -39,15 +39,24 @@ public class CityGrid
         }
     }
 
+    /// <summary>
+    /// Safely retrieves the zone by index, returning null if id is negative or out of bounds.
+    /// </summary>
     public Zone GetZone(int id)
     {
+        if (Zones == null || id < 0 || id >= Zones.Length) return null;
         return Zones[id];
     }
 
+    /// <summary>
+    /// Safely retrieves the zone at grid coordinate (x, y), returning null if out of bounds.
+    /// </summary>
     public Zone GetZone(int x, int y)
     {
-        if (x < 0 || x >= Width || y < 0 || y >= Height) return null;
-        return Zones[y * Width + x];
+        if (Zones == null || x < 0 || x >= Width || y < 0 || y >= Height) return null;
+        int id = y * Width + x;
+        if (id < 0 || id >= Zones.Length) return null;
+        return Zones[id];
     }
 
     public int GetZoneId(int x, int y)
@@ -57,9 +66,14 @@ public class CityGrid
 
     public int ZoneCount => Width * Height;
 
+    /// <summary>
+    /// Computes the 2D world center position of a zone. Returns Vector2.Zero safely if zoneId is out of bounds or zone is null.
+    /// </summary>
     public Vector2 GetWorldCenter(int zoneId)
     {
+        if (Zones == null || zoneId < 0 || zoneId >= Zones.Length) return Vector2.Zero;
         var zone = Zones[zoneId];
+        if (zone == null) return Vector2.Zero;
         return new Vector2((zone.GridPos.X + 0.5f) * CellSize, (zone.GridPos.Y + 0.5f) * CellSize);
     }
 
@@ -70,20 +84,28 @@ public class CityGrid
 
     public int TotalPopulation()
     {
+        if (Zones == null) return 0;
         int total = 0;
         for (int i = 0; i < Zones.Length; i++)
         {
-            total += Zones[i].Population;
+            if (Zones[i] != null)
+            {
+                total += Zones[i].Population;
+            }
         }
         return total;
     }
 
     public int TotalJobs()
     {
+        if (Zones == null) return 0;
         int total = 0;
         for (int i = 0; i < Zones.Length; i++)
         {
-            total += Zones[i].Jobs;
+            if (Zones[i] != null)
+            {
+                total += Zones[i].Jobs;
+            }
         }
         return total;
     }

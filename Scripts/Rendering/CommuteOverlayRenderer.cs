@@ -6,7 +6,8 @@ namespace CitySim.Rendering;
 
 public class CommuteTarget
 {
-    public int ZoneId;
+    public int ZoneId = -1;
+    public int ParcelId = -1;
     public Vector2 Position;
     public float Volume;
     public ZoneType Type;
@@ -19,26 +20,50 @@ public partial class CommuteOverlayRenderer : Node2D
     private CityGrid _grid;
     private ODMatrix _odMatrix;
     private RoadGraph _graph;
+    private ParcelManager _parcelManager;
     private float _pulseTime = 0f;
 
     public int SelectedZoneId = -1;
+    public int SelectedParcelId = -1;
     public List<CommuteTarget> Targets = new List<CommuteTarget>();
 
-    public void Initialize(CityGrid grid, ODMatrix od, RoadGraph graph)
+    public void Initialize(CityGrid grid, ODMatrix od, RoadGraph graph, ParcelManager parcelManager = null)
     {
         _grid = grid;
         _odMatrix = od;
         _graph = graph;
+        _parcelManager = parcelManager;
+    }
+
+    public void SetParcelManager(ParcelManager parcelManager)
+    {
+        _parcelManager = parcelManager;
     }
 
     public void SelectZone(int zoneId, float[,] distances, RoadGraph graph)
     {
         _graph = graph;
         SelectedZoneId = zoneId;
+        SelectedParcelId = -1;
         Targets = CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _odMatrix, distances, graph);
-        if (Targets.Count == 0 && (zoneId < 0 || zoneId >= _grid.ZoneCount || _grid.GetZone(zoneId)?.Type == ZoneType.Empty))
+        if (Targets.Count == 0 && (zoneId < 0 || _grid == null || zoneId >= _grid.ZoneCount || _grid.GetZone(zoneId)?.Type == ZoneType.Empty))
         {
             SelectedZoneId = -1;
+        }
+
+        QueueRedraw();
+    }
+
+    public void SelectParcel(int parcelId, ParcelManager parcelManager, RoadGraph graph)
+    {
+        _graph = graph;
+        _parcelManager = parcelManager;
+        SelectedParcelId = parcelId;
+        SelectedZoneId = -1;
+        Targets = CommuteAnalytics.ComputeCommuteTargetsForParcel(parcelId, _parcelManager, _odMatrix, graph);
+        if (Targets.Count == 0 && (parcelId <= 0 || _parcelManager == null || !_parcelManager.ParcelMap.ContainsKey(parcelId)))
+        {
+            SelectedParcelId = -1;
         }
 
         QueueRedraw();
@@ -47,77 +72,99 @@ public partial class CommuteOverlayRenderer : Node2D
     public override void _Process(double delta)
     {
         _pulseTime += (float)delta * 3f;
-        if (SelectedZoneId != -1) QueueRedraw();
+        if (SelectedZoneId != -1 || SelectedParcelId != -1) QueueRedraw();
     }
 
     public override void _Draw()
     {
-        if (_grid == null || _graph == null) return;
+        if (_graph == null) return;
 
         // 1. Draw Sector District Headers on the map
         DrawDistrictLabels();
 
         // 2. Draw Road Paths if a zone is selected
-        if (SelectedZoneId != -1 && Targets.Count > 0)
+        if (SelectedZoneId != -1 && Targets.Count > 0 && _grid != null)
         {
             var sourceZone = _grid.GetZone(SelectedZoneId);
-            Vector2 fromPos = _grid.GetWorldCenter(SelectedZoneId);
-
-            // Glowing golden halo at the selected building
-            float pulse = 18f + Mathf.Sin(_pulseTime * 2f) * 3f;
-            DrawArc(fromPos, pulse, 0, Mathf.Tau, 24, Colors.Gold, 2.8f, true);
-            DrawCircle(fromPos, 4f, Colors.Gold);
-
-            float maxVol = Targets[0].Volume;
-
-            foreach (var target in Targets)
+            if (sourceZone != null)
             {
-                float relativeWeight = Mathf.Clamp(target.Volume / Mathf.Max(maxVol, 0.01f), 0.2f, 1.0f);
-                float lineWidth = 2.5f + relativeWeight * 4.0f;
+                Vector2 fromPos = _grid.GetWorldCenter(SelectedZoneId);
+                DrawCommuteCorridors(fromPos, sourceZone.Type);
+            }
+        }
+        else if (SelectedParcelId != -1 && Targets.Count > 0 && _parcelManager != null)
+        {
+            if (_parcelManager.ParcelMap.TryGetValue(SelectedParcelId, out var sourceParcel))
+            {
+                Vector2 fromPos = sourceParcel.Center;
+                DrawCommuteCorridors(fromPos, sourceParcel.ZoneType);
+            }
+        }
+    }
 
-                Color corridorColor = sourceZone.Type switch
-                {
-                    ZoneType.Commercial => new Color(0.20f, 0.80f, 1.0f, 0.90f), // Glowing Cyan for commercial corridors
-                    ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.90f), // Glowing Amber for industrial corridors
-                    _ => (target.Type == ZoneType.Commercial ? new Color(0.20f, 0.80f, 1.0f, 0.90f) : new Color(1.0f, 0.65f, 0.15f, 0.90f))
-                };
+    private void DrawCommuteCorridors(Vector2 fromPos, ZoneType sourceType)
+    {
+        // Glowing golden halo at the selected entity
+        float pulse = 18f + Mathf.Sin(_pulseTime * 2f) * 3f;
+        DrawArc(fromPos, pulse, 0, Mathf.Tau, 24, Colors.Gold, 2.8f, true);
+        DrawCircle(fromPos, 4f, Colors.Gold);
 
-                Color pinColor = target.Type switch
-                {
-                    ZoneType.Commercial => new Color(0.15f, 0.70f, 1.0f, 0.95f),
-                    ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.95f),
-                    _ => new Color(0.35f, 0.95f, 0.45f, 0.95f) // Lime Green for residential origins
-                };
+        float maxVol = Targets[0].Volume;
 
-                // A. Draw the EXACT road street path edges
-                if (target.EdgePath != null && target.EdgePath.Count > 0)
+        foreach (var target in Targets)
+        {
+            float relativeWeight = Mathf.Clamp(target.Volume / Mathf.Max(maxVol, 0.01f), 0.2f, 1.0f);
+            float lineWidth = 2.5f + relativeWeight * 4.0f;
+
+            Color corridorColor = sourceType switch
+            {
+                ZoneType.Commercial => new Color(0.20f, 0.80f, 1.0f, 0.90f), // Glowing Cyan for commercial corridors
+                ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.90f), // Glowing Amber for industrial corridors
+                _ => (target.Type == ZoneType.Commercial ? new Color(0.20f, 0.80f, 1.0f, 0.90f) : new Color(1.0f, 0.65f, 0.15f, 0.90f))
+            };
+
+            Color pinColor = target.Type switch
+            {
+                ZoneType.Commercial => new Color(0.15f, 0.70f, 1.0f, 0.95f),
+                ZoneType.Industrial => new Color(1.0f, 0.65f, 0.15f, 0.95f),
+                _ => new Color(0.35f, 0.95f, 0.45f, 0.95f) // Lime Green for residential origins
+            };
+
+            // A. Draw the EXACT curved road street path edges
+            if (target.EdgePath != null && target.EdgePath.Count > 0)
+            {
+                foreach (var edgeId in target.EdgePath)
                 {
-                    foreach (var edgeId in target.EdgePath)
+                    if (edgeId >= 0 && edgeId < _graph.Edges.Count)
                     {
-                        if (edgeId >= 0 && edgeId < _graph.Edges.Count)
+                        var edge = _graph.Edges[edgeId];
+                        var fn = _graph.GetNode(edge.FromId);
+                        var tn = _graph.GetNode(edge.ToId);
+                        if (fn != null && tn != null)
                         {
-                            var edge = _graph.Edges[edgeId];
-                            var fn = _graph.GetNode(edge.FromId);
-                            var tn = _graph.GetNode(edge.ToId);
-                            if (fn != null && tn != null)
+                            // Draw high-visibility illuminated street corridor
+                            if (edge.Curve != null)
                             {
-                                // Draw high-visibility illuminated street corridor
+                                DrawPolyline(edge.Curve.GetSampledPoints(16), corridorColor, lineWidth, true);
+                            }
+                            else
+                            {
                                 DrawLine(fn.WorldPosition, tn.WorldPosition, corridorColor, lineWidth, true);
                             }
                         }
                     }
                 }
-                else
-                {
-                    // Fallback direct ray if path cache doesn't have intermediate nodes
-                    DrawLine(fromPos, target.Position, corridorColor, lineWidth, true);
-                }
-
-                // B. Draw origin / destination pin badge
-                DrawCircle(target.Position, 6.5f + relativeWeight * 2f, pinColor);
-                DrawArc(target.Position, 7f + relativeWeight * 2f, 0, Mathf.Tau, 16, Colors.White, 1.4f, true);
-                DrawCircle(target.Position, 2.5f, Colors.White);
             }
+            else
+            {
+                // Fallback direct ray if path cache doesn't have intermediate nodes
+                DrawLine(fromPos, target.Position, corridorColor, lineWidth, true);
+            }
+
+            // B. Draw origin / destination pin badge
+            DrawCircle(target.Position, 6.5f + relativeWeight * 2f, pinColor);
+            DrawArc(target.Position, 7f + relativeWeight * 2f, 0, Mathf.Tau, 16, Colors.White, 1.4f, true);
+            DrawCircle(target.Position, 2.5f, Colors.White);
         }
     }
 
@@ -137,6 +184,16 @@ public partial class CommuteOverlayRenderer : Node2D
             if (z.Type == ZoneType.Residential) resPop += z.Population;
             else if (z.Type == ZoneType.Commercial) comJobs += z.Jobs;
             else if (z.Type == ZoneType.Industrial) indJobs += z.Jobs;
+        }
+
+        if (_parcelManager != null)
+        {
+            foreach (var p in _parcelManager.Parcels)
+            {
+                if (p.ZoneType == ZoneType.Residential) resPop += p.Population;
+                else if (p.ZoneType == ZoneType.Commercial) comJobs += p.Jobs;
+                else if (p.ZoneType == ZoneType.Industrial) indJobs += p.Jobs;
+            }
         }
         
         // West Sector Header
