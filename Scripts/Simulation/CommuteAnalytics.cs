@@ -613,4 +613,39 @@ public static class CommuteAnalytics
 
         return targets;
     }
+
+    /// <summary>
+    /// Safely reconstructs the list of edge IDs for the shortest path between originNodeId and destNodeId
+    /// directly from CachedTreeBuffers.
+    /// </summary>
+    public static List<int> ExtractPathFromTreeBuffer(
+        OptimizedODMatrix matrix,
+        int originNodeId,
+        int destNodeId)
+    {
+        var path = new List<int>();
+        if (matrix == null || originNodeId < 0 || destNodeId < 0 || originNodeId == destNodeId)
+            return path;
+
+        if (!matrix.CachedTreeBuffers.TryGetValue(originNodeId, out var tree) || tree == null)
+            return path;
+
+        int maxLen = Math.Min(tree.ParentEdgeIds.Length, tree.ParentNodeIds.Length);
+        if (destNodeId >= maxLen)
+            return path;
+
+        int curr = destNodeId;
+        int safety = 0;
+        while (curr != originNodeId && curr >= 0 && curr < maxLen && safety++ < 2000)
+        {
+            int edgeId = tree.ParentEdgeIds[curr];
+            if (edgeId < 0) break;
+
+            path.Add(edgeId);
+            curr = tree.ParentNodeIds[curr];
+        }
+
+        path.Reverse();
+        return path;
+    }
 }
