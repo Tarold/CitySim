@@ -73,7 +73,6 @@ public class TrafficEngine
     private float[] _msaAuxCarVolumes = Array.Empty<float>();
     private float[] _msaTransitBoardings = Array.Empty<float>();
     private float[] _msaTransitAlightings = Array.Empty<float>();
-    private float[] _msaNodeFlowAccumulator = Array.Empty<float>();
 
     // Flow state of the running assignment, published to RoadEdge.CurrentVolume/PedestrianVolume at the end
     private float[] _carVolumes = Array.Empty<float>();
@@ -86,6 +85,62 @@ public class TrafficEngine
     public bool HasPendingVolumes { get; private set; }
     private readonly List<int> _msaActiveOrigins = new(256);
     private readonly RoutingSnapshot _msaRouting = new RoutingSnapshot();
+
+    /// <summary>MSA iterations per macro cycle once a warm equilibrium exists (day-to-day adjustment).</summary>
+    public const int WarmStartIterationsPerCycle = 1;
+
+    /// <summary>
+    /// Lower bound of the MSA step size in warm cycles, so that demand changes during the day reach the road
+    /// volumes within a few cycles instead of being averaged away.
+    /// </summary>
+    public const float MinWarmStepSize = 0.25f;
+
+    /// <summary>
+    /// Fixed number of origin chunks per search round. Each chunk accumulates its origins' flows in its own
+    /// array and the chunks are summed in index order, so volumes do not depend on thread scheduling or core count.
+    /// </summary>
+    public const int AccumulationChunks = 16;
+
+    /// <summary>Edges summed per parallel task when merging chunk volumes.</summary>
+    private const int MergeBlockSize = 4096;
+
+    /// <summary>Flow below which a node's accumulated demand is not propagated further.</summary>
+    private const float MinPropagatedFlow = 1e-4f;
+
+    [ThreadStatic]
+    private static ShortestPathTreeBuffer _tlsTree;
+
+    [ThreadStatic]
+    private static float[] _tlsNodeFlow;
+
+    private float[][] _chunkVolumes = Array.Empty<float[]>();
+    private int _iterationCount;
+    private RoadGraph _warmGraph;
+    private int _warmTopologyVersion = -1;
+    private int _warmEdgeCount = -1;
+
+    /// <summary>
+    /// Continue the previous equilibrium across calls (game): when the road topology is unchanged, each call
+    /// runs <see cref="WarmStartIterationsPerCycle"/> MSA iterations starting from the last volumes. False
+    /// (default) starts every call from scratch with the requested number of iterations.
+    /// </summary>
+    public bool WarmStart { get; set; }
+
+    /// <summary>
+    /// Car travel times between TAZ access nodes from the last search round; feed it to the next
+    /// <see cref="OptimizedODMatrix.Recalculate"/> to skip its own search round.
+    /// </summary>
+    public TravelTimeSkim Skim { get; } = new TravelTimeSkim();
+
+    /// <summary>MSA iterations accumulated in the current equilibrium (reset on cold start).</summary>
+    public int EquilibriumIterations => _iterationCount;
+
+    /// <summary>True when the previous call's volumes are a valid starting point for <paramref name="graph"/>.</summary>
+    public bool HasWarmEquilibrium(RoadGraph graph) =>
+        _iterationCount > 0 &&
+        ReferenceEquals(_warmGraph, graph) &&
+        graph.TopologyVersion == _warmTopologyVersion &&
+        graph.Edges.Count == _warmEdgeCount;
     private readonly Dictionary<int, List<(int DestNodeId, float Flow)>> _msaDemandsByOrigin = new(256);
 
     /// <summary>
@@ -101,8 +156,10 @@ public class TrafficEngine
     }
 
     /// <summary>
-    /// Equilibrium traffic assignment (User Equilibrium) using Method of Successive Averages (MSA)
-    /// with O(V) leaf-to-root flow accumulation on predecessor trees and zero allocations per cycle.
+    /// Equilibrium traffic assignment (User Equilibrium) using the Method of Successive Averages (MSA) with
+    /// O(V) leaf-to-root flow accumulation. Each search round streams over the TAZ access nodes: a tree is
+    /// computed, writes its <see cref="Skim"/> row, adds its origin's flows to a per-chunk volume array and is
+    /// discarded, so no trees are kept. With <see cref="WarmStart"/> the equilibrium continues across calls.
     /// </summary>
     public void AssignFlowsFromTazMsa(
         TazManager tazManager,
@@ -118,12 +175,21 @@ public class TrafficEngine
         int edgeCount = roadGraph.Edges.Count;
         int maxNodeId = roadGraph.GetMaxNodeIndex();
 
-        EnsureMsaBuffersCapacity(k, edgeCount, maxNodeId);
-        Array.Clear(_carVolumes, 0, edgeCount);
+        bool warm = WarmStart && HasWarmEquilibrium(roadGraph);
+        if (EnsureMsaBuffersCapacity(k, edgeCount, maxNodeId))
+        {
+            warm = false; // car volume arrays were reallocated
+        }
+        if (!warm)
+        {
+            _iterationCount = 0;
+        }
         Array.Clear(_pedestrianVolumes, 0, edgeCount);
 
         if (k == 0 || edgeCount == 0 || maxNodeId <= 0)
         {
+            Array.Clear(_carVolumes, 0, edgeCount);
+            _iterationCount = 0;
             CommitVolumes(roadGraph, edgeCount, deferPublish);
             return;
         }
@@ -223,79 +289,32 @@ public class TrafficEngine
             }
         }
 
+        int[] accessNodes = TravelTimeSkim.CollectAccessNodes(tazManager);
+
         if (_msaActiveOrigins.Count == 0)
         {
-            CommitVolumes(roadGraph, edgeCount, deferPublish);
-            if (!deferPublish) matrix.UpdateAccessibilityScores(tazManager, roadGraph);
+            // Only local traffic: no equilibrium to iterate, but refresh the skim for the next cycle
+            Array.Copy(_msaBaseInternalCarVolumes, _carVolumes, edgeCount);
+            _iterationCount = 0;
+            _msaRouting.Rebuild(roadGraph, _carVolumes);
+            Skim.Compute(roadGraph, _msaRouting, accessNodes);
+            FinishAssignment(tazManager, matrix, roadGraph, edgeCount, deferPublish);
             return;
         }
 
-        int iterations = Math.Clamp(msaIterations, 1, 8);
+        int iterations = warm ? WarmStartIterationsPerCycle : Math.Clamp(msaIterations, 1, 8);
 
-        // 4. MSA loop with O(V) Leaf-to-Root flow accumulation
-        for (int iter = 1; iter <= iterations; iter++)
+        // 4. MSA loop: V^(n) = (1 - a) * V^(n-1) + a * Y^(n), a = 1/n (floored at MinWarmStepSize when warm)
+        for (int iter = 0; iter < iterations; iter++)
         {
-            if (iter > 1)
-            {
-                // One compact copy of the graph with travel times under V^(n-1), shared by all origins
-                _msaRouting.Rebuild(roadGraph, _carVolumes);
-                Parallel.For(0, _msaActiveOrigins.Count, idx =>
-                {
-                    int u = _msaActiveOrigins[idx];
-                    var buffer = matrix.CachedTreeBuffers.GetOrAdd(u, _ => new ShortestPathTreeBuffer());
-                    _msaRouting.ComputeShortestPathTree(u, buffer);
-                });
-            }
+            // Cold start routes the first all-or-nothing round on the published volumes (previous cycle)
+            bool usePublishedVolumes = !warm && iter == 0;
+            _msaRouting.Rebuild(roadGraph, usePublishedVolumes ? null : _carVolumes);
+            RunAssignmentRound(roadGraph, accessNodes, edgeCount);
 
-            // Copy base internal traffic to auxiliary flow vector Y^(n)
-            Array.Copy(_msaBaseInternalCarVolumes, 0, _msaAuxCarVolumes, 0, edgeCount);
-
-            // Accumulate flows leaf-to-root for each active origin u in O(V) time
-            for (int idx = 0; idx < _msaActiveOrigins.Count; idx++)
-            {
-                int u = _msaActiveOrigins[idx];
-                if (!matrix.CachedTreeBuffers.TryGetValue(u, out var tree) || tree.VisitedCount == 0)
-                    continue;
-
-                var destList = _msaDemandsByOrigin[u];
-                Array.Clear(_msaNodeFlowAccumulator, 0, maxNodeId);
-
-                // Seed target nodes with demand flows
-                for (int d = 0; d < destList.Count; d++)
-                {
-                    var (destNodeId, flow) = destList[d];
-                    if (destNodeId >= 0 && destNodeId < maxNodeId)
-                    {
-                        _msaNodeFlowAccumulator[destNodeId] += flow;
-                    }
-                }
-
-                // Traverse nodes in reverse topological order (from farthest leaves back to root u)
-                int[] visitedOrder = tree.VisitedNodesOrder;
-                int[] parentEdges = tree.ParentEdgeIds;
-                int[] parentNodes = tree.ParentNodeIds;
-
-                for (int vIdx = tree.VisitedCount - 1; vIdx >= 0; vIdx--)
-                {
-                    int curr = visitedOrder[vIdx];
-                    if (curr == u) continue;
-
-                    float accumulatedFlow = _msaNodeFlowAccumulator[curr];
-                    if (accumulatedFlow <= 1e-4f) continue;
-
-                    int edgeId = parentEdges[curr];
-                    int parentNode = parentNodes[curr];
-
-                    if (edgeId >= 0 && edgeId < edgeCount && parentNode >= 0 && parentNode < maxNodeId)
-                    {
-                        _msaAuxCarVolumes[edgeId] += accumulatedFlow;
-                        _msaNodeFlowAccumulator[parentNode] += accumulatedFlow;
-                    }
-                }
-            }
-
-            // MSA blending formula: V^(n) = (1 - 1/n) * V^(n-1) + (1/n) * Y^(n)
-            float stepSize = 1.0f / iter;
+            _iterationCount++;
+            float stepSize = 1.0f / _iterationCount;
+            if (warm) stepSize = Math.Max(stepSize, MinWarmStepSize);
             float keepWeight = 1.0f - stepSize;
 
             for (int e = 0; e < edgeCount; e++)
@@ -304,13 +323,130 @@ public class TrafficEngine
             }
         }
 
+        FinishAssignment(tazManager, matrix, roadGraph, edgeCount, deferPublish);
+    }
+
+    /// <summary>
+    /// One streaming search round: for every access node compute the shortest-path tree on the current
+    /// <see cref="_msaRouting"/>, write its skim row and accumulate its origin's demand into the chunk's
+    /// volume array; then sum the chunks in index order into <see cref="_msaAuxCarVolumes"/> (Y^(n)).
+    /// </summary>
+    private void RunAssignmentRound(RoadGraph roadGraph, int[] accessNodes, int edgeCount)
+    {
+        int nodeCapacity = _msaRouting.NodeCapacity;
+        int originCount = accessNodes.Length;
+        Skim.Reset(accessNodes, roadGraph, nodeCapacity);
+
+        Parallel.For(0, AccumulationChunks, chunk =>
+        {
+            var volumes = _chunkVolumes[chunk];
+            var tree = _tlsTree ??= new ShortestPathTreeBuffer();
+            var nodeFlow = _tlsNodeFlow;
+            if (nodeFlow == null || nodeFlow.Length < nodeCapacity)
+            {
+                nodeFlow = _tlsNodeFlow = new float[Math.Max(nodeCapacity * 2, 256)];
+            }
+
+            int start = (int)((long)originCount * chunk / AccumulationChunks);
+            int end = (int)((long)originCount * (chunk + 1) / AccumulationChunks);
+            for (int row = start; row < end; row++)
+            {
+                int origin = accessNodes[row];
+                _msaRouting.ComputeShortestPathTree(origin, tree);
+                Skim.WriteRow(row, tree.Distances);
+
+                if (_msaDemandsByOrigin.TryGetValue(origin, out var destList) && destList.Count > 0)
+                {
+                    AccumulateOriginFlows(origin, destList, tree, nodeFlow, volumes, edgeCount, nodeCapacity);
+                }
+            }
+        });
+
+        int blocks = (edgeCount + MergeBlockSize - 1) / MergeBlockSize;
+        Parallel.For(0, blocks, block =>
+        {
+            int start = block * MergeBlockSize;
+            int end = Math.Min(start + MergeBlockSize, edgeCount);
+            for (int e = start; e < end; e++)
+            {
+                float sum = _msaBaseInternalCarVolumes[e];
+                for (int chunk = 0; chunk < AccumulationChunks; chunk++)
+                {
+                    float[] volumes = _chunkVolumes[chunk];
+                    sum += volumes[e];
+                    volumes[e] = 0f;
+                }
+                _msaAuxCarVolumes[e] = sum;
+            }
+        });
+    }
+
+    /// <summary>
+    /// Leaf-to-root accumulation of one origin's demand along its shortest-path tree. Uses and resets the
+    /// touched entries of <paramref name="nodeFlow"/> so the scratch array stays zero between origins.
+    /// </summary>
+    private static void AccumulateOriginFlows(
+        int origin,
+        List<(int DestNodeId, float Flow)> destList,
+        ShortestPathTreeBuffer tree,
+        float[] nodeFlow,
+        float[] volumes,
+        int edgeCount,
+        int nodeCapacity)
+    {
+        for (int d = 0; d < destList.Count; d++)
+        {
+            var (destNodeId, flow) = destList[d];
+            if (destNodeId >= 0 && destNodeId < nodeCapacity)
+            {
+                nodeFlow[destNodeId] += flow;
+            }
+        }
+
+        // Traverse nodes in reverse settle order (from farthest leaves back to the origin)
+        int[] visitedOrder = tree.VisitedNodesOrder;
+        int[] parentEdges = tree.ParentEdgeIds;
+        int[] parentNodes = tree.ParentNodeIds;
+
+        for (int vIdx = tree.VisitedCount - 1; vIdx >= 0; vIdx--)
+        {
+            int curr = visitedOrder[vIdx];
+            if (curr == origin) continue;
+
+            float accumulatedFlow = nodeFlow[curr];
+            nodeFlow[curr] = 0f;
+            if (accumulatedFlow <= MinPropagatedFlow) continue;
+
+            int edgeId = parentEdges[curr];
+            int parentNode = parentNodes[curr];
+            if (edgeId >= 0 && edgeId < edgeCount && parentNode >= 0 && parentNode < nodeCapacity)
+            {
+                volumes[edgeId] += accumulatedFlow;
+                nodeFlow[parentNode] += accumulatedFlow;
+            }
+        }
+
+        // Reset the root and unreachable destinations (not in the settle order)
+        nodeFlow[origin] = 0f;
+        for (int d = 0; d < destList.Count; d++)
+        {
+            int destNodeId = destList[d].DestNodeId;
+            if (destNodeId >= 0 && destNodeId < nodeCapacity) nodeFlow[destNodeId] = 0f;
+        }
+    }
+
+    /// <summary>Publishes or defers the volumes, stores the warm state and refreshes OD travel times.</summary>
+    private void FinishAssignment(TazManager tazManager, OptimizedODMatrix matrix, RoadGraph roadGraph, int edgeCount, bool deferPublish)
+    {
         CommitVolumes(roadGraph, edgeCount, deferPublish);
 
-        // 5. Final synchronization: update shortest trees, _travelTimes, and LUTI AccessibilityScores using equilibrium volumes V^(n)
-        if (iterations > 1)
-        {
-            matrix.UpdateEquilibriumTreesAndTimes(tazManager, roadGraph, deferPublish ? _carVolumes : null);
-        }
+        _warmGraph = roadGraph;
+        _warmTopologyVersion = roadGraph.TopologyVersion;
+        _warmEdgeCount = edgeCount;
+
+        // Travel times of the last round become the OD matrix's times (accessibility, analytics)
+        matrix.ApplySkim(tazManager, Skim);
+
         // Accessibility reads congestion from the published edge volumes; deferred callers run it after publishing
         if (!deferPublish)
         {
@@ -364,7 +500,6 @@ public class TrafficEngine
             if (edgeId >= 0 && edgeId < edgeCount)
             {
                 _msaBaseInternalCarVolumes[edgeId] += carPerEdge;
-                _carVolumes[edgeId] += carPerEdge;
                 _pedestrianVolumes[edgeId] += pedPerEdge;
             }
         }
@@ -381,8 +516,10 @@ public class TrafficEngine
         }
     }
 
-    private void EnsureMsaBuffersCapacity(int k, int edgeCount, int maxNodeId)
+    /// <summary>Grows the per-cycle buffers; returns true when the car volume array was reallocated (warm state lost).</summary>
+    private bool EnsureMsaBuffersCapacity(int k, int edgeCount, int maxNodeId)
     {
+        bool reallocated = false;
         if (_msaBaseInternalCarVolumes.Length < edgeCount)
         {
             int size = Math.Max(edgeCount * 2, 256);
@@ -390,6 +527,13 @@ public class TrafficEngine
             _msaAuxCarVolumes = new float[size];
             _carVolumes = new float[size];
             _pedestrianVolumes = new float[size];
+            reallocated = true;
+        }
+        if (_chunkVolumes.Length != AccumulationChunks || _chunkVolumes[0].Length < edgeCount)
+        {
+            int size = Math.Max(edgeCount * 2, 256);
+            _chunkVolumes = new float[AccumulationChunks][];
+            for (int c = 0; c < AccumulationChunks; c++) _chunkVolumes[c] = new float[size];
         }
         if (_msaTransitBoardings.Length < k)
         {
@@ -397,9 +541,6 @@ public class TrafficEngine
             _msaTransitBoardings = new float[size];
             _msaTransitAlightings = new float[size];
         }
-        if (_msaNodeFlowAccumulator.Length < maxNodeId)
-        {
-            _msaNodeFlowAccumulator = new float[Math.Max(maxNodeId * 2, 256)];
-        }
+        return reallocated;
     }
 }

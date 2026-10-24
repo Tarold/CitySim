@@ -12,6 +12,9 @@
 
 ## Специфічні правила `Scripts/Simulation/`
 - **Zero-GC у розрахунках:** у `OptimizedODMatrix`, `TrafficEngine`, `CarTrafficManager` та `PedestrianManager` перевикористовуй наявні масиви та `ShortestPathTreeBuffer`. Не створюй нових колекцій під час ітерацій MSA або щокадрового `Update()`.
+- **Без кешу дерев найкоротших шляхів:** не зберігай дерево на кожне джерело (пам'ять O(TAZ × вузли) — гігабайти на місті-мільйоннику). Раунд пошуку в `TrafficEngine` потоковий: дерево → рядок `TravelTimeSkim` + накопичення потоків → викинути. Час між зонами бери з `TravelTimeSkim`/`OptimizedODMatrix.GetTravelTime`, шлях для UI — з `OptimizedODMatrix.GetPathTree` (на вимогу).
+- **Детермінованість потоків:** паралельне накопичення йде у фіксовані чанки (`TrafficEngine.AccumulationChunks`), які сумуються в порядку індексів; не додавай спільних акумуляторів, порядок яких залежить від планувальника потоків.
+- **Продуктивність на масштабі:** зміни макроконвеєра перевіряй явним бенчмарком `Tests/Performance/MetropolisBudgetBenchmark.cs` (місто ~1.2 млн, бюджети в `docs/scaling-audit.md`).
 - **Просторові запити:** для пошуку найближчих вузлів, ребер чи парцелів використовуй `SpatialGridIndex` (`QueryRadius`, `QueryAABB`) із переданим буфером `List<int>`, а не лінійний перебір `Edges` чи `Parcels`.
 - **Криволінійна геометрія:** позицію та дотичну на дорозі обчислюй через `edge.Curve.Evaluate(t)` і `edge.Curve.GetTangent(t)`, а не лінійною інтерполяцією між `FromId` та `ToId`.
 - **Інвалідація після зміни топології:** єдина точка — `TopologyChangeCoordinator` (підписаний на події `RoadGraph`, прапорець `HasPendingChanges`). Статистику HUD рахуй у `CityStatsSnapshot` на макро-тіку, а не щокадрово.

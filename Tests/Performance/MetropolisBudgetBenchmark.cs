@@ -14,7 +14,7 @@ namespace CitySim.Tests.Performance;
 [TestFixture, Explicit("Performance budgets, not a regression test")]
 public class MetropolisBudgetBenchmark
 {
-    /// <summary>Background (worker) part of one periodic macro recalculation.</summary>
+    /// <summary>Background (worker) part of one periodic (steady-state) macro recalculation.</summary>
     public const double WorkerCycleBudgetMs = 1500;
 
     /// <summary>Main-thread part of applying a background recalculation.</summary>
@@ -27,6 +27,8 @@ public class MetropolisBudgetBenchmark
 
     private SimulationWorld _world;
     private double _coldCycleMs;
+    private double _rebuildWorkerMs;
+    private double _rebuildApplyMs;
     private double _warmWorkerMs;
     private double _warmApplyMs;
     private double _macroMemoryMb;
@@ -43,6 +45,13 @@ public class MetropolisBudgetBenchmark
         _coldCycleMs = _world.LastMacroComputeMilliseconds;
 
         _world.UseBackgroundMacroModel = true;
+
+        // First background cycle rebuilds the back buffer's TAZ structure (same work as after an edit)
+        _world.RecalculateMacroModel();
+        _world.WaitForMacroModel();
+        _rebuildWorkerMs = _world.LastMacroComputeMilliseconds;
+        _rebuildApplyMs = _world.LastMacroMainThreadMilliseconds;
+
         double worker = 0, apply = 0;
         for (int i = 0; i < WarmCycles; i++)
         {
@@ -59,7 +68,9 @@ public class MetropolisBudgetBenchmark
             $"Metropolis: pop={_world.Grid.TotalPopulation():N0} nodes={_world.RoadGraph.Nodes.Count:N0} edges={_world.RoadGraph.Edges.Count:N0} " +
             $"taz={_world.Taz.ActiveZones.Count:N0} lines={_world.Transit.Routes.Count} build={buildSeconds:F1}s");
         TestContext.Progress.WriteLine(
-            $"  cold sync cycle={_coldCycleMs:F0}ms | warm worker={_warmWorkerMs:F0}ms (budget {WorkerCycleBudgetMs}) | " +
+            $"  cold sync cycle={_coldCycleMs:F0}ms | structural rebuild: worker={_rebuildWorkerMs:F0}ms apply={_rebuildApplyMs:F0}ms");
+        TestContext.Progress.WriteLine(
+            $"  steady: worker={_warmWorkerMs:F0}ms (budget {WorkerCycleBudgetMs}) | " +
             $"main-thread apply={_warmApplyMs:F1}ms (budget {MainThreadApplyBudgetMs}) | macro memory={_macroMemoryMb:F0}MB (budget {MacroMemoryBudgetMb})");
     }
 

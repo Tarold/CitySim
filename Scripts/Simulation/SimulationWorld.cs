@@ -12,8 +12,9 @@ namespace CitySim.Simulation;
 /// <remarks>
 /// <para><b>Background macro model.</b> With <see cref="UseBackgroundMacroModel"/> the expensive part of a
 /// macro recalculation (TAZ refresh/rebuild, OD + mode split, MSA assignment) runs on a worker thread
-/// into a second set of macro-model objects while the front set (<see cref="Taz"/>, <see cref="OdMatrix"/>,
-/// <see cref="TrafficEngine"/>) stays readable by UI, growth and economy. When the job completes,
+/// into a second set of macro-model objects while the front set (<see cref="Taz"/>, <see cref="OdMatrix"/>)
+/// stays readable by UI, growth and economy. The single <see cref="TrafficEngine"/> carries the warm MSA
+/// equilibrium and travel-time skim across cycles and publishes volumes only during apply. When the job completes,
 /// <see cref="Tick"/> applies it on the main thread in the same order as the synchronous pipeline
 /// (publish volumes → accessibility → transit connections → accessibility → transit demand), swaps the
 /// sets and raises <see cref="MacroModelRecalculated"/>.</para>
@@ -29,8 +30,11 @@ public sealed class SimulationWorld : IDisposable
     {
         public readonly TazManager Taz = new TazManager();
         public readonly OptimizedODMatrix OdMatrix = new OptimizedODMatrix();
-        public readonly TrafficEngine Engine = new TrafficEngine();
     }
+
+    // Single traffic engine: it carries the warm MSA equilibrium and the travel-time skim from cycle to
+    // cycle, whichever buffer is in front. Only one recalculation runs at a time.
+    private readonly TrafficEngine _engine = new TrafficEngine { WarmStart = true };
 
     private MacroModelBuffers _front = new MacroModelBuffers();
     private MacroModelBuffers _back = new MacroModelBuffers();
@@ -41,7 +45,10 @@ public sealed class SimulationWorld : IDisposable
     public const int DefaultGridHeight = 20;
     public const float DefaultCellSize = 64f;
 
-    /// <summary>MSA iterations of the traffic assignment per macro recalculation.</summary>
+    /// <summary>
+    /// MSA iterations of a cold traffic assignment (first cycle, after road topology changes); warm cycles
+    /// run <see cref="TrafficEngine.WarmStartIterationsPerCycle"/>.
+    /// </summary>
     public const int MsaIterations = 4;
 
     /// <summary>Ticket price assumed by the mode split when no transit route exists.</summary>
@@ -72,8 +79,8 @@ public sealed class SimulationWorld : IDisposable
     /// <summary>Current (front) OD matrix; replaced after each background recalculation.</summary>
     public OptimizedODMatrix OdMatrix => _front.OdMatrix;
 
-    /// <summary>Current (front) traffic engine; replaced after each background recalculation.</summary>
-    public TrafficEngine TrafficEngine => _front.Engine;
+    /// <summary>Traffic engine (warm-started MSA equilibrium and travel-time skim).</summary>
+    public TrafficEngine TrafficEngine => _engine;
     public TrafficLightManager TrafficLights { get; }
     public CarTrafficManager Cars { get; }
     public PedestrianManager Pedestrians { get; }
@@ -248,8 +255,8 @@ public sealed class SimulationWorld : IDisposable
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         var model = _front;
         model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit);
-        model.OdMatrix.Recalculate(model.Taz, RoadGraph, Clock.Hour, GetAverageTicketPrice());
-        model.Engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations);
+        model.OdMatrix.Recalculate(model.Taz, RoadGraph, Clock.Hour, GetAverageTicketPrice(), _engine.Skim);
+        _engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations);
         model.Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
         model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
         Transit.AssignPassengerDemandFromTaz(model.Taz, model.OdMatrix, RoadGraph);
@@ -276,8 +283,8 @@ public sealed class SimulationWorld : IDisposable
         {
             long jobStart = System.Diagnostics.Stopwatch.GetTimestamp();
             model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit, refreshRouteTimes: false);
-            model.OdMatrix.Recalculate(model.Taz, RoadGraph, hour, ticketPrice);
-            model.Engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations, deferPublish: true);
+            model.OdMatrix.Recalculate(model.Taz, RoadGraph, hour, ticketPrice, _engine.Skim);
+            _engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations, deferPublish: true);
             LastMacroComputeMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(jobStart).TotalMilliseconds;
         });
     }
@@ -291,7 +298,7 @@ public sealed class SimulationWorld : IDisposable
         long applyStart = System.Diagnostics.Stopwatch.GetTimestamp();
 
         var model = _back;
-        model.Engine.PublishPendingVolumes(RoadGraph);
+        _engine.PublishPendingVolumes(RoadGraph);
         model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
         model.Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
         model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);

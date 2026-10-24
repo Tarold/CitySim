@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using Godot;
@@ -15,7 +14,6 @@ public sealed class OptimizedODMatrix
 {
     private int _tazCount;
 
-    private float[] _rawScores = Array.Empty<float>();
     private float[] _carTrips = Array.Empty<float>();
     private float[] _transitTrips = Array.Empty<float>();
     private float[] _walkTrips = Array.Empty<float>();
@@ -24,20 +22,23 @@ public sealed class OptimizedODMatrix
     private float[] _hansenPotentials = Array.Empty<float>();
     private float[] _accessibilityScores = Array.Empty<float>();
 
-    /// <summary>
-    /// Reusable pool of shortest path tree buffers (Zero-Allocation for MSA iterations).
-    /// </summary>
-    public ConcurrentDictionary<int, ShortestPathTreeBuffer> CachedTreeBuffers { get; } = new();
+    /// <summary>Intra-zonal car travel time (minutes) used on the matrix diagonal.</summary>
+    public const float IntraZonalTravelTime = 1.8f;
 
-    /// <summary>
-    /// Backward-compatible representation for external queries and tests.
-    /// References the same arrays inside CachedTreeBuffers without memory copies.
-    /// </summary>
-    public ConcurrentDictionary<int, (float[] Distances, int[] ParentEdgeIds, int[] ParentNodeIds)> CachedShortestTrees { get; } = new();
+    /// <summary>Connector access time (minutes) assumed for a TAZ without connectors.</summary>
+    public const float DefaultAccessTime = 0.5f;
 
-    private readonly HashSet<int> _uniqueOriginNodes = new();
+    /// <summary>On-demand trees kept for commute-path queries (cleared on every recalculation).</summary>
+    private const int MaxCachedPathTrees = 8;
+
+    // Fallback skim when no up-to-date skim is supplied (first cycle, topology change, standalone use)
+    private readonly TravelTimeSkim _ownSkim = new TravelTimeSkim();
     private readonly RoutingSnapshot _routing = new RoutingSnapshot();
-    private int[] _uniqueOriginNodesArray = Array.Empty<int>();
+
+    // On-demand shortest-path trees for commute path reconstruction (main thread, front matrix only)
+    private readonly Dictionary<int, ShortestPathTreeBuffer> _pathTrees = new();
+    private readonly Queue<int> _pathTreeOrder = new();
+    private RoadGraph _graph;
 
     public int TazCount => _tazCount;
     public float CurrentHour { get; set; }
@@ -68,14 +69,17 @@ public sealed class OptimizedODMatrix
     public float GetAccessibilityScore(int originTaz) =>
         (originTaz >= 0 && originTaz < _tazCount) ? _accessibilityScores[originTaz] : 0f;
 
+    /// <summary>K² arrays grow with 1/MatrixHeadroomDivisor spare capacity to avoid reallocating on every new TAZ.</summary>
+    private const int MatrixHeadroomDivisor = 8;
+
     private void EnsureCapacity(int k)
     {
         _tazCount = k;
         int required = k * k;
-        if (_rawScores.Length < required)
+        if (_carTrips.Length < required)
         {
-            int allocSize = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(required, 16));
-            _rawScores = new float[allocSize];
+            // Exact size plus headroom for a few more TAZs (K² arrays dominate macro-model memory)
+            int allocSize = Math.Max(required + required / MatrixHeadroomDivisor, 16);
             _carTrips = new float[allocSize];
             _transitTrips = new float[allocSize];
             _walkTrips = new float[allocSize];
@@ -91,16 +95,14 @@ public sealed class OptimizedODMatrix
     }
 
     /// <summary>
-    /// Updates shortest path trees in CachedTreeBuffers and populates travel times in _travelTimes.
-    /// Called at the start of Recalculate() and after final MSA iterations.
+    /// Fills the K×K travel-time matrix from a skim: road time between primary nodes plus both connector
+    /// access times; <see cref="IntraZonalTravelTime"/> on the diagonal; float.MaxValue when unreachable.
+    /// Also drops on-demand path trees (they reflect older volumes).
     /// </summary>
-    /// <param name="carVolumes">
-    /// Optional per-edge car volumes to evaluate travel times with (an unpublished assignment result);
-    /// null uses the published <see cref="RoadEdge.CurrentVolume"/>.
-    /// </param>
-    public void UpdateEquilibriumTreesAndTimes(TazManager tazManager, RoadGraph roadGraph, float[] carVolumes = null)
+    public void ApplySkim(TazManager tazManager, TravelTimeSkim skim)
     {
-        if (tazManager == null || roadGraph == null) return;
+        ClearPathTrees();
+        if (tazManager == null || skim == null) return;
 
         var tazList = tazManager.ActiveZones;
         int k = tazList.Count;
@@ -108,57 +110,32 @@ public sealed class OptimizedODMatrix
 
         EnsureCapacity(k);
 
-        _uniqueOriginNodes.Clear();
-        for (int i = 0; i < k; i++)
-        {
-            int nodeId = tazList[i].PrimaryRoadNodeId;
-            if (nodeId >= 0) _uniqueOriginNodes.Add(nodeId);
-        }
-
-        int uniqueCount = _uniqueOriginNodes.Count;
-        if (_uniqueOriginNodesArray.Length < uniqueCount)
-        {
-            _uniqueOriginNodesArray = new int[Math.Max(uniqueCount * 2, 64)];
-        }
-        _uniqueOriginNodes.CopyTo(_uniqueOriginNodesArray);
-        _routing.Rebuild(roadGraph, carVolumes);
-
-        Parallel.For(0, uniqueCount, idx =>
-        {
-            int nodeId = _uniqueOriginNodesArray[idx];
-            var buffer = CachedTreeBuffers.GetOrAdd(nodeId, _ => new ShortestPathTreeBuffer());
-            _routing.ComputeShortestPathTree(nodeId, buffer);
-
-            // Backward compatibility without extra array allocation
-            CachedShortestTrees[nodeId] = (buffer.Distances, buffer.ParentEdgeIds, buffer.ParentNodeIds);
-        });
-
         Parallel.For(0, k, i =>
         {
             var origin = tazList[i];
             int rowOffset = i * k;
+            int row = skim.IndexOf(origin.PrimaryRoadNodeId);
 
-            if (!CachedTreeBuffers.TryGetValue(origin.PrimaryRoadNodeId, out var tree))
+            if (row < 0)
             {
                 for (int j = 0; j < k; j++) _travelTimes[rowOffset + j] = float.MaxValue;
+                _travelTimes[rowOffset + i] = IntraZonalTravelTime;
                 return;
             }
 
-            float[] distMap = tree.Distances;
-            float origAccess = origin.Connectors.Count > 0 ? origin.Connectors[0].AccessTime : 0.5f;
+            float origAccess = origin.Connectors.Count > 0 ? origin.Connectors[0].AccessTime : DefaultAccessTime;
 
             for (int j = 0; j < k; j++)
             {
                 if (i == j)
                 {
-                    _travelTimes[rowOffset + j] = 1.8f;
+                    _travelTimes[rowOffset + j] = IntraZonalTravelTime;
                     continue;
                 }
 
                 var dest = tazList[j];
-                float roadTime = (dest.PrimaryRoadNodeId >= 0 && dest.PrimaryRoadNodeId < distMap.Length)
-                    ? distMap[dest.PrimaryRoadNodeId]
-                    : float.MaxValue;
+                int col = skim.IndexOf(dest.PrimaryRoadNodeId);
+                float roadTime = col < 0 ? float.MaxValue : skim.GetRoadTimeByIndex(row, col);
 
                 if (roadTime >= float.MaxValue * 0.5f)
                 {
@@ -166,21 +143,55 @@ public sealed class OptimizedODMatrix
                     continue;
                 }
 
-                float destAccess = dest.Connectors.Count > 0 ? dest.Connectors[0].AccessTime : 0.5f;
+                float destAccess = dest.Connectors.Count > 0 ? dest.Connectors[0].AccessTime : DefaultAccessTime;
                 _travelTimes[rowOffset + j] = roadTime + origAccess + destAccess;
             }
         });
     }
 
     /// <summary>
+    /// Shortest-path tree from <paramref name="originNodeId"/> on the published road volumes, computed on
+    /// demand for commute-path reconstruction and cached until the next recalculation. Main thread only;
+    /// null before the first recalculation.
+    /// </summary>
+    public ShortestPathTreeBuffer GetPathTree(int originNodeId)
+    {
+        if (_graph == null || originNodeId < 0) return null;
+        if (_pathTrees.TryGetValue(originNodeId, out var cached)) return cached;
+
+        if (_pathTreeOrder.Count >= MaxCachedPathTrees)
+        {
+            _pathTrees.Remove(_pathTreeOrder.Dequeue());
+        }
+
+        var tree = new ShortestPathTreeBuffer();
+        _graph.ComputeDijkstraIntoBuffer(originNodeId, tree);
+        _pathTrees[originNodeId] = tree;
+        _pathTreeOrder.Enqueue(originNodeId);
+        return tree;
+    }
+
+    private void ClearPathTrees()
+    {
+        _pathTrees.Clear();
+        _pathTreeOrder.Clear();
+    }
+
+    /// <summary>
     /// Full parallel recalculation of travel demand, shortest trees, gravity distribution, and 3-mode split.
     /// </summary>
+    /// <param name="skim">
+    /// Car travel times from the previous traffic assignment. Used when it covers the current TAZs and road
+    /// topology; otherwise one search round computes a fresh skim (published volumes).
+    /// </param>
     public void Recalculate(
         TazManager tazManager,
         RoadGraph roadGraph,
         float currentHour,
-        float ticketFare = 12.0f)
+        float ticketFare = 12.0f,
+        TravelTimeSkim skim = null)
     {
+        _graph = roadGraph;
         CurrentHour = currentHour;
         TotalTrips = 0f;
         TotalCarTrips = 0f;
@@ -200,7 +211,6 @@ public sealed class OptimizedODMatrix
         EnsureCapacity(k);
 
         int required = k * k;
-        Array.Clear(_rawScores, 0, required);
         Array.Clear(_carTrips, 0, required);
         Array.Clear(_transitTrips, 0, required);
         Array.Clear(_walkTrips, 0, required);
@@ -212,8 +222,14 @@ public sealed class OptimizedODMatrix
         for (int i = 0; i < k; i++)
             totalCityPop += tazList[i].TotalPopulation;
 
-        // 1 & 2. Compute shortest trees into CachedTreeBuffers and populate _travelTimes
-        UpdateEquilibriumTreesAndTimes(tazManager, roadGraph);
+        // 1 & 2. Car travel times from the assignment skim (or a fresh search round)
+        if (skim == null || !skim.Covers(tazManager, roadGraph))
+        {
+            _routing.Rebuild(roadGraph);
+            _ownSkim.Compute(roadGraph, _routing, TravelTimeSkim.CollectAccessNodes(tazManager));
+            skim = _ownSkim;
+        }
+        ApplySkim(tazManager, skim);
 
         // 3. Gravity Model Trip Distribution & Hansen Accessibility Index
         Array.Clear(_rowScoreSums, 0, k);
@@ -236,7 +252,7 @@ public sealed class OptimizedODMatrix
                 float tCar = _travelTimes[rowOffset + j];
                 if (tCar >= float.MaxValue * 0.5f)
                 {
-                    _rawScores[rowOffset + j] = 0f;
+                    _walkTrips[rowOffset + j] = 0f;
                     continue;
                 }
 
@@ -247,7 +263,7 @@ public sealed class OptimizedODMatrix
                 float attraction = destJobs * morningBias + destPop * (1.0f - morningBias);
                 if (attraction <= 0.01f)
                 {
-                    _rawScores[rowOffset + j] = 0f;
+                    _walkTrips[rowOffset + j] = 0f;
                     continue;
                 }
 
@@ -261,7 +277,8 @@ public sealed class OptimizedODMatrix
 
                 float impedance = 1.0f / MathF.Pow(effectiveTime + 2.0f, 1.25f);
                 float score = production * attraction * impedance;
-                _rawScores[rowOffset + j] = score;
+                // Raw gravity score parked in the walk-trip slot until the mode split below overwrites it
+                _walkTrips[rowOffset + j] = score;
                 localSum += score;
             }
 
@@ -272,11 +289,13 @@ public sealed class OptimizedODMatrix
         UpdateAccessibilityScores(tazManager, roadGraph, morningBias);
 
         float targetHourlyDemand = 1.5f * totalCityPop * diurnalMultiplier;
-        if (targetHourlyDemand <= 0.001f) return;
-
         float globalScoreSum = 0f;
         for (int i = 0; i < k; i++) globalScoreSum += _rowScoreSums[i];
-        if (globalScoreSum <= 1e-5f) return;
+        if (targetHourlyDemand <= 0.001f || globalScoreSum <= 1e-5f)
+        {
+            Array.Clear(_walkTrips, 0, required); // drop the parked gravity scores: no trips this hour
+            return;
+        }
 
         float normFactor = targetHourlyDemand / globalScoreSum;
 
@@ -298,8 +317,12 @@ public sealed class OptimizedODMatrix
             for (int j = 0; j < k; j++)
             {
                 int idx = rowOffset + j;
-                float totalTrips = _rawScores[idx] * normFactor;
-                if (totalTrips < 0.01f) continue;
+                float totalTrips = _walkTrips[idx] * normFactor;
+                if (totalTrips < 0.01f)
+                {
+                    _walkTrips[idx] = 0f;
+                    continue;
+                }
 
                 var dest = tazList[j];
                 float netDist = i == j

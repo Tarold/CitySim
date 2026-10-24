@@ -51,6 +51,10 @@ public sealed class TazManager
     private TransitConnectionInfo[] _transitConnectionsCache = Array.Empty<TransitConnectionInfo>();
     private int _cachedTazCount = 0;
 
+    // True when the cache was computed from a TransitManager with routes: it then lists every direct and
+    // 1-transfer connection, and unconnected pairs need no topological fallback check.
+    private bool _transitConnectionsAuthoritative;
+
     // Number of grid zones + parcels that contributed to TAZ buckets at the last full rebuild
     private int _contributingEntityCount = 0;
 
@@ -245,12 +249,14 @@ public sealed class TazManager
     {
         int k = _activeTazList.Count;
         _cachedTazCount = k;
+        _transitConnectionsAuthoritative = false;
         if (k == 0) return;
 
         int required = k * k;
         if (_transitConnectionsCache.Length < required)
         {
-            int allocSize = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(required, 16));
+            // Exact size plus 1/8 headroom: this K² cache is a large share of macro-model memory
+            int allocSize = Math.Max(required + required / 8, 16);
             _transitConnectionsCache = new TransitConnectionInfo[allocSize];
         }
         Array.Clear(_transitConnectionsCache, 0, required);
@@ -262,6 +268,7 @@ public sealed class TazManager
         {
             transit.UpdateAllRouteTravelTimes(roadGraph);
         }
+        _transitConnectionsAuthoritative = true;
 
         for (int i = 0; i < k; i++)
         {
@@ -382,7 +389,7 @@ public sealed class TazManager
             dest.Id >= 0 && dest.Id < _cachedTazCount)
         {
             var cached = _transitConnectionsCache[origin.Id * _cachedTazCount + dest.Id];
-            if (cached.IsConnected)
+            if (cached.IsConnected || _transitConnectionsAuthoritative)
                 return cached;
         }
 

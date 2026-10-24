@@ -78,7 +78,7 @@ public static class CommuteAnalytics
 
     /// <summary>
     /// Safely reconstructs the list of edge IDs for the shortest path between originNodeId and destNodeId
-    /// directly from CachedTreeBuffers.
+    /// from the matrix's on-demand shortest-path tree of the origin.
     /// </summary>
     public static List<int> ExtractPathFromTreeBuffer(
         OptimizedODMatrix matrix,
@@ -89,7 +89,8 @@ public static class CommuteAnalytics
         if (matrix == null || originNodeId < 0 || destNodeId < 0 || originNodeId == destNodeId)
             return path;
 
-        if (!matrix.CachedTreeBuffers.TryGetValue(originNodeId, out var tree) || tree == null)
+        var tree = matrix.GetPathTree(originNodeId);
+        if (tree == null)
             return path;
 
         int maxLen = Math.Min(tree.ParentEdgeIds.Length, tree.ParentNodeIds.Length);
@@ -285,7 +286,7 @@ public static class CommuteAnalytics
     }
 
     /// <summary>
-    /// Resolves top-8 illuminated commute corridors for a selected grid zone using CachedTreeBuffers in O(K).
+    /// Resolves top-8 illuminated commute corridors for a selected grid zone using on-demand shortest-path trees in O(K).
     /// </summary>
     public static List<CommuteTarget> ComputeCommuteTargets(
         int zoneId,
@@ -322,7 +323,7 @@ public static class CommuteAnalytics
     }
 
     /// <summary>
-    /// Resolves top-8 illuminated commute corridors for a selected roadside parcel using CachedTreeBuffers in O(K).
+    /// Resolves top-8 illuminated commute corridors for a selected roadside parcel using on-demand shortest-path trees in O(K).
     /// </summary>
     public static List<CommuteTarget> ComputeCommuteTargetsForParcel(
         int parcelId,
@@ -580,11 +581,6 @@ public static class CommuteAnalytics
     {
         var targets = new List<CommuteTarget>();
         int k = tazManager.ActiveZones.Count;
-
-        if (sourceTaz.PrimaryRoadNodeId >= 0 && !odMatrix.CachedTreeBuffers.ContainsKey(sourceTaz.PrimaryRoadNodeId))
-        {
-            odMatrix.UpdateEquilibriumTreesAndTimes(tazManager, graph);
-        }
 
         for (int otherIdx = 0; otherIdx < k; otherIdx++)
         {
