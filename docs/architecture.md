@@ -76,7 +76,7 @@
 
 ---
 
-## 3. Керування та режими взаємодії (`Scripts/Main.cs`, `Scripts/UI/GameUI.cs`)
+## 3. Керування та режими взаємодії (`Scripts/Tools/`, `Scripts/Main.cs`, `Scripts/UI/GameUI.cs`)
 
 | Клавіша / Дія | Призначення |
 | :--- | :--- |
@@ -92,3 +92,29 @@
 - `ToggleBusLane` (`🚌 Bus Lane`) — увімкнення/вимкнення виділеної смуги ГТ на сегменті дороги.
 - `ZoneResidential` / `ZoneCommercial` / `ZoneIndustrial` / `Dezone` — зонування клітинок сітки та придорожніх парцелів (підтримує затискання та протягування миші).
 - `CreateTransitRoute` (`🚌 New Route`) — проєктування лінійних та кільцевих автобусних маршрутів по графу доріг.
+
+---
+
+## 4. Шари коду та потік керування
+
+```text
+Godot-шар                         Headless-шар (dotnet test)
+───────────                       ─────────────────────────────────────────────────────────
+Main.cs ── ToolInput ──────────►  Scripts/Tools/ (ITool) ── IWorldCommand ──► Commands/
+   ▲  (IToolHost, IToolPreview)                                                  │
+   │                                                                             ▼
+   └── події світу ◄──────────────────────────────────────────────── SimulationWorld
+       MacroModelRecalculated · TopologyApplied · LandUseChanged      (Clock, Growth, Topology,
+                                                                        Stats, підсистеми)
+Main._Process ── Tick(dt) ─────────────────────────────────────────────────►  SimulationWorld
+```
+
+- **`SimulationWorld`** — власник усіх підсистем симуляції. `Create(scenario)` (через `ScenarioLoader`), `Tick(dt)` (страхувальне застосування відкладених змін топології → `SimulationClock` → макро-, фінансовий і LUTI-тіки → оновлення агентів), `RecalculateMacroModel()`, `ApplyTopologyChange()`. Події `MacroModelRecalculated`, `TopologyApplied`, `LandUseChanged` — єдиний канал, через який Godot-шар оновлює рендеринг.
+- **`SimulationClock`** — ігровий час, швидкість, перехід доби та розклад тіків (`SimulationTicks`).
+- **`TopologyChangeCoordinator`** — єдиний ланцюжок інвалідації після зміни графа доріг (кеші шляхів → світлофори → парцели → `TransitManager.RevalidateRoutes()` → авто → пішоходи → досяжність LUTI → `TazManager.MarkDirty()`); відстежує зміни через події `RoadGraph`.
+- **`LutiGrowthSystem`** — ріст населення та щільності клітинок і парцел; кешує досяжність від в'їздів до зміни топології.
+- **`CityStatsSnapshot`** — статистика HUD, що рахується на макро-тіку, а не щокадрово.
+- **Команди (`IWorldCommand`)** — кожне редагування гравця: валідація цілі й бюджету, зміна світу, ланцюжок топології або перерахунок макромоделі, `CommandResult` (статус, повідомлення, тон, вартість, результат топології, id створеної сутності).
+- **Інструменти (`ITool`)** — покрокові стани взаємодії (наведення, клік, скасування правою кнопкою). Не читають Godot `Input`: отримують `ToolInput`, а превʼю та підказки віддають через `IToolPreview` / `IToolHost`.
+- **`Main.cs`** — лише адаптер: створює світ і рендерери, передає ввід активному інструменту, режим Inspect, HUD із `world.Stats`.
+

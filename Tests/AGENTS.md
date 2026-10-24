@@ -4,7 +4,9 @@
 Набір модульних та інтеграційних тестів на **NUnit 3** (`net8.0`), що перевіряє симуляційне ядро, економіку, маршрутизацію та побудову буферів рендерингу без запуску рушія Godot.
 
 ## Структура тестів
-- `Tests/Simulation/` — модульні тести підсистем симуляції (еталон: `Tests/Simulation/TazClusteringAndOptimizedODTests.cs`).
+- `Tests/Simulation/` — модульні тести підсистем симуляції (еталон: `Tests/Simulation/TazClusteringAndOptimizedODTests.cs`) та інтеграційні тести `SimulationWorld`.
+- `Tests/Simulation/Commands/` — тести команд редагування (`CommandTestWorld` створює готовий світ із бюджетом).
+- `Tests/Tools/` — тести інструментів через `FakeToolHost` / `FakeToolPreview`.
 - `Tests/*.cs` — інтеграційні та сценарні тести (`Phase4LutiAccessibilityAndDensityTests.cs`, `GameplayEconomyTests.cs`, `GameplayRoutingTests.cs`, `MapEditingVisualTests.cs`, `RoadConstructionTests.cs`, `TransitDesignerTests.cs`, `ZoningAndExpansionTests.cs`).
 
 ## Специфічні правила `Tests/`
@@ -12,3 +14,5 @@
 - **Тестування рендерингу через Builder:** для перевірки візуалізації агентів тестуй `VehicleMultimeshBufferBuilder` напряму (перевіряй `ActiveCarInstances`, `ActiveBusInstances`, `ActivePedestrianInstances` та значення у `float[]` буферах), як у `Tests/Simulation/Phase3GpuInstancingAndDodTests.cs`.
 - **Детермінованість:** уникай `Thread.Sleep` та залежності від системного часу. Передавай фіксовані `delta` або кількість тіків у методи `Update(dt)` / `Recalculate()`.
 - **Іменування:** використовуй формат `MethodOrScenario_Condition_ExpectedBehavior` та атрибут `[Test]`.
+- **Стан фікстури:** NUnit використовує один екземпляр фікстури для всіх тестів — лічильники в полях скидай у `[SetUp]`.
+- **Сітка за замовчуванням:** `CityGrid` завжди створює два в'їзди посередині лівого та правого країв — враховуй це в тестах досяжності.

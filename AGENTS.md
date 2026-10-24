@@ -14,8 +14,10 @@ dotnet test Tests/Tests.csproj --filter "FullyQualifiedName~Name" # запуск
 ## Структура
 - `Scripts/Simulation/` — макромодель (TAZ, OD-матриця, MSA-трафік, економіка, LUTI) та мікроагенти. Правила: `Scripts/Simulation/AGENTS.md`
 - `Scripts/Rendering/` та `Shaders/` — 2D-рендеринг, теплокарти, GPU `MultiMesh`-інстансинг. Правила: `Scripts/Rendering/AGENTS.md`
+- `Scripts/Simulation/SimulationWorld.cs` — власник підсистем і ігрового циклу (`Tick`), `Scripts/Simulation/Commands/` — команди редагування світу.
+- `Scripts/Tools/` — headless-інструменти взаємодії (`ITool`: дороги, знесення, зонування, смуги ГТ, маршрути).
 - `Scripts/UI/` — інтерфейс гравця (`GameUI.cs`, `MainMenu.cs`).
-- `Scripts/Main.cs` — точка входу симуляції, ігровий цикл `_Process`, обробка інструментів.
+- `Scripts/Main.cs` — Godot-адаптер: камера, рендерери, HUD, режим Inspect, передача вводу активному інструменту.
 - `Scenes/` — сцени Godot (`Main.tscn`, `MainMenu.tscn`).
 - `Tests/` — модульні та інтеграційні тести NUnit. Правила: `Tests/AGENTS.md`
 - `.agents/agents/` — ролі субагентів Outer/Inner Loop (`product_manager.md`, `developer.md`, `qa_engineer.md`).
@@ -32,6 +34,7 @@ dotnet test Tests/Tests.csproj --filter "FullyQualifiedName~Name" # запуск
 - **Зміни топології доріг:** після будь-якої зміни ребер/вузлів у `RoadGraph` викликай `TopologyChangeCoordinator.ApplyChanges()` (у `Main.cs` — `ApplyTopologyChange()`). Координатор у фіксованому порядку оновлює кеші шляхів, `TrafficLightManager`, `ParcelManager`, маршрути `TransitManager.RevalidateRoutes()`, `CarTrafficManager`, `PedestrianManager` і `TazManager.MarkDirty()`. Не дублюй цей ланцюжок вручну; нову підсистему, залежну від топології, підключай у координатор. `RoadGraph.RebuildAfterTopologyChange()` будує щільну матрицю й лишився лише для старих тестів.
 - **Продуктивність гарячого циклу (`_Process`):** уникай алокацій у купі (`new` класів, LINQ, замикань) у щокадрових методах `CarTrafficManager`, `PedestrianManager`, `VehicleMultimeshBufferBuilder` та `OptimizedODMatrix`. Використовуй плоскі масиви та пули структур.
 - **Еталон нової фічі:** додавай систему за зразком `Scripts/Simulation/TazManager.cs` разом із тестами за зразком `Tests/Simulation/TazClusteringAndOptimizedODTests.cs` (див. skill `.agents/skills/add-simulation-feature/SKILL.md`).
+- **Шари:** логіку симуляції додавай у `SimulationWorld`/підсистеми, редагування гравця — як `IWorldCommand`, покрокову взаємодію — як `ITool` у `Scripts/Tools/` (без Godot `Input`, через `ToolInput`/`IToolHost`). `Main.cs` залишається тонким адаптером: не додавай у нього правил симуляції чи валідації.
 - **Стиль коду:** `PascalCase` для публічних членів і типів, `_camelCase` для приватних полів, іменовані константи замість магічних чисел. Не видаляй наявні коментарі та XML-докстрінги поза межами своїх змін.
 
 ## Перевірка готовності
