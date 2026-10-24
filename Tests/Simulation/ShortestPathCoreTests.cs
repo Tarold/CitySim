@@ -129,4 +129,63 @@ public class ShortestPathCoreTests
         // Old implementation allocated two node-sized arrays per query (400 nodes * 8 bytes) plus the queue
         Assert.That(perQuery, Is.LessThan(_graph.Nodes.Count * 4), $"{perQuery} bytes per query");
     }
+
+    [Test]
+    public void RoutingSnapshot_EveryOrigin_MatchesRoadGraphTree()
+    {
+        var snapshot = new RoutingSnapshot();
+        snapshot.Rebuild(_graph);
+        var expected = new ShortestPathTreeBuffer();
+        var actual = new ShortestPathTreeBuffer();
+
+        foreach (var node in _graph.Nodes.Where((_, i) => i % 7 == 0))
+        {
+            _graph.ComputeDijkstraIntoBuffer(node.Id, expected);
+            snapshot.ComputeShortestPathTree(node.Id, actual);
+
+            Assert.That(actual.VisitedCount, Is.EqualTo(expected.VisitedCount));
+            for (int v = 0; v < snapshot.NodeCapacity; v++)
+            {
+                Assert.That(actual.Distances[v], Is.EqualTo(expected.Distances[v]), $"source {node.Id}, node {v}");
+                Assert.That(actual.ParentEdgeIds[v], Is.EqualTo(expected.ParentEdgeIds[v]), $"source {node.Id}, node {v}");
+            }
+            for (int k = 0; k < expected.VisitedCount; k++)
+            {
+                Assert.That(actual.VisitedNodesOrder[k], Is.EqualTo(expected.VisitedNodesOrder[k]));
+            }
+        }
+    }
+
+    [Test]
+    public void RoutingSnapshot_GraphChangedAfterRebuild_KeepsOldCostsUntilNextRebuild()
+    {
+        var snapshot = new RoutingSnapshot();
+        snapshot.Rebuild(_graph);
+        int source = Node(0, 0);
+        var before = new ShortestPathTreeBuffer();
+        snapshot.ComputeShortestPathTree(source, before);
+        float distBefore = before.Distances[Node(10, 0)];
+
+        foreach (var edge in _graph.Edges) edge.CurrentVolume = edge.Capacity * 3f;
+        var stale = new ShortestPathTreeBuffer();
+        snapshot.ComputeShortestPathTree(source, stale);
+        snapshot.Rebuild(_graph);
+        var fresh = new ShortestPathTreeBuffer();
+        snapshot.ComputeShortestPathTree(source, fresh);
+
+        Assert.That(stale.Distances[Node(10, 0)], Is.EqualTo(distBefore));
+        Assert.That(fresh.Distances[Node(10, 0)], Is.GreaterThan(distBefore));
+    }
+
+    [Test]
+    public void RoutingSnapshot_UnknownSource_LeavesEverythingUnreachable()
+    {
+        var snapshot = new RoutingSnapshot();
+        snapshot.Rebuild(_graph);
+        var buffer = new ShortestPathTreeBuffer();
+
+        snapshot.ComputeShortestPathTree(-5, buffer);
+
+        Assert.That(buffer.VisitedCount, Is.EqualTo(0));
+    }
 }
