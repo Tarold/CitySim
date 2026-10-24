@@ -188,4 +188,47 @@ public class ShortestPathCoreTests
 
         Assert.That(buffer.VisitedCount, Is.EqualTo(0));
     }
+
+    [Test]
+    public void ComputeTravelTime_MatchesInstanceMethods()
+    {
+        foreach (var edge in _graph.Edges.Take(50))
+        {
+            Assert.That(RoadEdge.ComputeTravelTime(edge.Length, edge.FreeFlowSpeed, edge.CurrentVolume, edge.Capacity), Is.EqualTo(edge.GetTravelTime()));
+            Assert.That(RoadEdge.ComputeWalkingTravelTime(edge.Length, edge.WalkingSpeed, edge.PedestrianVolume, edge.PedestrianCapacity), Is.EqualTo(edge.GetWalkingTravelTime()));
+        }
+    }
+
+    [Test]
+    public void RoutingSnapshot_ExternalVolumes_EquivalentToPublishedVolumes()
+    {
+        var volumes = _graph.Edges.Select(e => e.CurrentVolume).ToArray();
+        var fromEdges = new RoutingSnapshot();
+        var fromArray = new RoutingSnapshot();
+        fromEdges.Rebuild(_graph);
+        foreach (var e in _graph.Edges) e.CurrentVolume = 0f; // published state differs from the array
+        fromArray.Rebuild(_graph, volumes);
+
+        var a = new ShortestPathTreeBuffer();
+        var b = new ShortestPathTreeBuffer();
+        fromEdges.ComputeShortestPathTree(Node(2, 3), a);
+        fromArray.ComputeShortestPathTree(Node(2, 3), b);
+
+        for (int v = 0; v < fromEdges.NodeCapacity; v++)
+        {
+            Assert.That(b.Distances[v], Is.EqualTo(a.Distances[v]));
+        }
+    }
+
+    [Test]
+    public void GetShortestWalkingPath_ExternalVolumes_EquivalentToPublishedVolumes()
+    {
+        var pedestrianVolumes = _graph.Edges.Select(e => e.PedestrianVolume).ToArray();
+        var expected = _graph.GetShortestWalkingPath(Node(1, 2), Node(14, 11));
+        foreach (var e in _graph.Edges) e.PedestrianVolume = 0f;
+
+        var actual = _graph.GetShortestWalkingPath(Node(1, 2), Node(14, 11), pedestrianVolumes);
+
+        Assert.That(actual, Is.EqualTo(expected));
+    }
 }

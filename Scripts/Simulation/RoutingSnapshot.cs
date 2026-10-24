@@ -29,10 +29,12 @@ public sealed class RoutingSnapshot
     public int AdjacencyCount { get; private set; }
 
     /// <summary>
-    /// Copies topology and current car travel times from <paramref name="graph"/>, reusing arrays.
-    /// Call before each search round; later graph changes are not seen until the next rebuild.
+    /// Copies topology and car travel times from <paramref name="graph"/>, reusing arrays. Travel times use
+    /// <paramref name="carVolumes"/> (indexed by edge id) when given, otherwise the published
+    /// <see cref="RoadEdge.CurrentVolume"/>. Call before each search round; later graph changes are not seen
+    /// until the next rebuild.
     /// </summary>
-    public void Rebuild(RoadGraph graph)
+    public void Rebuild(RoadGraph graph, float[] carVolumes = null)
     {
         int maxId = graph.GetMaxNodeIndex();
         NodeCapacity = maxId;
@@ -64,7 +66,9 @@ public sealed class RoutingSnapshot
 
                 _adjEdge[count] = eid;
                 _adjTarget[count] = v;
-                _adjCost[count] = edge.GetTravelTime();
+                _adjCost[count] = carVolumes == null
+                    ? edge.GetTravelTime()
+                    : RoadEdge.ComputeTravelTime(edge.Length, edge.FreeFlowSpeed, carVolumes[eid], edge.Capacity);
                 count++;
             }
         }

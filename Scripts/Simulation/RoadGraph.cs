@@ -59,9 +59,15 @@ public class RoadEdge
         }
     }
 
-    public float GetTravelTime()
+    public float GetTravelTime() => ComputeTravelTime(Length, FreeFlowSpeed, CurrentVolume, Capacity);
+
+    /// <summary>
+    /// BPR car travel time T = T0 · (1 + 0.15 · (V/C)^4) for an arbitrary volume (used with flow arrays
+    /// that are not yet published to <see cref="CurrentVolume"/>).
+    /// </summary>
+    public static float ComputeTravelTime(float length, float freeFlowSpeed, float volume, float capacity)
     {
-        return (Length / FreeFlowSpeed) * (1f + 0.15f * Mathf.Pow(CurrentVolume / Mathf.Max(Capacity, 1f), 4f));
+        return (length / freeFlowSpeed) * (1f + 0.15f * Mathf.Pow(volume / Mathf.Max(capacity, 1f), 4f));
     }
 
     /// <summary>
@@ -83,9 +89,12 @@ public class RoadEdge
         return CurrentVolume / Mathf.Max(Capacity, 1f);
     }
 
-    public float GetWalkingTravelTime()
+    public float GetWalkingTravelTime() => ComputeWalkingTravelTime(Length, WalkingSpeed, PedestrianVolume, PedestrianCapacity);
+
+    /// <summary>Pedestrian travel time with crowding for an arbitrary pedestrian volume.</summary>
+    public static float ComputeWalkingTravelTime(float length, float walkingSpeed, float pedestrianVolume, float pedestrianCapacity)
     {
-        return (Length / WalkingSpeed) * (1f + 0.10f * Mathf.Pow(PedestrianVolume / Mathf.Max(PedestrianCapacity, 1f), 2f));
+        return (length / walkingSpeed) * (1f + 0.10f * Mathf.Pow(pedestrianVolume / Mathf.Max(pedestrianCapacity, 1f), 2f));
     }
 
     public float GetPedestrianCongestionRatio()
@@ -339,19 +348,30 @@ public class RoadGraph
     /// <summary>Edge weight used by the shared shortest-path core (struct for zero-cost generic dispatch).</summary>
     private interface IEdgeCost
     {
-        float Get(RoadEdge edge);
+        float Get(int edgeIndex, RoadEdge edge);
     }
 
     /// <summary>Car travel time with BPR congestion (<see cref="RoadEdge.GetTravelTime"/>).</summary>
     private readonly struct DrivingCost : IEdgeCost
     {
-        public float Get(RoadEdge edge) => edge.GetTravelTime();
+        public float Get(int edgeIndex, RoadEdge edge) => edge.GetTravelTime();
     }
 
     /// <summary>Pedestrian travel time with crowding (<see cref="RoadEdge.GetWalkingTravelTime"/>).</summary>
     private readonly struct WalkingCost : IEdgeCost
     {
-        public float Get(RoadEdge edge) => edge.GetWalkingTravelTime();
+        public float Get(int edgeIndex, RoadEdge edge) => edge.GetWalkingTravelTime();
+    }
+
+    /// <summary>Pedestrian travel time using pedestrian volumes from an external per-edge array.</summary>
+    private readonly struct WalkingVolumeCost : IEdgeCost
+    {
+        private readonly float[] _pedestrianVolumes;
+
+        public WalkingVolumeCost(float[] pedestrianVolumes) => _pedestrianVolumes = pedestrianVolumes;
+
+        public float Get(int edgeIndex, RoadEdge edge) =>
+            RoadEdge.ComputeWalkingTravelTime(edge.Length, edge.WalkingSpeed, _pedestrianVolumes[edgeIndex], edge.PedestrianCapacity);
     }
 
     [ThreadStatic]
@@ -366,7 +386,7 @@ public class RoadGraph
     /// is dequeued (pass -1 for a full tree). An invalid <paramref name="sourceNodeId"/> (negative or out of
     /// range) leaves every node unreachable. Thread-safe for concurrent readers of an unchanging graph.
     /// </summary>
-    private void RunShortestPathSearch<TCost>(int sourceNodeId, int targetNodeId, int maxId, ShortestPathTreeBuffer buffer)
+    private void RunShortestPathSearch<TCost>(int sourceNodeId, int targetNodeId, int maxId, ShortestPathTreeBuffer buffer, TCost cost = default)
         where TCost : struct, IEdgeCost
     {
         buffer.EnsureCapacity(maxId);
@@ -381,7 +401,6 @@ public class RoadGraph
         var pq = _tlsPriorityQueue ??= new PriorityQueue<int, float>(256);
         pq.Clear();
 
-        var cost = default(TCost);
         float[] dist = buffer.Distances;
         dist[sourceNodeId] = 0f;
         pq.Enqueue(sourceNodeId, 0f);
@@ -404,7 +423,7 @@ public class RoadGraph
                 int v = edge.ToId;
                 if (v < 0 || v >= maxId || edge.FromId == -1) continue;
 
-                float newDist = d + cost.Get(edge);
+                float newDist = d + cost.Get(eid, edge);
                 if (newDist < dist[v])
                 {
                     dist[v] = newDist;
@@ -592,6 +611,22 @@ public class RoadGraph
 
         var buffer = QueryBuffer;
         RunShortestPathSearch<WalkingCost>(fromNodeId, toNodeId, maxId, buffer);
+        return ExtractEdgePath(buffer, fromNodeId, toNodeId);
+    }
+
+    /// <summary>
+    /// Shortest walking path whose crowding term uses <paramref name="pedestrianVolumes"/> (indexed by edge id)
+    /// instead of the published <see cref="RoadEdge.PedestrianVolume"/>. Used during traffic assignment.
+    /// </summary>
+    public List<int> GetShortestWalkingPath(int fromNodeId, int toNodeId, float[] pedestrianVolumes)
+    {
+        if (!AdjacencyEdges.ContainsKey(fromNodeId) || !AdjacencyEdges.ContainsKey(toNodeId)) return null;
+
+        int maxId = GetMaxNodeIndex();
+        if (fromNodeId < 0 || toNodeId < 0 || fromNodeId >= maxId || toNodeId >= maxId) return null;
+
+        var buffer = QueryBuffer;
+        RunShortestPathSearch(fromNodeId, toNodeId, maxId, buffer, new WalkingVolumeCost(pedestrianVolumes));
         return ExtractEdgePath(buffer, fromNodeId, toNodeId);
     }
 

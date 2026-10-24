@@ -326,6 +326,10 @@ public class TrafficEngine
     private float[] _msaTransitBoardings = Array.Empty<float>();
     private float[] _msaTransitAlightings = Array.Empty<float>();
     private float[] _msaNodeFlowAccumulator = Array.Empty<float>();
+
+    // Flow state of the running assignment, published to RoadEdge.CurrentVolume/PedestrianVolume at the end
+    private float[] _carVolumes = Array.Empty<float>();
+    private float[] _pedestrianVolumes = Array.Empty<float>();
     private readonly List<int> _msaActiveOrigins = new(256);
     private readonly RoutingSnapshot _msaRouting = new RoutingSnapshot();
     private readonly Dictionary<int, List<(int DestNodeId, float Flow)>> _msaDemandsByOrigin = new(256);
@@ -354,15 +358,20 @@ public class TrafficEngine
     {
         if (tazManager == null || matrix == null || roadGraph == null) return;
 
-        roadGraph.ClearVolumes();
-
         var tazList = tazManager.ActiveZones;
         int k = tazList.Count;
         int edgeCount = roadGraph.Edges.Count;
         int maxNodeId = roadGraph.GetMaxNodeIndex();
-        if (k == 0 || edgeCount == 0 || maxNodeId <= 0) return;
 
         EnsureMsaBuffersCapacity(k, edgeCount, maxNodeId);
+        Array.Clear(_carVolumes, 0, edgeCount);
+        Array.Clear(_pedestrianVolumes, 0, edgeCount);
+
+        if (k == 0 || edgeCount == 0 || maxNodeId <= 0)
+        {
+            PublishVolumes(roadGraph, edgeCount);
+            return;
+        }
 
         Array.Clear(_msaBaseInternalCarVolumes, 0, edgeCount);
         Array.Clear(_msaTransitBoardings, 0, k);
@@ -439,7 +448,7 @@ public class TrafficEngine
                 {
                     if (!roadGraph.WalkingPathCache.TryGetValue((u, v), out var walkEdges))
                     {
-                        walkEdges = roadGraph.GetShortestWalkingPath(u, v);
+                        walkEdges = roadGraph.GetShortestWalkingPath(u, v, _pedestrianVolumes);
                         if (walkEdges != null)
                         {
                             roadGraph.WalkingPathCache[(u, v)] = walkEdges;
@@ -452,7 +461,7 @@ public class TrafficEngine
                         {
                             int eid = walkEdges[w];
                             if (eid >= 0 && eid < edgeCount)
-                                roadGraph.Edges[eid].PedestrianVolume += walkFlow;
+                                _pedestrianVolumes[eid] += walkFlow;
                         }
                     }
                 }
@@ -461,6 +470,7 @@ public class TrafficEngine
 
         if (_msaActiveOrigins.Count == 0)
         {
+            PublishVolumes(roadGraph, edgeCount);
             matrix.UpdateAccessibilityScores(tazManager, roadGraph);
             return;
         }
@@ -473,7 +483,7 @@ public class TrafficEngine
             if (iter > 1)
             {
                 // One compact copy of the graph with travel times under V^(n-1), shared by all origins
-                _msaRouting.Rebuild(roadGraph);
+                _msaRouting.Rebuild(roadGraph, _carVolumes);
                 Parallel.For(0, _msaActiveOrigins.Count, idx =>
                 {
                     int u = _msaActiveOrigins[idx];
@@ -535,10 +545,11 @@ public class TrafficEngine
 
             for (int e = 0; e < edgeCount; e++)
             {
-                var edge = roadGraph.Edges[e];
-                edge.CurrentVolume = keepWeight * edge.CurrentVolume + stepSize * _msaAuxCarVolumes[e];
+                _carVolumes[e] = keepWeight * _carVolumes[e] + stepSize * _msaAuxCarVolumes[e];
             }
         }
+
+        PublishVolumes(roadGraph, edgeCount);
 
         // 5. Final synchronization: update shortest trees, _travelTimes, and LUTI AccessibilityScores using equilibrium volumes V^(n)
         if (iterations > 1)
@@ -570,9 +581,20 @@ public class TrafficEngine
             if (edgeId >= 0 && edgeId < edgeCount)
             {
                 _msaBaseInternalCarVolumes[edgeId] += carPerEdge;
-                roadGraph.Edges[edgeId].CurrentVolume += carPerEdge;
-                roadGraph.Edges[edgeId].PedestrianVolume += pedPerEdge;
+                _carVolumes[edgeId] += carPerEdge;
+                _pedestrianVolumes[edgeId] += pedPerEdge;
             }
+        }
+    }
+
+    /// <summary>Copies the assignment's flow arrays into the road edges (single publish point).</summary>
+    private void PublishVolumes(RoadGraph roadGraph, int edgeCount)
+    {
+        var edges = roadGraph.Edges;
+        for (int e = 0; e < edgeCount; e++)
+        {
+            edges[e].CurrentVolume = _carVolumes[e];
+            edges[e].PedestrianVolume = _pedestrianVolumes[e];
         }
     }
 
@@ -583,6 +605,8 @@ public class TrafficEngine
             int size = Math.Max(edgeCount * 2, 256);
             _msaBaseInternalCarVolumes = new float[size];
             _msaAuxCarVolumes = new float[size];
+            _carVolumes = new float[size];
+            _pedestrianVolumes = new float[size];
         }
         if (_msaTransitBoardings.Length < k)
         {
