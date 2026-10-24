@@ -222,6 +222,7 @@ public class RoadGraph
 
     public void BuildFromGrid(CityGrid grid)
     {
+        BumpTopologyVersion();
         Nodes.Clear();
         Edges.Clear();
         NodeMap.Clear();
@@ -337,11 +338,38 @@ public class RoadGraph
         SpatialIndex.AddEdge(e2, this);
     }
 
+    /// <summary>Snapshot of <see cref="GetMaxNodeIndex"/> and the graph state it was computed for.</summary>
+    private sealed record MaxNodeIndexCache(int TopologyVersion, int NodeMapCount, int AdjacencyCount, int MaxNodeIndex);
+
+    private MaxNodeIndexCache _maxNodeIndexCache;
+
+    /// <summary>
+    /// Incremented by every <see cref="RoadGraph"/> method that adds, removes or splits nodes and edges.
+    /// Direct edits of the public collections do not bump it.
+    /// </summary>
+    public int TopologyVersion { get; private set; }
+
+    private void BumpTopologyVersion() => TopologyVersion++;
+
+    /// <summary>
+    /// Exclusive upper bound of node ids (size for per-node search arrays). Cached per
+    /// <see cref="TopologyVersion"/> and collection sizes, so direct collection edits are still picked up.
+    /// </summary>
     public int GetMaxNodeIndex()
     {
+        var cache = _maxNodeIndexCache;
+        if (cache != null &&
+            cache.TopologyVersion == TopologyVersion &&
+            cache.NodeMapCount == NodeMap.Count &&
+            cache.AdjacencyCount == AdjacencyEdges.Count)
+        {
+            return cache.MaxNodeIndex;
+        }
+
         int maxId = 0;
         foreach (var k in AdjacencyEdges.Keys) if (k >= maxId) maxId = k + 1;
         foreach (var k in NodeMap.Keys) if (k >= maxId) maxId = k + 1;
+        _maxNodeIndexCache = new MaxNodeIndexCache(TopologyVersion, NodeMap.Count, AdjacencyEdges.Count, maxId);
         return maxId;
     }
 
@@ -740,6 +768,7 @@ public class RoadGraph
 
         SpatialIndex.AddNode(node);
         _syncedNodesCount = Nodes.Count;
+        BumpTopologyVersion();
         NodeAdded?.Invoke(node);
         return node;
     }
@@ -818,6 +847,7 @@ public class RoadGraph
         _syncedNodesCount = Nodes.Count;
         _syncedEdgesCount = Edges.Count;
 
+        BumpTopologyVersion();
         EdgeAdded?.Invoke(e1);
         EdgeAdded?.Invoke(e2);
 
@@ -980,6 +1010,7 @@ public class RoadGraph
             if (rightEid != -1) SetBusLaneBidirectional(rightEid, true);
         }
 
+        BumpTopologyVersion();
         EdgeSplit?.Invoke(edgeId, junction);
         if (revId != -1)
         {
@@ -1067,6 +1098,7 @@ public class RoadGraph
         // Invalidate affected path cache entries
         InvalidatePathsWithEdges(eidForward, eidReverse);
 
+        BumpTopologyVersion();
         if (eidForward != -1) EdgeRemoved?.Invoke(eidForward);
         if (eidReverse != -1) EdgeRemoved?.Invoke(eidReverse);
 
@@ -1102,6 +1134,7 @@ public class RoadGraph
 
         SpatialIndex.AddNode(node);
         _syncedNodesCount = Nodes.Count;
+        BumpTopologyVersion();
         NodeAdded?.Invoke(node);
 
         return node;
@@ -1154,7 +1187,8 @@ public class RoadGraph
             AdjacencyEdges.Remove(zoneId);
             SpatialIndex.RemoveNode(zoneId);
             _syncedNodesCount = Nodes.Count;
-            NodeRemoved?.Invoke(zoneId);
+            BumpTopologyVersion();
+        NodeRemoved?.Invoke(zoneId);
             changed = true;
         }
 

@@ -231,4 +231,26 @@ public class ShortestPathCoreTests
 
         Assert.That(actual, Is.EqualTo(expected));
     }
+
+    [Test]
+    public void GetMaxNodeIndex_TracksGraphMethodsAndDirectEdits()
+    {
+        int initial = _graph.GetMaxNodeIndex();
+        Assert.That(initial, Is.EqualTo(_graph.Nodes.Max(n => n.Id) + 1));
+
+        var created = _graph.CreateNode(new Godot.Vector2(5000f, 5000f));
+        Assert.That(_graph.GetMaxNodeIndex(), Is.EqualTo(created.Id + 1));
+
+        // Remove + add keeps both collection counts equal: only the topology version can invalidate
+        int versionBefore = _graph.TopologyVersion;
+        _graph.DetachAndRemoveNode(created.Id);
+        var recreated = _graph.CreateNode(new Godot.Vector2(5100f, 5000f));
+        Assert.That(_graph.TopologyVersion, Is.GreaterThan(versionBefore));
+        Assert.That(_graph.GetMaxNodeIndex(), Is.EqualTo(recreated.Id + 1));
+
+        // Direct collection edit (as some tests and generators do) changes the counts
+        int directId = recreated.Id + 50;
+        _graph.NodeMap[directId] = new RoadNode { Id = directId };
+        Assert.That(_graph.GetMaxNodeIndex(), Is.EqualTo(directId + 1));
+    }
 }
