@@ -1,6 +1,7 @@
 using Godot;
 using System.Collections.Generic;
 using CitySim.Simulation;
+using CitySim.Tools;
 using CitySim.UI;
 
 namespace CitySim.Rendering;
@@ -8,7 +9,7 @@ namespace CitySim.Rendering;
 /// <summary>
 /// Renders interactive visual feedback and previews for road construction and demolition tooling.
 /// </summary>
-public partial class ToolPreviewRenderer : Node2D
+public partial class ToolPreviewRenderer : Node2D, IToolPreview
 {
     private CityGrid _grid;
     private RoadGraph _roadGraph;
@@ -213,11 +214,7 @@ public partial class ToolPreviewRenderer : Node2D
     /// <summary>
     /// Checks whether the specified mode is a zoning or dezoning interaction mode.
     /// </summary>
-    public static bool IsZoningMode(InteractionMode mode) =>
-        mode == InteractionMode.ZoneResidential ||
-        mode == InteractionMode.ZoneCommercial ||
-        mode == InteractionMode.ZoneIndustrial ||
-        mode == InteractionMode.Dezone;
+    public static bool IsZoningMode(InteractionMode mode) => mode.IsZoningMode();
 
     /// <summary>
     /// Configures the active preview for a tool operation.

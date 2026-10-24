@@ -5,33 +5,6 @@ using CitySim.Simulation;
 
 namespace CitySim.UI;
 
-/// <summary>
-/// Determines how mouse clicks on the game map are interpreted.
-/// </summary>
-public enum InteractionMode
-{
-    /// <summary>Click zones to inspect commuters, mode split, and analytics.</summary>
-    Inspect,
-    /// <summary>Click or drag between adjacent grid cells to construct road segments.</summary>
-    BuildRoad,
-    /// <summary>Click an existing road connection to tear it down.</summary>
-    Demolish,
-    /// <summary>Designate empty or existing cells as Residential district.</summary>
-    ZoneResidential,
-    /// <summary>Designate empty or existing cells as Commercial district.</summary>
-    ZoneCommercial,
-    /// <summary>Designate empty or existing cells as Industrial district.</summary>
-    ZoneIndustrial,
-    /// <summary>Clear existing zoned cell back to empty terrain.</summary>
-    Dezone,
-    /// <summary>Design and construct a new public transit route with custom stops.</summary>
-    CreateTransitRoute,
-    /// <summary>Click start, end, and drag/click curvature apex to build curved Bézier roads.</summary>
-    BuildCurvedRoad,
-    /// <summary>Click on an existing road segment to toggle dedicated public transit bus lanes.</summary>
-    ToggleBusLane
-}
-
 public partial class GameUI : CanvasLayer
 {
     [Signal] public delegate void SpeedChangedEventHandler(float speed);
