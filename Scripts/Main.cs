@@ -205,21 +205,6 @@ public partial class Main : Node2D
         _gameUI?.UpdateRouteDesignerStatus(0, 0, false);
     }
 
-    /// <summary>
-    /// Runs the shared road-topology invalidation chain and macro recalculation in the world;
-    /// rendering is refreshed by <see cref="OnTopologyApplied"/>.
-    /// </summary>
-    private TopologyChangeResult ApplyTopologyChange() => _world.ApplyTopologyChange();
-
-    /// <summary>
-    /// Recalculates the macro model and redraws map layers after a non-topological edit (zoning, demand).
-    /// </summary>
-    private void RefreshAfterSimulationEdit()
-    {
-        RecalculateODMatrix();
-        RefreshMapLayers();
-    }
-
     private void RefreshMapLayers()
     {
         _roadRenderer.Refresh();
@@ -270,8 +255,6 @@ public partial class Main : Node2D
         }
     }
     
-    private void RecalculateODMatrix() => _world.RecalculateMacroModel();
-
     private void OnMacroModelRecalculated()
     {
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
@@ -1105,16 +1088,13 @@ public partial class Main : Node2D
         else if (snap.Type == SnapType.Edge && snap.SnappedEdge != null)
         {
             // Mid-road stop insertion: automatically split the edge at the clicked position
-            var newNode = _roadGraph.SplitEdgeAtPoint(snap.SnappedEdge.Id, snap.Position);
-            if (newNode == null)
+            var insertResult = Execute(new InsertTransitStopCommand(snap.SnappedEdge.Id, snap.Position));
+            if (!insertResult.IsApplied)
             {
-                _gameUI.SetToolHint("⚠️ Failed to insert mid-road stop at this position.", Colors.Coral);
+                ShowResult(insertResult);
                 return;
             }
-            stopNodeId = newNode.Id;
-
-            // Rebuild topology and matrices (existing routes through the split edge are re-routed via the new junction)
-            ApplyTopologyChange();
+            stopNodeId = insertResult.EntityId;
         }
         else
         {
@@ -1200,48 +1180,14 @@ public partial class Main : Node2D
 
     private void OnRouteLaunchRequested(string routeName, Color color)
     {
-        if (_draftTransitStops.Count < 2 || _draftTransitPath.Count < 2)
+        var result = Execute(new CreateTransitRouteCommand(routeName, _draftTransitPath, _draftTransitStops, color, _draftIsLoop));
+        if (result.IsApplied)
         {
-            _gameUI.SetToolHint("⚠️ At least 2 stops are required to launch a transit route.", Colors.Coral);
-            return;
+            CancelTransitDraft();
+            _gameUI.SetInteractionMode(InteractionMode.Inspect);
         }
-
-        if (!_economyManager.CanAfford(EconomyManager.TransitRouteBaseCost))
-        {
-            _gameUI.SetToolHint($"⚠️ Insufficient funds! Launching a route costs ${EconomyManager.TransitRouteBaseCost}.", Colors.Coral);
-            return;
-        }
-
-        int optimalFleet = TransitManager.CalculateOptimalFleetSize(_draftTransitPath.Count, _draftIsLoop);
-        var newRoute = _transitManager.CreateRoute(
-            routeName,
-            _draftTransitPath,
-            _draftTransitStops,
-            color,
-            _draftIsLoop,
-            fleetSize: optimalFleet,
-            ticketPrice: 12f
-        );
-
-        // The draft may traverse an edge that was split after it was drafted (mid-road stop insertion)
-        var revalidation = _transitManager.RevalidateRoutes(_roadGraph);
-        if (revalidation.RemovedRouteIds.Contains(newRoute.Id))
-        {
-            _gameUI.UpdateTransitRoutesView();
-            _gameUI.SetToolHint("⚠️ The drafted route no longer follows a connected road. Redraw it.", Colors.Coral);
-            return;
-        }
-
-        _economyManager.Spend(EconomyManager.TransitRouteBaseCost);
-        CancelTransitDraft();
-        _gameUI.SetInteractionMode(InteractionMode.Inspect);
-        RecalculateODMatrix();
         _gameUI.UpdateTransitRoutesView();
-        _vehicleRenderer.QueueRedraw();
-        _roadRenderer.Refresh();
-        _cityRenderer.Refresh();
-
-        _gameUI.SetToolHint($"🎉 Route '{newRoute.Name}' launched with {newRoute.FleetSize} buses! Transit coverage updated.", new Color(0.3f, 1f, 0.5f));
+        ShowResult(result);
     }
 
     private void OnRouteCancelRequested()
@@ -1252,14 +1198,11 @@ public partial class Main : Node2D
 
     private void OnRouteDeleted(int routeId)
     {
-        bool removed = _transitManager.RemoveRoute(routeId);
-        if (removed)
+        var result = Execute(new DeleteTransitRouteCommand(routeId));
+        if (result.IsApplied)
         {
-            RecalculateODMatrix();
             _gameUI.UpdateTransitRoutesView();
-            _vehicleRenderer.QueueRedraw();
-            _roadRenderer.Refresh();
-            _gameUI.SetToolHint("🗑️ Route deleted and fleet decommissioned.", new Color(1f, 0.6f, 0.4f));
         }
+        ShowResult(result);
     }
 }

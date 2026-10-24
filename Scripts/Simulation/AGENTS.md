@@ -13,7 +13,7 @@
 ## Специфічні правила `Scripts/Simulation/`
 - **Zero-GC у розрахунках:** у `OptimizedODMatrix`, `TrafficEngine`, `CarTrafficManager` та `PedestrianManager` перевикористовуй наявні масиви та `ShortestPathTreeBuffer`. Не створюй нових колекцій під час ітерацій MSA або щокадрового `Update()`.
 - **Просторові запити:** для пошуку найближчих вузлів, ребер чи парцелів використовуй `SpatialGridIndex` (`QueryRadius`, `QueryAABB`) із переданим буфером `List<int>`, а не лінійний перебір `Edges` чи `Parcels`.
-- **Криволінійна геометрія:** позицію та дотичну на дорозі обчислюй через `edge.Curve.EvaluatePoint(t)` і `edge.Curve.EvaluateTangent(t)`, а не лінійною інтерполяцією між `FromId` та `ToId`.
+- **Криволінійна геометрія:** позицію та дотичну на дорозі обчислюй через `edge.Curve.Evaluate(t)` і `edge.Curve.GetTangent(t)`, а не лінійною інтерполяцією між `FromId` та `ToId`.
 - **Інвалідація після зміни топології:** єдина точка — `TopologyChangeCoordinator` (підписаний на події `RoadGraph`, прапорець `HasPendingChanges`). Статистику HUD рахуй у `CityStatsSnapshot` на макро-тіку, а не щокадрово.
 - **Мутація ребер графа:** при розбитті ребра (`SplitEdgeAtPoint`) або видаленні дороги перенось/очищуй прив'язані `RoadsideParcel` через `ParcelManager` і викликай `TazManager.MarkDirty()`.
 - **Легасі `ODMatrix.cs`:** залишений виключно для сумісності зі старими тестами. Усі зміни макропопиту, тарифів чи LUTI внось у `OptimizedODMatrix.cs`.
