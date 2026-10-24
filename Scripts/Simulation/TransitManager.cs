@@ -319,6 +319,20 @@ public class TransitVehicle
     }
 }
 
+/// <summary>
+/// Outcome of <see cref="TransitManager.RevalidateRoutes"/> after a road topology change.
+/// </summary>
+public sealed class TransitRevalidationResult
+{
+    /// <summary>Routes whose path was re-routed around split or demolished roads (fleet redeployed).</summary>
+    public List<int> ReroutedRouteIds { get; } = new List<int>();
+
+    /// <summary>Routes removed because they could no longer be connected or kept fewer than 2 stops.</summary>
+    public List<int> RemovedRouteIds { get; } = new List<int>();
+
+    public bool HasChanges => ReroutedRouteIds.Count > 0 || RemovedRouteIds.Count > 0;
+}
+
 public class TransitManager
 {
     public const float DefaultStopShoulderOffset = 8.5f;
@@ -846,6 +860,127 @@ public class TransitManager
         Vehicles.RemoveAll(v => v.RouteId == routeId);
         Routes.Remove(route);
 
+        RemoveOrphanedStops();
+        return true;
+    }
+
+    /// <summary>
+    /// Re-validates every route against the current road topology after roads were built, split or demolished.
+    /// Routes whose path still follows existing edges are left untouched. Broken segments are re-routed along
+    /// the shortest road path; stops whose road node no longer exists are dropped. Routes that cannot be
+    /// re-routed or are left with fewer than 2 stops are removed together with their fleet.
+    /// </summary>
+    public TransitRevalidationResult RevalidateRoutes(RoadGraph graph)
+    {
+        var result = new TransitRevalidationResult();
+        if (graph == null || Routes.Count == 0) return result;
+
+        for (int i = Routes.Count - 1; i >= 0; i--)
+        {
+            var route = Routes[i];
+            if (IsRoutePathValid(route, graph)) continue;
+
+            if (TryRebuildRoutePath(route, graph, out var newPath))
+            {
+                route.PathNodeIds = newPath;
+                route.StopNodeIds.RemoveWhere(stopId => graph.GetNode(stopId) == null);
+                route.UpdatePrefixTravelTimes(graph);
+                DeployRouteVehicles(route, route.FleetSize);
+                result.ReroutedRouteIds.Add(route.Id);
+            }
+            else
+            {
+                Vehicles.RemoveAll(v => v.RouteId == route.Id);
+                Routes.RemoveAt(i);
+                result.RemovedRouteIds.Add(route.Id);
+            }
+        }
+
+        if (result.HasChanges)
+        {
+            RemoveOrphanedStops();
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Returns true when every node of the route exists and each consecutive pair (plus the loop closure)
+    /// is connected by an active directed edge.
+    /// </summary>
+    public static bool IsRoutePathValid(TransitRoute route, RoadGraph graph)
+    {
+        var path = route.PathNodeIds;
+        if (path.Count < 2) return false;
+
+        for (int i = 0; i < path.Count; i++)
+        {
+            if (graph.GetNode(path[i]) == null) return false;
+            if (i > 0 && graph.FindEdgeId(path[i - 1], path[i]) == -1) return false;
+        }
+
+        return !route.IsLoop || graph.FindEdgeId(path[path.Count - 1], path[0]) != -1;
+    }
+
+    private static bool TryRebuildRoutePath(TransitRoute route, RoadGraph graph, out List<int> newPath)
+    {
+        newPath = new List<int>(route.PathNodeIds.Count + 4);
+        int survivingStops = 0;
+        foreach (int stopId in route.StopNodeIds)
+        {
+            if (graph.GetNode(stopId) != null) survivingStops++;
+        }
+        if (survivingStops < 2) return false;
+
+        foreach (int nodeId in route.PathNodeIds)
+        {
+            // Demolished nodes are skipped; the next surviving node is reconnected along the shortest road path
+            if (graph.GetNode(nodeId) == null) continue;
+
+            if (newPath.Count == 0)
+            {
+                newPath.Add(nodeId);
+            }
+            else
+            {
+                int prev = newPath[newPath.Count - 1];
+                if (prev == nodeId) continue;
+                if (!AppendRoadSegment(newPath, prev, nodeId, graph, includeTarget: true)) return false;
+            }
+        }
+
+        if (newPath.Count < 2) return false;
+
+        if (route.IsLoop)
+        {
+            // Loop closure back to the origin is implicit: append only the intermediate nodes
+            if (!AppendRoadSegment(newPath, newPath[newPath.Count - 1], newPath[0], graph, includeTarget: false)) return false;
+        }
+
+        return true;
+    }
+
+    private static bool AppendRoadSegment(List<int> path, int fromId, int toId, RoadGraph graph, bool includeTarget)
+    {
+        if (graph.FindEdgeId(fromId, toId) != -1)
+        {
+            if (includeTarget) path.Add(toId);
+            return true;
+        }
+
+        var segment = graph.GetShortestNodePath(fromId, toId);
+        if (segment == null || segment.Count < 2) return false;
+
+        int end = includeTarget ? segment.Count : segment.Count - 1;
+        for (int k = 1; k < end; k++)
+        {
+            path.Add(segment[k]);
+        }
+        return true;
+    }
+
+    private void RemoveOrphanedStops()
+    {
         // Clean up orphaned stops
         var activeStopNodes = new HashSet<int>();
         foreach (var r in Routes)
@@ -861,8 +996,6 @@ public class TransitManager
         {
             Stops.Remove(k);
         }
-
-        return true;
     }
 
     /// <summary>

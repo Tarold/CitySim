@@ -20,6 +20,8 @@ public partial class Main : Node2D
     private CarTrafficManager _carTrafficManager;
     private PedestrianManager _pedestrianManager;
     private ParcelManager _parcelManager;
+    private TopologyChangeCoordinator _topology;
+    private CityStatsSnapshot _cityStats;
     
     private CityRenderer _cityRenderer;
     private RoadRenderer _roadRenderer;
@@ -116,6 +118,10 @@ public partial class Main : Node2D
         
         _pedestrianManager = new PedestrianManager();
         _pedestrianManager.Initialize(_roadGraph, _grid, _transitManager);
+
+        _topology = new TopologyChangeCoordinator(
+            _roadGraph, _grid, _trafficLights, _parcelManager,
+            _transitManager, _carTrafficManager, _pedestrianManager, _tazManager);
 
         _camera = new Camera2D();
         _camera.Position = new Vector2(672f, 672f);
@@ -227,6 +233,44 @@ public partial class Main : Node2D
         _previewRenderer?.ClearTransitDraft();
         _gameUI?.UpdateRouteDesignerStatus(0, 0, false);
     }
+
+    /// <summary>
+    /// Runs the shared road-topology invalidation chain (see <see cref="TopologyChangeCoordinator"/>),
+    /// then recalculates demand and refreshes rendering.
+    /// </summary>
+    private TopologyChangeResult ApplyTopologyChange()
+    {
+        var result = _topology.ApplyChanges();
+        RefreshAfterSimulationEdit();
+
+        if (result.Transit.HasChanges)
+        {
+            _gameUI.UpdateTransitRoutesView();
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Recalculates the macro model and redraws map layers after a non-topological edit (zoning, demand).
+    /// </summary>
+    private void RefreshAfterSimulationEdit()
+    {
+        RecalculateODMatrix();
+        _roadRenderer.Refresh();
+        _cityRenderer.Refresh();
+        _vehicleRenderer.QueueRedraw();
+    }
+
+    private static string DescribeTransitChanges(TopologyChangeResult result)
+    {
+        var transit = result.Transit;
+        if (!transit.HasChanges) return string.Empty;
+
+        string note = "";
+        if (transit.ReroutedRouteIds.Count > 0) note += $" 🚌 {transit.ReroutedRouteIds.Count} bus route(s) re-routed.";
+        if (transit.RemovedRouteIds.Count > 0) note += $" ⚠️ {transit.RemovedRouteIds.Count} bus route(s) removed (no road path).";
+        return note;
+    }
     
     private void RecalculateODMatrix()
     {
@@ -248,6 +292,7 @@ public partial class Main : Node2D
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
         _carTrafficManager.RefreshBusyEdges(_roadGraph);
         _lastODRecalcHour = _gameHour;
+        _cityStats = CityStatsSnapshot.Capture(_grid, _parcelManager, _optimizedOdMatrix, _trafficEngine, _roadGraph, _transitManager);
 
         // Refresh selected parcel or zone overlay
         if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
@@ -266,6 +311,13 @@ public partial class Main : Node2D
     public override void _Process(double delta)
     {
         float dt = (float)delta;
+
+        // Safety net: graph edits not followed by an explicit ApplyTopologyChange() (e.g. an edge split
+        // while drafting a road) are applied before agents move on stale edges.
+        if (_topology.HasPendingChanges)
+        {
+            ApplyTopologyChange();
+        }
 
         // Realistic clock speed: at 1x speed, 1 real second = 1 game minute (0.01667 hours/sec)
         // 1 full day takes 24 minutes at 1x, 2.4 minutes at 10x, ~29 seconds at 50x.
@@ -305,19 +357,17 @@ public partial class Main : Node2D
         float transitRidership = 0f;
         foreach (var v in _transitManager.Vehicles) transitRidership += v.Passengers;
         
-        // Update HUD
-        int totalPop = _grid.TotalPopulation() + (_parcelManager?.TotalPopulation ?? 0);
-        int totalJobs = _grid.TotalJobs() + (_parcelManager?.TotalJobs ?? 0);
+        // Update HUD from the cached macro-tick snapshot (full scans happen in RecalculateODMatrix)
         _gameUI.UpdateTime(_gameHour, _gameDay);
         _gameUI.UpdateStats(
-            totalPop,
-            _optimizedOdMatrix.TotalTrips,
-            _trafficEngine.GetAverageCongestion(_roadGraph),
+            _cityStats.Population,
+            _cityStats.TotalTrips,
+            _cityStats.AverageCongestion,
             transitRidership,
-            _transitManager.GetTransitCoverage(_grid, _roadGraph, _parcelManager),
+            _cityStats.TransitCoverage,
             ODMatrix.GetDemandMultiplier(_gameHour),
             ODMatrix.GetDirectionalBias(_gameHour),
-            totalJobs
+            _cityStats.Jobs
         );
         
         _gameUI.UpdateEconomy(_economyManager.Money, _economyManager.LastDelta);
@@ -454,6 +504,8 @@ public partial class Main : Node2D
 
             if (uiNeedsUpdate)
             {
+                _cityStats = _cityStats.WithLandUse(_grid, _parcelManager);
+
                 if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
                 {
                     _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _tazManager, _optimizedOdMatrix, _grid);
@@ -1043,22 +1095,13 @@ public partial class Main : Node2D
 
     private void CompleteRoadConstruction()
     {
-        _roadGraph.PathCache.Clear();
-        _roadGraph.WalkingPathCache.Clear();
-        _trafficLights.BuildIntersections(_roadGraph);
-        _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
-        _pedestrianManager.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
-        _parcelManager?.RefreshParcels(_roadGraph);
-        RecalculateODMatrix();
-        _roadRenderer.Refresh();
-        _cityRenderer.Refresh();
-        _vehicleRenderer.QueueRedraw();
+        var topologyResult = ApplyTopologyChange();
 
         _roadBuildStep = 0;
         _roadStartNode = null;
         _roadEndNode = null;
         _previewRenderer.ClearRoadBuildPreview();
-        _gameUI.SetToolHint("✅ Road built successfully! Click to build another.", new Color(0.3f, 1f, 0.5f));
+        _gameUI.SetToolHint("✅ Road built successfully! Click to build another." + DescribeTransitChanges(topologyResult), new Color(0.3f, 1f, 0.5f));
     }
 
     private void HandleDemolishClick(int gx, int gy)
@@ -1103,18 +1146,10 @@ public partial class Main : Node2D
                         {
                             ClearInspectSelection();
                         }
-                        _roadGraph.PathCache.Clear();
-                        _roadGraph.WalkingPathCache.Clear();
-                        _trafficLights.BuildIntersections(_roadGraph);
-                        _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
-                        _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
-                        RecalculateODMatrix();
-                        _cityRenderer.Refresh();
-                        _roadRenderer.Refresh();
-                        _vehicleRenderer.QueueRedraw();
+                        var topologyResult = ApplyTopologyChange();
                         _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
-                        _gameUI.SetToolHint($"💥 Demolished isolated building/node at ({gx}, {gy}).", new Color(1f, 0.4f, 0.3f));
+                        _gameUI.SetToolHint($"💥 Demolished isolated building/node at ({gx}, {gy})." + DescribeTransitChanges(topologyResult), new Color(1f, 0.4f, 0.3f));
                         return;
                     }
                 }
@@ -1189,21 +1224,12 @@ public partial class Main : Node2D
                     _roadGraph.DetachAndRemoveNode(zone.Id);
                 }
 
-                _roadGraph.PathCache.Clear();
-                _roadGraph.WalkingPathCache.Clear();
-                _trafficLights.BuildIntersections(_roadGraph);
-                _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
-                _pedestrianManager.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
-                _parcelManager?.RefreshParcels(_roadGraph);
-                RecalculateODMatrix();
-                _roadRenderer.Refresh();
-                _cityRenderer.Refresh();
-                _vehicleRenderer.QueueRedraw();
+                var topologyResult = ApplyTopologyChange();
 
                 int sx = startZone.GridPos.X;
                 int sy = startZone.GridPos.Y;
                 CancelPendingOperation();
-                _gameUI.SetToolHint($"💥 Road demolished between ({sx}, {sy}) and ({gx}, {gy})! Click to demolish another.", new Color(1f, 0.4f, 0.3f));
+                _gameUI.SetToolHint($"💥 Road demolished between ({sx}, {sy}) and ({gx}, {gy})! Click to demolish another." + DescribeTransitChanges(topologyResult), new Color(1f, 0.4f, 0.3f));
             }
             else
             {
@@ -1252,10 +1278,14 @@ public partial class Main : Node2D
         {
             _economyManager.Spend(EconomyManager.ZoningCost);
             _roadGraph.EnsureNode(zoneId, _grid.GetWorldCenter(zoneId));
-            RecalculateODMatrix();
-            _cityRenderer.Refresh();
-            _roadRenderer.Refresh();
-            _vehicleRenderer.QueueRedraw();
+            if (_topology.HasPendingChanges)
+            {
+                ApplyTopologyChange();
+            }
+            else
+            {
+                RefreshAfterSimulationEdit();
+            }
 
             _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
@@ -1297,8 +1327,7 @@ public partial class Main : Node2D
             if (_roadGraph.GetNode(zoneId) != null && _roadGraph.GetNodeDegree(zoneId) == 0)
             {
                 _roadGraph.DetachAndRemoveNode(zoneId);
-                _trafficLights.BuildIntersections(_roadGraph);
-                _roadRenderer.Refresh();
+                ApplyTopologyChange();
                 _gameUI.SetToolHint($"🧹 Cleared orphan connector dot at ({gx}, {gy}).", new Color(1f, 0.7f, 0.4f));
                 return;
             }
@@ -1320,17 +1349,11 @@ public partial class Main : Node2D
             _roadGraph.DetachAndRemoveNode(zoneId);
         }
 
-        _trafficLights.BuildIntersections(_roadGraph);
-        _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
-        _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
-        RecalculateODMatrix();
-        _cityRenderer.Refresh();
-        _roadRenderer.Refresh();
-        _vehicleRenderer.QueueRedraw();
+        var topologyResult = ApplyTopologyChange();
 
         _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
-        _gameUI.SetToolHint($"🧹 Cleared cell ({gx}, {gy}) back to empty terrain.", new Color(1f, 0.7f, 0.4f));
+        _gameUI.SetToolHint($"🧹 Cleared cell ({gx}, {gy}) back to empty terrain." + DescribeTransitChanges(topologyResult), new Color(1f, 0.7f, 0.4f));
     }
 
     private void HandleRoadsideZoneClick(List<RoadsideParcel> parcels, ParcelSide side, ZoneType type, bool fullSide)
@@ -1460,17 +1483,8 @@ public partial class Main : Node2D
             }
             stopNodeId = newNode.Id;
 
-            // Rebuild topology and matrices
-            _roadGraph.PathCache.Clear();
-            _roadGraph.WalkingPathCache.Clear();
-            _trafficLights.BuildIntersections(_roadGraph);
-            _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
-            _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
-            _parcelManager?.RefreshParcels(_roadGraph);
-            RecalculateODMatrix();
-            _roadRenderer.Refresh();
-            _cityRenderer.Refresh();
-            _vehicleRenderer.QueueRedraw();
+            // Rebuild topology and matrices (existing routes through the split edge are re-routed via the new junction)
+            ApplyTopologyChange();
         }
         else
         {
@@ -1578,6 +1592,15 @@ public partial class Main : Node2D
             fleetSize: optimalFleet,
             ticketPrice: 12f
         );
+
+        // The draft may traverse an edge that was split after it was drafted (mid-road stop insertion)
+        var revalidation = _transitManager.RevalidateRoutes(_roadGraph);
+        if (revalidation.RemovedRouteIds.Contains(newRoute.Id))
+        {
+            _gameUI.UpdateTransitRoutesView();
+            _gameUI.SetToolHint("⚠️ The drafted route no longer follows a connected road. Redraw it.", Colors.Coral);
+            return;
+        }
 
         _economyManager.Spend(EconomyManager.TransitRouteBaseCost);
         CancelTransitDraft();
