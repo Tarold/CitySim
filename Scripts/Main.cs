@@ -969,35 +969,17 @@ public partial class Main : Node2D
             if (validTargets.Count == 0)
             {
                 // If this is an isolated building or orphan node with degree 0, demolish/dezone it directly
-                if (_roadGraph.GetNodeDegree(zone.Id) == 0)
+                if (_selectedZoneId == zone.Id && _roadGraph.GetNodeDegree(zone.Id) == 0)
                 {
-                    bool wasNode = _roadGraph.GetNode(zone.Id) != null;
-                    bool wasZoned = zone.Type != ZoneType.Empty;
-
-                    if (wasNode)
-                    {
-                        _roadGraph.DetachAndRemoveNode(zone.Id);
-                    }
-                    if (wasZoned)
-                    {
-                        _grid.DezoneCell(zone.Id);
-                    }
-
-                    if (wasNode || wasZoned)
-                    {
-                        if (_selectedZoneId == zone.Id)
-                        {
-                            ClearInspectSelection();
-                        }
-                        var topologyResult = ApplyTopologyChange();
-                        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
-
-                        _gameUI.SetToolHint($"💥 Demolished isolated building/node at ({gx}, {gy})." + DescribeTransitChanges(topologyResult), new Color(1f, 0.4f, 0.3f));
-                        return;
-                    }
+                    ClearInspectSelection();
                 }
 
-                _gameUI.SetToolHint($"⚠️ Zone at ({gx}, {gy}) has no road connections to demolish.", Colors.Coral);
+                var isolatedResult = Execute(new DemolishIsolatedCommand(zone.Id));
+                if (isolatedResult.IsApplied)
+                {
+                    _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
+                }
+                ShowResult(isolatedResult);
                 return;
             }
 
@@ -1052,33 +1034,9 @@ public partial class Main : Node2D
             }
 
             // Remove road segment
-            bool removed = _roadGraph.RemoveRoadSegment(_pendingStartZoneId, zone.Id);
-            if (removed)
-            {
-                // If either endpoint is now an empty zone with degree 0, detach and remove it
-                var startZ = _grid.GetZone(_pendingStartZoneId);
-                if (startZ != null && startZ.Type == ZoneType.Empty && _roadGraph.GetNodeDegree(_pendingStartZoneId) == 0)
-                {
-                    _roadGraph.DetachAndRemoveNode(_pendingStartZoneId);
-                }
-                var targetZ = _grid.GetZone(zone.Id);
-                if (targetZ != null && targetZ.Type == ZoneType.Empty && _roadGraph.GetNodeDegree(zone.Id) == 0)
-                {
-                    _roadGraph.DetachAndRemoveNode(zone.Id);
-                }
-
-                var topologyResult = ApplyTopologyChange();
-
-                int sx = startZone.GridPos.X;
-                int sy = startZone.GridPos.Y;
-                CancelPendingOperation();
-                _gameUI.SetToolHint($"💥 Road demolished between ({sx}, {sy}) and ({gx}, {gy})! Click to demolish another." + DescribeTransitChanges(topologyResult), new Color(1f, 0.4f, 0.3f));
-            }
-            else
-            {
-                CancelPendingOperation();
-                _gameUI.SetToolHint("⚠️ Failed to demolish road segment.", Colors.Coral);
-            }
+            var result = Execute(new DemolishRoadCommand(_pendingStartZoneId, zone.Id));
+            CancelPendingOperation();
+            ShowResult(result);
         }
     }
 
