@@ -20,7 +20,7 @@ public enum ParcelSide
 /// Stores geometric boundaries, facade orientation, access points, zoning designation,
 /// and population/employment capacities.
 /// </summary>
-public class RoadsideParcel
+public class RoadsideParcel : ILandUseUnit
 {
     /// <summary>Unique identifier for this parcel.</summary>
     public int Id { get; set; }
@@ -82,6 +82,8 @@ public class RoadsideParcel
 
     /// <summary>Active zoning type for this lot.</summary>
     public ZoneType ZoneType { get; set; } = ZoneType.Empty;
+
+    ZoneType ILandUseUnit.LandUseType => ZoneType;
 
     /// <summary>Current population living in this parcel.</summary>
     public int Population { get; set; }

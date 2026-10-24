@@ -150,6 +150,30 @@ public class EconomyManager
     }
 
     /// <summary>
+    /// Adds one land-use unit's hourly tax: residents for residential units, jobs for commercial/industrial,
+    /// scaled by the congestion/accessibility attractiveness multiplier.
+    /// </summary>
+    private void AccumulateLandUseTax(
+        ILandUseUnit unit, float congestionRatio, float accessibility,
+        ref float baseTaxWithoutPenalty, ref float populationTax, ref float jobTax)
+    {
+        float taxMult = CalculateTaxAttractivenessMultiplier(congestionRatio, accessibility);
+
+        if (unit.LandUseType == ZoneType.Residential)
+        {
+            float baseTax = (unit.Population * TaxPerPopulation) / 24f;
+            baseTaxWithoutPenalty += baseTax;
+            populationTax += baseTax * taxMult;
+        }
+        else if (LandUse.IsWorkplace(unit.LandUseType))
+        {
+            float baseTax = (unit.Jobs * TaxPerJob) / 24f;
+            baseTaxWithoutPenalty += baseTax;
+            jobTax += baseTax * taxMult;
+        }
+    }
+
+    /// <summary>
     /// Processes a periodic financial tick, deducting maintenance costs and adding tax revenues.
     /// Districts blocked in severe congestion (R_congestion &gt; 1.5) suffer reduced tax attractiveness.
     /// </summary>
@@ -222,20 +246,7 @@ public class EconomyManager
                     }
                 }
 
-                float taxMult = CalculateTaxAttractivenessMultiplier(rCong, access);
-
-                if (zone.Type == ZoneType.Residential)
-                {
-                    float baseZ = (zone.Population * TaxPerPopulation) / 24f;
-                    baseTaxWithoutPenalty += baseZ;
-                    popTax += baseZ * taxMult;
-                }
-                else if (zone.Type == ZoneType.Commercial || zone.Type == ZoneType.Industrial)
-                {
-                    float baseZ = (zone.Jobs * TaxPerJob) / 24f;
-                    baseTaxWithoutPenalty += baseZ;
-                    jobTax += baseZ * taxMult;
-                }
+                AccumulateLandUseTax(zone, rCong, access, ref baseTaxWithoutPenalty, ref popTax, ref jobTax);
             }
         }
 
@@ -266,20 +277,7 @@ public class EconomyManager
                     }
                 }
 
-                float taxMult = CalculateTaxAttractivenessMultiplier(rCong, access);
-
-                if (parcel.ZoneType == ZoneType.Residential)
-                {
-                    float baseP = (parcel.Population * TaxPerPopulation) / 24f;
-                    baseTaxWithoutPenalty += baseP;
-                    popTax += baseP * taxMult;
-                }
-                else if (parcel.ZoneType == ZoneType.Commercial || parcel.ZoneType == ZoneType.Industrial)
-                {
-                    float baseP = (parcel.Jobs * TaxPerJob) / 24f;
-                    baseTaxWithoutPenalty += baseP;
-                    jobTax += baseP * taxMult;
-                }
+                AccumulateLandUseTax(parcel, rCong, access, ref baseTaxWithoutPenalty, ref popTax, ref jobTax);
             }
         }
 

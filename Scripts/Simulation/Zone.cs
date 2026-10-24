@@ -14,7 +14,7 @@ public enum DensityLevel
     High = 2
 }
 
-public class Zone
+public class Zone : ILandUseUnit
 {
     public int Id;
     public ZoneType Type;
@@ -31,6 +31,12 @@ public class Zone
     public float LocalCongestion { get; set; } = 0.0f;
     public bool IsStagnant => LocalCongestion > 1.5f;
     
+    ZoneType ILandUseUnit.LandUseType => Type;
+    int ILandUseUnit.Population => Population;
+    int ILandUseUnit.Jobs => Jobs;
+    int ILandUseUnit.ResidentialCap => ResidentialCap;
+    int ILandUseUnit.CommercialCap => CommercialCap;
+
     public Zone(int id, ZoneType type, Vector2I gridPos)
     {
         Id = id;

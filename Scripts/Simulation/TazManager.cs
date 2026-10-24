@@ -99,11 +99,11 @@ public sealed class TazManager
 
             foreach (var zone in taz.Zones)
             {
-                AccumulateTotals(taz, zone.Type, zone.Population, zone.Jobs, zone.ResidentialCap + zone.CommercialCap);
+                AccumulateTotals(taz, zone);
             }
             foreach (var parcel in taz.Parcels)
             {
-                AccumulateTotals(taz, parcel.ZoneType, parcel.Population, parcel.Jobs, parcel.ResidentialCap + parcel.CommercialCap);
+                AccumulateTotals(taz, parcel);
             }
         }
 
@@ -152,15 +152,12 @@ public sealed class TazManager
             foreach (int zoneId in cityGrid.ActiveZoneIds)
             {
                 var zone = cityGrid.GetZone(zoneId);
-                if (zone == null || zone.Type == ZoneType.Empty) continue;
-
-                int cap = zone.ResidentialCap + zone.CommercialCap;
-                if (zone.Population <= 0 && zone.Jobs <= 0 && cap <= 0) continue;
+                if (!LandUse.ContributesToTaz(zone)) continue;
 
                 Vector2 worldPos = cityGrid.GetWorldCenter(zone.Id);
                 var taz = GetOrCreateBucket(worldPos);
                 taz.Zones.Add(zone);
-                AccumulateToTaz(taz, worldPos, zone.Type, zone.Population, zone.Jobs, cap);
+                AccumulateToTaz(taz, worldPos, zone);
             }
         }
 
@@ -169,15 +166,12 @@ public sealed class TazManager
         {
             foreach (var parcel in parcelManager.ActiveParcels)
             {
-                if (parcel == null || parcel.ZoneType == ZoneType.Empty) continue;
-
-                int cap = parcel.ResidentialCap + parcel.CommercialCap;
-                if (parcel.Population <= 0 && parcel.Jobs <= 0 && cap <= 0) continue;
+                if (!LandUse.ContributesToTaz(parcel)) continue;
 
                 Vector2 worldPos = parcel.Center;
                 var taz = GetOrCreateBucket(worldPos);
                 taz.Parcels.Add(parcel);
-                AccumulateToTaz(taz, worldPos, parcel.ZoneType, parcel.Population, parcel.Jobs, cap);
+                AccumulateToTaz(taz, worldPos, parcel);
             }
         }
 
@@ -588,9 +582,7 @@ public sealed class TazManager
         {
             foreach (int zoneId in cityGrid.ActiveZoneIds)
             {
-                var zone = cityGrid.GetZone(zoneId);
-                if (zone == null || zone.Type == ZoneType.Empty) continue;
-                if (zone.Population > 0 || zone.Jobs > 0 || zone.ResidentialCap + zone.CommercialCap > 0) count++;
+                if (LandUse.ContributesToTaz(cityGrid.GetZone(zoneId))) count++;
             }
         }
         if (parcelManager != null)
@@ -598,28 +590,30 @@ public sealed class TazManager
             var parcels = parcelManager.Parcels;
             for (int i = 0; i < parcels.Count; i++)
             {
-                var parcel = parcels[i];
-                if (parcel == null || parcel.ZoneType == ZoneType.Empty) continue;
-                if (parcel.Population > 0 || parcel.Jobs > 0 || parcel.ResidentialCap + parcel.CommercialCap > 0) count++;
+                if (LandUse.ContributesToTaz(parcels[i])) count++;
             }
         }
         return count;
     }
 
-    private static void AccumulateToTaz(
-        TrafficAnalysisZone taz, Vector2 pos, ZoneType type, int pop, int jobs, int capacity)
+    private static void AccumulateToTaz(TrafficAnalysisZone taz, Vector2 pos, ILandUseUnit unit)
     {
-        int activityWeight = pop + jobs;
+        int activityWeight = unit.Population + unit.Jobs;
         if (activityWeight > 0)
         {
             taz.Centroid += pos * activityWeight;
         }
 
-        AccumulateTotals(taz, type, pop, jobs, capacity);
+        AccumulateTotals(taz, unit);
     }
 
-    private static void AccumulateTotals(TrafficAnalysisZone taz, ZoneType type, int pop, int jobs, int capacity)
+    private static void AccumulateTotals(TrafficAnalysisZone taz, ILandUseUnit unit)
     {
+        ZoneType type = unit.LandUseType;
+        int pop = unit.Population;
+        int jobs = unit.Jobs;
+        int capacity = LandUse.TotalCapacity(unit);
+
         taz.TotalPopulation += pop;
         taz.TotalCapacity += capacity;
 
