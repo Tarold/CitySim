@@ -287,6 +287,7 @@ public partial class RoadRenderer : Node2D
     private MeshInstance2D _heatmapMeshInstance;
     private ArrayMesh _heatmapArrayMesh;
     private ShaderMaterial _heatmapShaderMaterial;
+    private TrafficLightOverlay _trafficLightOverlay;
 
     public RoadHeatmapMeshBuffer HeatmapBuffer => _heatmapBuffer;
     public Vector2[] MeshVertices => _heatmapBuffer.MeshVertices;
@@ -298,6 +299,7 @@ public partial class RoadRenderer : Node2D
     public override void _Ready()
     {
         SetupHeatmapMeshInstance();
+        SetupTrafficLightOverlay();
         if (_heatmapBuffer.EnsureSynced())
         {
             UploadHeatmapMeshToGpu();
@@ -313,8 +315,19 @@ public partial class RoadRenderer : Node2D
         if (IsInsideTree())
         {
             SetupHeatmapMeshInstance();
+            SetupTrafficLightOverlay();
             UploadHeatmapMeshToGpu();
         }
+    }
+
+    private void SetupTrafficLightOverlay()
+    {
+        if (_trafficLightOverlay == null)
+        {
+            _trafficLightOverlay = new TrafficLightOverlay { Name = "TrafficLights" };
+            AddChild(_trafficLightOverlay);
+        }
+        _trafficLightOverlay.Initialize(_trafficLights);
     }
 
     private void SetupHeatmapMeshInstance()
@@ -389,13 +402,17 @@ public partial class RoadRenderer : Node2D
         }
     }
 
+    /// <summary>
+    /// Road geometry, markings, junction caps, heatmap dots and congestion labels only change after an edit
+    /// or a macro recalculation, which call <see cref="Refresh"/> / <see cref="UpdateMaxVolume"/> and queue a
+    /// redraw. Animated signal heads are drawn by the <see cref="TrafficLightOverlay"/> child.
+    /// </summary>
     public override void _Process(double delta)
     {
         if (_heatmapBuffer.EnsureSynced())
         {
             UploadHeatmapMeshToGpu();
         }
-        QueueRedraw();
     }
 
     public override void _Draw()
@@ -508,48 +525,6 @@ public partial class RoadRenderer : Node2D
                 {
                     DrawCircle(node.WorldPosition, 3.5f, new Color(0.12f, 0.12f, 0.15f, 0.95f));
                     DrawCircle(node.WorldPosition, 2.8f, new Color(0.22f, 0.22f, 0.26f, 0.95f));
-                }
-            }
-        }
-
-        if (_trafficLights != null)
-        {
-            foreach (var kvp in _trafficLights.Intersections)
-            {
-                var light = kvp.Value;
-                Vector2 pos = light.Position;
-
-                DrawCircle(pos, 3.5f, new Color(0.2f, 0.2f, 0.25f, 0.8f));
-
-                if (light.ApproachSignals != null && light.ApproachSignals.Count > 0)
-                {
-                    foreach (var app in light.ApproachSignals)
-                    {
-                        bool isGreen = app.Phase == 0
-                            ? (light.CurrentState == SignalState.NorthSouthGreen)
-                            : (light.CurrentState == SignalState.EastWestGreen);
-
-                        Color signalColor = isGreen
-                            ? new Color(0.1f, 0.95f, 0.2f)
-                            : new Color(0.95f, 0.15f, 0.15f);
-
-                        DrawCircle(app.Position, 2.2f, signalColor);
-                    }
-                }
-                else
-                {
-                    Color nsColor = light.CurrentState == SignalState.NorthSouthGreen
-                        ? new Color(0.1f, 0.95f, 0.2f)
-                        : new Color(0.95f, 0.15f, 0.15f);
-
-                    Color ewColor = light.CurrentState == SignalState.EastWestGreen
-                        ? new Color(0.1f, 0.95f, 0.2f)
-                        : new Color(0.95f, 0.15f, 0.15f);
-
-                    DrawCircle(pos + new Vector2(0, -9), 2.2f, nsColor);
-                    DrawCircle(pos + new Vector2(0, 9), 2.2f, nsColor);
-                    DrawCircle(pos + new Vector2(-9, 0), 2.2f, ewColor);
-                    DrawCircle(pos + new Vector2(9, 0), 2.2f, ewColor);
                 }
             }
         }
