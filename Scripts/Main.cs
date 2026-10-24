@@ -2,6 +2,7 @@ using Godot;
 using System.Collections.Generic;
 using System.Linq;
 using CitySim.Simulation;
+using CitySim.Simulation.Commands;
 using CitySim.Rendering;
 using CitySim.UI;
 
@@ -225,6 +226,40 @@ public partial class Main : Node2D
         _cityRenderer.Refresh();
         _vehicleRenderer.QueueRedraw();
     }
+
+    /// <summary>
+    /// Executes a player edit on the world. Topology edits refresh the map through
+    /// <see cref="OnTopologyApplied"/>; other applied edits refresh it here. The caller shows the
+    /// result with <see cref="ShowResult"/> after its own UI follow-ups.
+    /// </summary>
+    private CommandResult Execute(IWorldCommand command)
+    {
+        var result = command.Execute(_world);
+        if (result.IsApplied && result.Topology == null)
+        {
+            RefreshMapLayers();
+        }
+        return result;
+    }
+
+    private void ShowResult(CommandResult result)
+    {
+        if (!string.IsNullOrEmpty(result.Message))
+        {
+            _gameUI.SetToolHint(result.Message, GetToneColor(result.Tone));
+        }
+    }
+
+    private static Color GetToneColor(CommandTone tone) => tone switch
+    {
+        CommandTone.Success    => new Color(0.3f, 1f, 0.5f),
+        CommandTone.Demolition => new Color(1f, 0.4f, 0.3f),
+        CommandTone.Clearing   => new Color(1f, 0.7f, 0.4f),
+        CommandTone.Caution    => new Color(1f, 0.8f, 0.4f),
+        CommandTone.Warning    => Colors.Yellow,
+        CommandTone.Error      => Colors.Coral,
+        _                      => Colors.LightGray
+    };
 
     private void OnTopologyApplied(TopologyChangeResult result)
     {
@@ -1066,46 +1101,12 @@ public partial class Main : Node2D
             return;
         }
 
-        int zoneId = _grid.GetZoneId(gx, gy);
-        var zone = _grid.GetZone(zoneId);
-
-        if (zone != null && zone.Type == type)
+        var result = Execute(new ZoneCellCommand(_grid.GetZoneId(gx, gy), type));
+        if (result.IsApplied)
         {
-            _gameUI.SetToolHint($"ℹ️ Cell ({gx}, {gy}) is already zoned as {type}.", Colors.LightGray);
-            return;
-        }
-
-        if (!_economyManager.CanAfford(EconomyManager.ZoningCost))
-        {
-            _gameUI.SetToolHint($"⚠️ Insufficient funds! Zoning costs ${EconomyManager.ZoningCost}.", Colors.Coral);
-            return;
-        }
-
-        bool changed = _grid.ZoneCell(zoneId, type);
-        if (changed)
-        {
-            _economyManager.Spend(EconomyManager.ZoningCost);
-            _roadGraph.EnsureNode(zoneId, _grid.GetWorldCenter(zoneId));
-            if (_world.Topology.HasPendingChanges)
-            {
-                ApplyTopologyChange();
-            }
-            else
-            {
-                RefreshAfterSimulationEdit();
-            }
-
             _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
-
-            string typeName = type switch
-            {
-                ZoneType.Residential => "Residential (🏡)",
-                ZoneType.Commercial  => "Commercial (🏢)",
-                ZoneType.Industrial  => "Industrial (🏭)",
-                _ => type.ToString()
-            };
-            _gameUI.SetToolHint($"✅ Designated cell ({gx}, {gy}) as {typeName}! Click more cells to expand.", new Color(0.3f, 1f, 0.5f));
         }
+        ShowResult(result);
     }
 
     private void HandleDezoneClick(int gx, int gy)
@@ -1129,110 +1130,42 @@ public partial class Main : Node2D
 
         int zoneId = _grid.GetZoneId(gx, gy);
         var zone = _grid.GetZone(zoneId);
-
-        if (zone == null || zone.Type == ZoneType.Empty)
-        {
-            if (_roadGraph.GetNode(zoneId) != null && _roadGraph.GetNodeDegree(zoneId) == 0)
-            {
-                _roadGraph.DetachAndRemoveNode(zoneId);
-                ApplyTopologyChange();
-                _gameUI.SetToolHint($"🧹 Cleared orphan connector dot at ({gx}, {gy}).", new Color(1f, 0.7f, 0.4f));
-                return;
-            }
-            _gameUI.SetToolHint($"ℹ️ Cell ({gx}, {gy}) is already empty terrain.", Colors.LightGray);
-            return;
-        }
-
-        if (_selectedZoneId == zoneId)
+        bool wasZoned = zone != null && zone.Type != ZoneType.Empty;
+        if (wasZoned && _selectedZoneId == zoneId)
         {
             ClearInspectSelection();
         }
 
-        // Dezone the cell
-        _grid.DezoneCell(zoneId);
-
-        // If the associated RoadNode has degree 0 (no road edges attached), detach and remove it
-        if (_roadGraph.GetNode(zoneId) != null && _roadGraph.GetNodeDegree(zoneId) == 0)
+        var result = Execute(new DezoneCellCommand(zoneId));
+        if (result.IsApplied && wasZoned)
         {
-            _roadGraph.DetachAndRemoveNode(zoneId);
+            _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
         }
-
-        var topologyResult = ApplyTopologyChange();
-
-        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
-
-        _gameUI.SetToolHint($"🧹 Cleared cell ({gx}, {gy}) back to empty terrain." + DescribeTransitChanges(topologyResult), new Color(1f, 0.7f, 0.4f));
+        ShowResult(result);
     }
 
     private void HandleRoadsideZoneClick(List<RoadsideParcel> parcels, ParcelSide side, ZoneType type, bool fullSide)
     {
-        var toZone = parcels.Where(p => p.ZoneType != type).ToList();
-        if (toZone.Count == 0)
+        var result = Execute(new ZoneParcelsCommand(parcels, side, type));
+        if (result.IsApplied)
         {
-            _gameUI.SetToolHint($"ℹ️ Selected roadside parcel(s) are already zoned as {type}.", Colors.LightGray);
-            return;
+            _previewRenderer.ClearHoveredParcels();
+            UpdateHoverTarget();
+            _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
         }
-
-        float totalCost = toZone.Count * EconomyManager.ZoningCost;
-        if (!_economyManager.CanAfford(totalCost))
-        {
-            _gameUI.SetToolHint($"⚠️ Insufficient funds! Costs ${totalCost:F0} (${EconomyManager.ZoningCost}/parcel).", Colors.Coral);
-            return;
-        }
-
-        _economyManager.Spend(totalCost);
-        foreach (var p in toZone)
-        {
-            _parcelManager.ZoneParcel(p.Id, type, ensureAccessNode: false);
-        }
-
-        RecalculateODMatrix();
-        _cityRenderer.Refresh();
-        _roadRenderer.Refresh();
-        _previewRenderer.ClearHoveredParcels();
-        UpdateHoverTarget();
-        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
-
-        string sideStr = side == ParcelSide.Left ? "Left" : "Right";
-        string typeName = type switch
-        {
-            ZoneType.Residential => "Residential (🏡)",
-            ZoneType.Commercial  => "Commercial (🏢)",
-            ZoneType.Industrial  => "Industrial (🏭)",
-            _ => type.ToString()
-        };
-
-        string msg = toZone.Count == 1
-            ? $"✅ Zoned roadside lot on {sideStr} side as {typeName} (-${EconomyManager.ZoningCost:F0})!"
-            : $"✅ Zoned {toZone.Count} roadside lots on {sideStr} side as {typeName} (-${totalCost:F0})!";
-        _gameUI.SetToolHint(msg, new Color(0.3f, 1f, 0.5f));
+        ShowResult(result);
     }
 
     private void HandleRoadsideDezoneClick(List<RoadsideParcel> parcels, ParcelSide side, bool fullSide)
     {
-        var toDezone = parcels.Where(p => p.ZoneType != ZoneType.Empty).ToList();
-        if (toDezone.Count == 0)
+        var result = Execute(new DezoneParcelsCommand(parcels, side));
+        if (result.IsApplied)
         {
-            _gameUI.SetToolHint("ℹ️ Selected roadside parcel(s) are already empty.", Colors.LightGray);
-            return;
+            _previewRenderer.ClearHoveredParcels();
+            UpdateHoverTarget();
+            _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
         }
-
-        foreach (var p in toDezone)
-        {
-            _parcelManager.DezoneParcel(p.Id);
-        }
-
-        RecalculateODMatrix();
-        _cityRenderer.Refresh();
-        _previewRenderer.ClearHoveredParcels();
-        UpdateHoverTarget();
-        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
-
-        string sideStr = side == ParcelSide.Left ? "Left" : "Right";
-        string msg = toDezone.Count == 1
-            ? $"🧹 Cleared roadside lot on {sideStr} side back to empty."
-            : $"🧹 Cleared {toDezone.Count} roadside lots on {sideStr} side back to empty.";
-        _gameUI.SetToolHint(msg, new Color(1f, 0.7f, 0.4f));
+        ShowResult(result);
     }
 
     private List<int> GetValidAdjacentTargets(InteractionMode mode, int zoneId)
