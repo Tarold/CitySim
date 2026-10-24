@@ -133,47 +133,6 @@ public class RoadConstructionTests
     }
 
     [Test]
-    public void RebuildAfterTopologyChange_RecalculatesDistanceAndPathCache()
-    {
-        // Setup a 3-node linear graph: A (1,1) -> B (1,2) -> C (1,3)
-        var grid = new CityGrid(5, 5, 64f);
-        int a = grid.GetZoneId(1, 1);
-        int b = grid.GetZoneId(1, 2);
-        int c = grid.GetZoneId(1, 3);
-
-        grid.Zones[a].Type = ZoneType.Residential;
-        grid.Zones[b].Type = ZoneType.Residential;
-        grid.Zones[c].Type = ZoneType.Commercial;
-
-        var graph = new RoadGraph();
-        graph.BuildFromGrid(grid);
-
-        var distances = graph.RebuildAfterTopologyChange(grid.ZoneCount);
-
-        // Distance from A to C should be travel time along A->B->C
-        float initialDist = distances[a, c];
-        Assert.That(initialDist, Is.LessThan(float.MaxValue));
-        Assert.That(graph.PathCache.ContainsKey((a, c)), Is.True);
-        Assert.That(graph.PathCache[(a, c)].Count, Is.EqualTo(2)); // two edges
-
-        // Demolish segment B-C: C becomes disconnected from A
-        graph.RemoveRoadSegment(b, c);
-        var newDistances = graph.RebuildAfterTopologyChange(grid.ZoneCount);
-
-        Assert.That(newDistances[a, c], Is.EqualTo(float.MaxValue));
-        Assert.That(graph.PathCache.ContainsKey((a, c)), Is.False);
-
-        // Reconnect directly with a new road segment A-C
-        bool added = graph.AddRoadSegment(a, c);
-        Assert.That(added, Is.True);
-
-        var reconnectedDistances = graph.RebuildAfterTopologyChange(grid.ZoneCount);
-        Assert.That(reconnectedDistances[a, c], Is.LessThan(float.MaxValue));
-        Assert.That(graph.PathCache.ContainsKey((a, c)), Is.True);
-        Assert.That(graph.PathCache[(a, c)].Count, Is.EqualTo(1)); // direct 1 edge shortcut!
-    }
-
-    [Test]
     public void CarTrafficManager_HandleInvalidatedEdges_SafelyRespawnsVehicles()
     {
         int z1 = _grid.GetZoneId(1, 1);
@@ -297,9 +256,8 @@ public class RoadConstructionTests
         Assert.That(_roadGraph.HasEdge(z1, z2), Is.True);
         Assert.That(_roadGraph.HasEdge(z2, z1), Is.True);
 
-        var distances = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        Assert.That(distances[z1, z2], Is.LessThan(float.MaxValue));
-        Assert.That(_roadGraph.PathCache.ContainsKey((z1, z2)), Is.True);
+        Assert.That(_roadGraph.Dijkstra(z1)[z2], Is.LessThan(float.MaxValue));
+        Assert.That(_roadGraph.GetShortestPath(z1, z2), Is.EqualTo(new[] { _roadGraph.FindEdgeId(z1, z2) }));
     }
 
     [Test]

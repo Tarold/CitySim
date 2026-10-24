@@ -32,7 +32,6 @@ public static class EconomyTestCityGenerator
         roadGraph.Edges.Clear();
         roadGraph.NodeMap.Clear();
         roadGraph.AdjacencyEdges.Clear();
-        roadGraph.PathCache.Clear();
         roadGraph.WalkingPathCache.Clear();
 
         transitManager?.Routes.Clear();

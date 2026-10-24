@@ -133,7 +133,6 @@ public class RoadGraph
     public List<RoadEdge> Edges = new List<RoadEdge>();
     public Dictionary<int, RoadNode> NodeMap = new Dictionary<int, RoadNode>();
     public Dictionary<int, List<int>> AdjacencyEdges = new Dictionary<int, List<int>>();
-    public Dictionary<(int, int), List<int>> PathCache = new Dictionary<(int, int), List<int>>();
     public Dictionary<(int, int), List<int>> WalkingPathCache = new Dictionary<(int, int), List<int>>();
     private readonly Dictionary<int, (int FromId, int ToId, RoadNode Junction)> _splitInfo =
         new Dictionary<int, (int, int, RoadNode)>();
@@ -227,7 +226,6 @@ public class RoadGraph
         Edges.Clear();
         NodeMap.Clear();
         AdjacencyEdges.Clear();
-        PathCache.Clear();
         _splitInfo.Clear();
         _splitReverseEdges.Clear();
         SpatialIndex.ClearNodesAndEdges();
@@ -948,21 +946,6 @@ public class RoadGraph
 
     private void InvalidatePathsWithEdges(int eid1, int eid2)
     {
-        var keysToRemove = new List<(int, int)>();
-        foreach (var kvp in PathCache)
-        {
-            foreach (var pid in kvp.Value)
-            {
-                if (pid == eid1 || (eid2 != -1 && pid == eid2))
-                {
-                    keysToRemove.Add(kvp.Key);
-                    break;
-                }
-            }
-        }
-        foreach (var key in keysToRemove)
-            PathCache.Remove(key);
-
         var walkingKeysToRemove = new List<(int, int)>();
         foreach (var kvp in WalkingPathCache)
         {
@@ -981,7 +964,7 @@ public class RoadGraph
 
     /// <summary>
     /// Removes both directed edges between two zone nodes, cleaning up
-    /// <see cref="AdjacencyEdges"/> and <see cref="PathCache"/>.
+    /// <see cref="AdjacencyEdges"/> and <see cref="WalkingPathCache"/>.
     /// </summary>
     /// <returns><c>true</c> if edges were removed; <c>false</c> otherwise.</returns>
     public bool RemoveRoadSegment(int fromZoneId, int toZoneId)
@@ -1114,20 +1097,11 @@ public class RoadGraph
             SpatialIndex.RemoveNode(zoneId);
             _syncedNodesCount = Nodes.Count;
             BumpTopologyVersion();
-        NodeRemoved?.Invoke(zoneId);
+            NodeRemoved?.Invoke(zoneId);
             changed = true;
         }
 
-        // 4. Invalidate any remaining path cache keys referencing this zone
-        var keysToRemove = new List<(int, int)>();
-        foreach (var key in PathCache.Keys)
-        {
-            if (key.Item1 == zoneId || key.Item2 == zoneId)
-                keysToRemove.Add(key);
-        }
-        foreach (var key in keysToRemove)
-            PathCache.Remove(key);
-
+        // 4. Invalidate any remaining walking path cache keys referencing this zone
         var walkingKeysToRemove = new List<(int, int)>();
         foreach (var key in WalkingPathCache.Keys)
         {

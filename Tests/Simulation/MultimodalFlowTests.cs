@@ -27,7 +27,6 @@ public class MultimodalFlowTests
 
         _roadGraph.AddRoadSegment(_grid.GetZoneId(1, 2), _grid.GetZoneId(2, 2));
         _roadGraph.AddRoadSegment(_grid.GetZoneId(2, 2), _grid.GetZoneId(3, 2));
-        _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
     }
 
     [Test]
@@ -87,7 +86,7 @@ public class MultimodalFlowTests
         int z1 = _grid.GetZoneId(1, 2);
         int z3 = _grid.GetZoneId(3, 2);
 
-        _roadGraph.BuildPathCache(_grid.ZoneCount);
+        FillWalkingPathCache();
         Assert.That(_roadGraph.WalkingPathCache.ContainsKey((z1, z3)), Is.True);
         Assert.That(_roadGraph.WalkingPathCache.ContainsKey((z3, z1)), Is.True);
 
@@ -108,7 +107,7 @@ public class MultimodalFlowTests
         int z2 = _grid.GetZoneId(2, 2);
         int z3 = _grid.GetZoneId(3, 2);
 
-        _roadGraph.BuildPathCache(_grid.ZoneCount);
+        FillWalkingPathCache();
         Assert.That(_roadGraph.WalkingPathCache.ContainsKey((z1, z3)), Is.True);
 
         // Detach central node z2
@@ -119,43 +118,6 @@ public class MultimodalFlowTests
         Assert.That(_roadGraph.WalkingPathCache.ContainsKey((z1, z2)), Is.False);
         Assert.That(_roadGraph.WalkingPathCache.ContainsKey((z2, z3)), Is.False);
         Assert.That(_roadGraph.WalkingPathCache.ContainsKey((z1, z3)), Is.False);
-    }
-
-    [Test]
-    public void TrafficEngine_AssignFlows_AssignsTransitAccessAndEgressLegsToPedestrianVolume()
-    {
-        int zOrigin = _grid.GetZoneId(1, 2);
-        int zTransitStop = _grid.GetZoneId(2, 2);
-        int zDest = _grid.GetZoneId(3, 2);
-
-        _grid.GetZone(zOrigin).Population = 1000;
-        _grid.GetZone(zDest).Type = ZoneType.Commercial;
-        _grid.GetZone(zDest).Jobs = 1000;
-
-        var transitMgr = new TransitManager();
-        var stopNodes = new HashSet<int> { zTransitStop };
-        transitMgr.CreateRoute("Transit Line 1", new List<int> { zTransitStop, zDest }, stopNodes, Colors.SkyBlue, false, fleetSize: 1);
-
-        var od = new ODMatrix(_grid.ZoneCount);
-        od.TransitTrips[zOrigin, zDest] = 45f;
-        od.Trips[zOrigin, zDest] = 45f;
-
-        var engine = new TrafficEngine();
-        engine.AssignFlows(od, _roadGraph, _grid, transitMgr);
-
-        // Access walk leg is from origin (1, 2) to transit stop (2, 2)
-        int accessEdgeId = _roadGraph.FindEdgeId(zOrigin, zTransitStop);
-        Assert.That(accessEdgeId, Is.Not.EqualTo(-1));
-        Assert.That(_roadGraph.Edges[accessEdgeId].PedestrianVolume, Is.GreaterThanOrEqualTo(45f));
-
-        // Egress walk leg is from transit stop (2, 2) to destination (3, 2)
-        int egressEdgeId = _roadGraph.FindEdgeId(zTransitStop, zDest);
-        Assert.That(egressEdgeId, Is.Not.EqualTo(-1));
-        Assert.That(_roadGraph.Edges[egressEdgeId].PedestrianVolume, Is.GreaterThanOrEqualTo(45f));
-
-        // Private car volume on these edges should be 0 because all trips were transit
-        Assert.That(_roadGraph.Edges[accessEdgeId].CurrentVolume, Is.EqualTo(0f));
-        Assert.That(_roadGraph.Edges[egressEdgeId].CurrentVolume, Is.EqualTo(0f));
     }
 
     [Test]
@@ -207,5 +169,19 @@ public class MultimodalFlowTests
         Assert.That(tC, Is.EqualTo(0f).Within(0.001f));
         Assert.That(wC, Is.EqualTo(0f).Within(0.001f));
         Assert.That(cC + tC + wC, Is.EqualTo(100f).Within(0.001f));
+    }
+
+    /// <summary>Caches the shortest walking path for every node pair (as traffic assignment does lazily).</summary>
+    private void FillWalkingPathCache()
+    {
+        foreach (var u in _roadGraph.Nodes)
+        {
+            foreach (var v in _roadGraph.Nodes)
+            {
+                if (u.Id == v.Id) continue;
+                var path = _roadGraph.GetShortestWalkingPath(u.Id, v.Id);
+                if (path != null) _roadGraph.WalkingPathCache[(u.Id, v.Id)] = path;
+            }
+        }
     }
 }

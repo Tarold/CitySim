@@ -192,4 +192,38 @@ public class SimulationWorldTests
 
         Assert.That(_world.Topology.HasPendingChanges, Is.False);
     }
+
+    [Test]
+    public void RecalculateMacroModel_TransitTrips_LoadAccessAndEgressWalkingOntoTazStreets()
+    {
+        _world = SimulationWorld.Create(ScenarioType.Tutorial);
+        _world.RecalculateMacroModel();
+        var zones = _world.Taz.ActiveZones;
+        int k = zones.Count;
+
+        // TAZ with the most transit boardings + alightings
+        int best = -1;
+        float bestTransitLegs = 0f;
+        for (int i = 0; i < k; i++)
+        {
+            float legs = 0f;
+            for (int j = 0; j < k; j++)
+            {
+                legs += _world.OdMatrix.GetTransitTrips(i, j) + _world.OdMatrix.GetTransitTrips(j, i);
+            }
+            if (legs > bestTransitLegs)
+            {
+                bestTransitLegs = legs;
+                best = i;
+            }
+        }
+        Assume.That(best, Is.GreaterThanOrEqualTo(0), "Tutorial city produces transit trips");
+
+        var taz = zones[best];
+        var streets = taz.InternalEdgeIds.Count > 0 ? taz.InternalEdgeIds : _world.RoadGraph.AdjacencyEdges[taz.PrimaryRoadNodeId];
+        float pedestrianVolume = streets.Sum(e => _world.RoadGraph.Edges[e].PedestrianVolume);
+
+        Assert.That(pedestrianVolume, Is.GreaterThanOrEqualTo(bestTransitLegs * 0.99f),
+            "Walking legs to and from transit stops are loaded onto the TAZ's streets");
+    }
 }

@@ -46,7 +46,7 @@ public class DynamicCommuteDestination
 /// <summary>
 /// Dynamic analytics computation for zone-level, parcel-level, and city-wide commute metrics and mode splits.
 /// </summary>
-public static partial class CommuteAnalytics
+public static class CommuteAnalytics
 {
     /// <summary>
     /// Calculates private car and public transit percentage shares from trip counts (legacy 2-mode overload).

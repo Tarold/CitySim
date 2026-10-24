@@ -104,7 +104,6 @@ public class TopologyChangeCoordinatorTests
     [Test]
     public void ApplyChanges_AfterEdit_ClearsCachesPendingFlagAndMarksTazDirty()
     {
-        _graph.PathCache[(Node(2, 4), Node(6, 4))] = new List<int> { 0 };
         _graph.WalkingPathCache[(Node(2, 4), Node(6, 4))] = new List<int> { 0 };
         _tazManager.IsDirty = false;
         _graph.AddRoadSegment(Node(4, 4), Node(4, 5));
@@ -114,7 +113,6 @@ public class TopologyChangeCoordinatorTests
         Assert.That(result.Applied, Is.True);
         Assert.That(_coordinator.HasPendingChanges, Is.False);
         Assert.That(_coordinator.AppliedChangeCount, Is.EqualTo(1));
-        Assert.That(_graph.PathCache, Is.Empty);
         Assert.That(_graph.WalkingPathCache, Is.Empty);
         Assert.That(_tazManager.IsDirty, Is.True);
     }

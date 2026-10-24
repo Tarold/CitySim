@@ -1,6 +1,7 @@
 using Godot;
 using NUnit.Framework;
 using CitySim.Simulation;
+using CitySim.Tests.Simulation;
 using System.Linq;
 
 namespace CitySim.Tests;
@@ -13,7 +14,6 @@ public class GameplayRoutingTests
     private ParcelManager _parcelManager = null!;
     private TransitManager _transitManager = null!;
     private EconomyManager _economyManager = null!;
-    private TrafficEngine _trafficEngine = null!;
 
     [SetUp]
     public void Setup()
@@ -24,7 +24,6 @@ public class GameplayRoutingTests
         _parcelManager.Initialize(_roadGraph);
         _transitManager = new TransitManager();
         _economyManager = new EconomyManager();
-        _trafficEngine = new TrafficEngine();
 
         RoutingTestCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
     }
@@ -51,76 +50,24 @@ public class GameplayRoutingTests
     [Test]
     public void ModalSplit_CalculatesCarTransitAndWalking_AllModesRepresented()
     {
-        float[,] dist = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
-        float[,] walkDist = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
-        _roadGraph.BuildPathCache(_grid.ZoneCount);
+        var (_, od, _) = MacroTestPipeline.Run(_grid, _roadGraph, _parcelManager, _transitManager, ticketFare: 8f, assignFlows: false);
 
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-        var coveredZones = _transitManager.GetCoveredZoneIds(_grid, 3, _roadGraph, _parcelManager);
+        Assert.That(od.TotalTrips, Is.GreaterThan(0f));
+        Assert.That(od.TotalCarTrips, Is.GreaterThan(0f), "Private cars must take trips");
+        Assert.That(od.TotalTransitTrips, Is.GreaterThan(0f), "Transit line must attract commuters");
+        Assert.That(od.TotalWalkTrips, Is.GreaterThan(0f), "Walk corridor must produce walking trips");
 
-        odMatrix.Recalculate(
-            hour: 8.0f,
-            grid: _grid,
-            distances: dist,
-            hasTransit: true,
-            coveredZoneIds: coveredZones,
-            averageTicketPrice: 8.0f,
-            walkingDistances: walkDist,
-            transitManager: _transitManager,
-            parcelManager: _parcelManager,
-            roadGraph: _roadGraph
-        );
-
-        Assert.That(odMatrix.TotalTrips, Is.GreaterThan(0f));
-        Assert.That(odMatrix.TotalCarTrips, Is.GreaterThan(0f), "Private cars must take trips");
-        Assert.That(odMatrix.TotalTransitTrips, Is.GreaterThan(0f), "Transit line must attract commuters");
-        Assert.That(odMatrix.TotalWalkTrips, Is.GreaterThan(0f), "Walk corridor must produce walking trips");
-
-        float sumModes = odMatrix.TotalCarTrips + odMatrix.TotalTransitTrips + odMatrix.TotalWalkTrips;
-        Assert.That(sumModes, Is.EqualTo(odMatrix.TotalTrips).Within(0.01f), "Mode split must sum to total demand");
+        float sumModes = od.TotalCarTrips + od.TotalTransitTrips + od.TotalWalkTrips;
+        Assert.That(sumModes, Is.EqualTo(od.TotalTrips).Within(0.01f * od.TotalTrips), "Mode split must sum to total demand");
     }
 
     [Test]
     public void TransitCatchment_ModeChoiceShift_WhenTicketPriceChanges()
     {
-        float[,] dist = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
-        float[,] walkDist = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
-        _roadGraph.BuildPathCache(_grid.ZoneCount);
-
-        var coveredZones = _transitManager.GetCoveredZoneIds(_grid, 3, _roadGraph, _parcelManager);
-
-        // 1. Inexpensive transit ($2 fare)
-        var odCheap = new ODMatrix(_grid.ZoneCount);
-        odCheap.Recalculate(
-            hour: 8.0f,
-            grid: _grid,
-            distances: dist,
-            hasTransit: true,
-            coveredZoneIds: coveredZones,
-            averageTicketPrice: 2.0f,
-            walkingDistances: walkDist,
-            transitManager: _transitManager,
-            parcelManager: _parcelManager,
-            roadGraph: _roadGraph
-        );
+        var (_, odCheap, _) = MacroTestPipeline.Run(_grid, _roadGraph, _parcelManager, _transitManager, ticketFare: 2f, assignFlows: false);
+        var (_, odExpensive, _) = MacroTestPipeline.Run(_grid, _roadGraph, _parcelManager, _transitManager, ticketFare: 120f, assignFlows: false);
 
         float transitShareCheap = odCheap.TotalTransitTrips / odCheap.TotalTrips;
-
-        // 2. Expensive transit ($120 fare)
-        var odExpensive = new ODMatrix(_grid.ZoneCount);
-        odExpensive.Recalculate(
-            hour: 8.0f,
-            grid: _grid,
-            distances: dist,
-            hasTransit: true,
-            coveredZoneIds: coveredZones,
-            averageTicketPrice: 120.0f,
-            walkingDistances: walkDist,
-            transitManager: _transitManager,
-            parcelManager: _parcelManager,
-            roadGraph: _roadGraph
-        );
-
         float transitShareExpensive = odExpensive.TotalTransitTrips / odExpensive.TotalTrips;
 
         Assert.That(transitShareCheap, Is.GreaterThan(transitShareExpensive),
@@ -130,27 +77,7 @@ public class GameplayRoutingTests
     [Test]
     public void TrafficAssignment_AssignsFlowsAcrossCorridors()
     {
-        float[,] dist = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
-        float[,] walkDist = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
-        _roadGraph.BuildPathCache(_grid.ZoneCount);
-
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-        var coveredZones = _transitManager.GetCoveredZoneIds(_grid, 3, _roadGraph, _parcelManager);
-
-        odMatrix.Recalculate(
-            hour: 8.0f,
-            grid: _grid,
-            distances: dist,
-            hasTransit: true,
-            coveredZoneIds: coveredZones,
-            averageTicketPrice: 8.0f,
-            walkingDistances: walkDist,
-            transitManager: _transitManager,
-            parcelManager: _parcelManager,
-            roadGraph: _roadGraph
-        );
-
-        _trafficEngine.AssignFlows(odMatrix, _roadGraph, _grid, _transitManager);
+        MacroTestPipeline.Run(_grid, _roadGraph, _parcelManager, _transitManager, ticketFare: 8f);
 
         float maxCarVol = _roadGraph.Edges.Max(e => e.CurrentVolume);
         float maxPedVol = _roadGraph.Edges.Max(e => e.PedestrianVolume);
@@ -180,37 +107,26 @@ public class GameplayRoutingTests
     [Test]
     public void ShortDistanceTrips_FavorWalkingOverLongDistanceTrips()
     {
-        float[,] dist = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
-        float[,] walkDist = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
-        _roadGraph.BuildPathCache(_grid.ZoneCount);
+        var (taz, od, _) = MacroTestPipeline.Run(_grid, _roadGraph, _parcelManager, _transitManager, ticketFare: 8f, assignFlows: false);
+        int k = taz.ActiveZones.Count;
 
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-        var coveredZones = _transitManager.GetCoveredZoneIds(_grid, 3, _roadGraph, _parcelManager);
+        var pairs = (from i in Enumerable.Range(0, k)
+                     from j in Enumerable.Range(0, k)
+                     where i != j
+                     let total = od.GetCarTrips(i, j) + od.GetTransitTrips(i, j) + od.GetWalkTrips(i, j)
+                     let time = od.GetTravelTime(i, j)
+                     where total > 0.01f && time < float.MaxValue
+                     orderby time
+                     select (Time: time, Walk: od.GetWalkTrips(i, j), Total: total)).ToList();
+        Assert.That(pairs.Count, Is.GreaterThanOrEqualTo(4), "Need inter-TAZ trips to compare");
 
-        odMatrix.Recalculate(
-            hour: 8.0f,
-            grid: _grid,
-            distances: dist,
-            hasTransit: true,
-            coveredZoneIds: coveredZones,
-            averageTicketPrice: 8.0f,
-            walkingDistances: walkDist,
-            transitManager: _transitManager,
-            parcelManager: _parcelManager,
-            roadGraph: _roadGraph
-        );
+        var shortTrips = pairs.Take(pairs.Count / 3).ToList();
+        var longTrips = pairs.Skip(pairs.Count - pairs.Count / 3).ToList();
 
-        // Find short distance trips (<400m) vs long distance trips (>700m)
-        var shortTrips = odMatrix.DynamicTrips.Where(t => t.NetworkDistance < 400f && t.TotalTrips > 0.01f).ToList();
-        var longTrips = odMatrix.DynamicTrips.Where(t => t.NetworkDistance > 700f && t.TotalTrips > 0.01f).ToList();
-
-        Assert.That(shortTrips.Count, Is.GreaterThan(0), "Short distance trips should exist");
-        Assert.That(longTrips.Count, Is.GreaterThan(0), "Long distance trips should exist");
-
-        float shortWalkFraction = shortTrips.Sum(t => t.WalkTrips) / shortTrips.Sum(t => t.TotalTrips);
-        float longWalkFraction = longTrips.Sum(t => t.WalkTrips) / longTrips.Sum(t => t.TotalTrips);
+        float shortWalkFraction = shortTrips.Sum(t => t.Walk) / shortTrips.Sum(t => t.Total);
+        float longWalkFraction = longTrips.Sum(t => t.Walk) / longTrips.Sum(t => t.Total);
 
         Assert.That(shortWalkFraction, Is.GreaterThan(longWalkFraction),
-            "Short distance trips (<400m) must have significantly higher walking proportion than long-distance trips");
+            "The shortest third of TAZ pairs must have a higher walking share than the longest third");
     }
 }

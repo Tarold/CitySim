@@ -51,7 +51,6 @@ public class TazClusteringAndOptimizedODTests
 
         _graph.AddRoadSegment(n1, n2);
         _graph.AddRoadSegment(n2, n3);
-        _graph.RebuildAfterTopologyChange(_grid.ZoneCount);
 
         _tazManager.Rebuild(_grid, _parcelManager, _graph, _transitManager);
 
@@ -75,7 +74,6 @@ public class TazClusteringAndOptimizedODTests
         _grid.ZoneCell(2, 2, ZoneType.Residential, population: 0);
         int n1 = _grid.GetZoneId(2, 2);
         _graph.EnsureNode(n1, _grid.GetWorldCenter(n1));
-        _graph.RebuildAfterTopologyChange(_grid.ZoneCount);
 
         _tazManager.Rebuild(_grid, _parcelManager, _graph, _transitManager);
 
@@ -95,7 +93,6 @@ public class TazClusteringAndOptimizedODTests
 
         _graph.AddRoadSegment(nodeA.Id, nodeB.Id);
         _graph.AddRoadSegment(nodeB.Id, nodeC.Id);
-        _graph.RebuildAfterTopologyChange(100);
 
         var (distances, parentEdges, parentNodes) = _graph.DijkstraWithPredecessors(nodeA.Id);
 
@@ -116,7 +113,6 @@ public class TazClusteringAndOptimizedODTests
         var n3 = _graph.CreateNode(new Vector2(400, 50));
         _graph.AddRoadSegment(n1.Id, n2.Id);
         _graph.AddRoadSegment(n2.Id, n3.Id);
-        _graph.RebuildAfterTopologyChange(100);
 
         _grid.ZoneCell(0, 0, ZoneType.Residential);
         _grid.Zones[_grid.GetZoneId(0, 0)].Population = 300;
@@ -152,7 +148,6 @@ public class TazClusteringAndOptimizedODTests
         var nA = _graph.CreateNode(new Vector2(50, 50));
         var nB = _graph.CreateNode(new Vector2(350, 50));
         _graph.AddRoadSegment(nA.Id, nB.Id);
-        _graph.RebuildAfterTopologyChange(100);
 
         _grid.ZoneCell(0, 0, ZoneType.Residential);
         _grid.Zones[_grid.GetZoneId(0, 0)].Population = 1000;
@@ -181,7 +176,6 @@ public class TazClusteringAndOptimizedODTests
         var nA = _graph.CreateNode(new Vector2(50, 50));
         var nB = _graph.CreateNode(new Vector2(100, 50));
         _graph.AddRoadSegment(nA.Id, nB.Id);
-        _graph.RebuildAfterTopologyChange(100);
 
         _grid.ZoneCell(1, 1, ZoneType.Residential);
         _grid.Zones[_grid.GetZoneId(1, 1)].Population = 800;
@@ -222,7 +216,6 @@ public class TazClusteringAndOptimizedODTests
         _graph.AddRoadSegment(nA.Id, nB.Id, 5f);
         _graph.AddRoadSegment(nA.Id, nC.Id, 20f);
         _graph.AddRoadSegment(nC.Id, nB.Id, 20f);
-        _graph.RebuildAfterTopologyChange(100);
 
         int eDirect = _graph.FindEdgeId(nA.Id, nB.Id);
         int eBypass1 = _graph.FindEdgeId(nA.Id, nC.Id);
@@ -256,7 +249,6 @@ public class TazClusteringAndOptimizedODTests
         var nC = _graph.CreateNode(new Vector2(200, 0));
         _graph.AddRoadSegment(nA.Id, nB.Id);
         _graph.AddRoadSegment(nB.Id, nC.Id);
-        _graph.RebuildAfterTopologyChange(100);
 
         _grid.ZoneCell(0, 0, ZoneType.Residential);
         _grid.Zones[_grid.GetZoneId(0, 0)].Population = 1000;
@@ -305,7 +297,6 @@ public class TazClusteringAndOptimizedODTests
         _graph.AddRoadSegment(zRes1Id, zRes2Id);
         _graph.AddRoadSegment(zRes2Id, zComId);
         _graph.AddRoadSegment(zComId, zIndId);
-        _graph.RebuildAfterTopologyChange(_grid.ZoneCount);
 
         _parcelManager.RefreshParcels(_graph);
         var resParcel = _parcelManager.Parcels.First(p => p.Center.X < 200f);
@@ -382,7 +373,6 @@ public class TazClusteringAndOptimizedODTests
 
         _graph.AddRoadSegment(zResId, zMidId);
         _graph.AddRoadSegment(zMidId, zComId);
-        _graph.RebuildAfterTopologyChange(_grid.ZoneCount);
 
         _parcelManager.RefreshParcels(_graph);
         var resParcel = _parcelManager.Parcels.First(p => p.Center.X < 200f);
@@ -419,7 +409,6 @@ public class TazClusteringAndOptimizedODTests
         _graph.AddRoadSegment(n0.Id, n1.Id);
         _graph.AddRoadSegment(n1.Id, n2.Id);
         _graph.AddRoadSegment(nIso1.Id, nIso2.Id);
-        _graph.RebuildAfterTopologyChange(_grid.ZoneCount);
 
         _grid.ZoneCell(0, 0, ZoneType.Residential);
         _grid.Zones[_grid.GetZoneId(0, 0)].Population = 2000;

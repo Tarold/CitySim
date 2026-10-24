@@ -92,7 +92,6 @@ public sealed class TopologyChangeCoordinator : IDisposable
     /// </summary>
     public TopologyChangeResult ApplyChanges()
     {
-        _roadGraph.PathCache.Clear();
         _roadGraph.WalkingPathCache.Clear();
         _roadGraph.EnsureSpatialIndexSynced();
 

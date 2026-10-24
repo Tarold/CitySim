@@ -2,6 +2,7 @@ using Godot;
 using NUnit.Framework;
 using System.Collections.Generic;
 using CitySim.Simulation;
+using CitySim.Tests.Simulation;
 using CitySim.Rendering;
 using CitySim.UI;
 
@@ -194,61 +195,6 @@ public class ZoningAndExpansionTests
     }
 
     [Test]
-    public void ODMatrix_Recalculate_WithNewlyZonedResidentialAndCommercial_GeneratesCommuteTrips()
-    {
-        int rId = _grid.GetZoneId(1, 1);
-        int cId = _grid.GetZoneId(1, 2);
-
-        _grid.ZoneCell(1, 1, ZoneType.Residential); int _zId = _grid.GetZoneId(1, 1); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
-        _grid.ZoneCell(1, 2, ZoneType.Commercial);
-
-        _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
-        _roadGraph.EnsureNode(cId, _grid.GetWorldCenter(cId));
-        _roadGraph.AddRoadSegment(rId, cId);
-
-        var distances = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        Assert.That(distances[rId, cId], Is.LessThan(float.MaxValue));
-
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false); // Morning rush
-
-        // Tripmaking should occur from Residential to Commercial
-        Assert.That(odMatrix.Trips[rId, cId], Is.GreaterThan(0f));
-        Assert.That(odMatrix.TotalTrips, Is.GreaterThan(0f));
-        Assert.That(odMatrix.CarTrips[rId, cId], Is.GreaterThan(0f));
-    }
-
-    [Test]
-    public void ODMatrix_Recalculate_AfterDezoning_CleansUpTrips()
-    {
-        int rId = _grid.GetZoneId(1, 1);
-        int cId = _grid.GetZoneId(1, 2);
-
-        _grid.ZoneCell(1, 1, ZoneType.Residential); int _zId = _grid.GetZoneId(1, 1); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
-        _grid.ZoneCell(1, 2, ZoneType.Commercial);
-
-        _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
-        _roadGraph.EnsureNode(cId, _grid.GetWorldCenter(cId));
-        _roadGraph.AddRoadSegment(rId, cId);
-
-        var distances = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false);
-
-        Assert.That(odMatrix.TotalTrips, Is.GreaterThan(0f));
-
-        // Now dezone residential
-        _grid.DezoneCell(1, 1);
-        _roadGraph.DetachAndRemoveNode(rId);
-        distances = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-
-        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false);
-
-        Assert.That(odMatrix.Trips[rId, cId], Is.EqualTo(0f));
-        Assert.That(odMatrix.TotalTrips, Is.EqualTo(0f));
-    }
-
-    [Test]
     public void Zoning_BoundsChecking_SafeHandling()
     {
         Assert.That(_grid.ZoneCell(-1, 0, ZoneType.Residential), Is.False);
@@ -273,37 +219,6 @@ public class ZoningAndExpansionTests
         Assert.That(ToolPreviewRenderer.IsZoningMode(InteractionMode.Inspect), Is.False);
         Assert.That(ToolPreviewRenderer.IsZoningMode(InteractionMode.BuildRoad), Is.False);
         Assert.That(ToolPreviewRenderer.IsZoningMode(InteractionMode.Demolish), Is.False);
-    }
-
-    [Test]
-    public void TrafficEngine_AssignFlows_AfterExpansion_PopulatesVolumes()
-    {
-        int rId = _grid.GetZoneId(2, 2);
-        int cId = _grid.GetZoneId(2, 3);
-
-        _grid.ZoneCell(2, 2, ZoneType.Residential); int _zId = _grid.GetZoneId(2, 2); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
-        _grid.ZoneCell(2, 3, ZoneType.Commercial);
-
-        _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
-        _roadGraph.EnsureNode(cId, _grid.GetWorldCenter(cId));
-        _roadGraph.AddRoadSegment(rId, cId);
-
-        var distances = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false);
-
-        var trafficEngine = new TrafficEngine();
-        trafficEngine.AssignFlows(odMatrix, _roadGraph, _grid);
-
-        int edgeId = _roadGraph.FindEdgeId(rId, cId);
-        Assert.That(edgeId, Is.Not.EqualTo(-1));
-        Assert.That(_roadGraph.Edges[edgeId].CurrentVolume, Is.GreaterThan(0f));
-
-        float maxVol = trafficEngine.GetMaxVolume(_roadGraph);
-        Assert.That(maxVol, Is.GreaterThan(0f));
-
-        float avgCong = trafficEngine.GetAverageCongestion(_roadGraph);
-        Assert.That(avgCong, Is.GreaterThan(0f));
     }
 
     [Test]
@@ -340,34 +255,6 @@ public class ZoningAndExpansionTests
         var lights = new TrafficLightManager();
         lights.BuildIntersections(_roadGraph);
         Assert.DoesNotThrow(() => carMgr.Update(0.1f, 1.0f, _roadGraph, lights));
-    }
-
-    [Test]
-    public void Rezone_ConnectedCell_UpdatesODTripsDirectionAndDemand()
-    {
-        int rId = _grid.GetZoneId(3, 3);
-        int cId = _grid.GetZoneId(3, 4);
-
-        _grid.ZoneCell(3, 3, ZoneType.Residential); int _zId = _grid.GetZoneId(3, 3); _grid.Zones[_zId].Population = _grid.Zones[_zId].ResidentialCap;
-        _grid.ZoneCell(3, 4, ZoneType.Commercial);
-
-        _roadGraph.EnsureNode(rId, _grid.GetWorldCenter(rId));
-        _roadGraph.EnsureNode(cId, _grid.GetWorldCenter(cId));
-        _roadGraph.AddRoadSegment(rId, cId);
-
-        var distances = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false);
-
-        float initialTrips = odMatrix.Trips[rId, cId];
-        Assert.That(initialTrips, Is.GreaterThan(0f));
-
-        // Rezone commercial to industrial
-        _grid.ZoneCell(3, 4, ZoneType.Industrial);
-        odMatrix.Recalculate(8.0f, _grid, distances, hasTransit: false);
-
-        Assert.That(_grid.GetZone(cId).Type, Is.EqualTo(ZoneType.Industrial));
-        Assert.That(odMatrix.Trips[rId, cId], Is.GreaterThan(0f));
     }
 
     [Test]
@@ -437,5 +324,83 @@ public class ZoningAndExpansionTests
         Assert.That(_roadGraph.GetNodeDegree(z2), Is.EqualTo(0));
         Assert.That(_roadGraph.GetNodeDegree(z3), Is.EqualTo(0));
     }
-}
 
+    /// <summary>
+    /// Residential cell (1,y) and commercial cell (6,y) in different 320 px TAZ buckets, joined by a road
+    /// corridor through the cells in between.
+    /// </summary>
+    private (int ResidentialId, int CommercialId) BuildCommuteCorridor(int y)
+    {
+        _grid.ZoneCell(1, y, ZoneType.Residential);
+        int rId = _grid.GetZoneId(1, y);
+        _grid.Zones[rId].Population = _grid.Zones[rId].ResidentialCap;
+        _grid.ZoneCell(6, y, ZoneType.Commercial);
+        int cId = _grid.GetZoneId(6, y);
+
+        for (int x = 1; x <= 6; x++)
+        {
+            int id = _grid.GetZoneId(x, y);
+            _roadGraph.EnsureNode(id, _grid.GetWorldCenter(id));
+            if (x > 1) _roadGraph.AddRoadSegment(_grid.GetZoneId(x - 1, y), id);
+        }
+        return (rId, cId);
+    }
+
+    private static float CarTripsBetween(TazManager taz, OptimizedODMatrix od, Vector2I from, Vector2I to)
+    {
+        int i = taz.GetTazIdForZoneTile(from);
+        int j = taz.GetTazIdForZoneTile(to);
+        return i < 0 || j < 0 ? 0f : od.GetCarTrips(i, j);
+    }
+
+    [Test]
+    public void MacroModel_NewlyZonedResidentialAndCommercial_GeneratesCommuteTrips()
+    {
+        var (rId, cId) = BuildCommuteCorridor(1);
+
+        var (taz, od, _) = MacroTestPipeline.Run(_grid, _roadGraph, assignFlows: false);
+
+        Assert.That(od.TotalTrips, Is.GreaterThan(0f));
+        Assert.That(CarTripsBetween(taz, od, _grid.GetZone(rId).GridPos, _grid.GetZone(cId).GridPos), Is.GreaterThan(0f),
+            "Morning commuters drive from the residential TAZ to the commercial TAZ");
+    }
+
+    [Test]
+    public void MacroModel_AfterDezoningResidential_RemovesItsTrips()
+    {
+        var (rId, cId) = BuildCommuteCorridor(1);
+        var (_, before, _) = MacroTestPipeline.Run(_grid, _roadGraph, assignFlows: false);
+
+        _grid.DezoneCell(rId);
+        var (taz, after, _) = MacroTestPipeline.Run(_grid, _roadGraph, assignFlows: false);
+
+        Assert.That(taz.GetTazIdForZoneTile(_grid.GetZone(rId).GridPos), Is.EqualTo(-1), "Empty cell no longer forms a TAZ");
+        Assert.That(after.TotalTrips, Is.LessThan(before.TotalTrips));
+        Assert.That(after.TotalCarTrips, Is.LessThan(before.TotalCarTrips));
+    }
+
+    [Test]
+    public void MacroModel_AfterExpansion_AssignsVolumeToCorridor()
+    {
+        var (rId, _) = BuildCommuteCorridor(2);
+
+        MacroTestPipeline.Run(_grid, _roadGraph);
+
+        int firstLeg = _roadGraph.FindEdgeId(rId, _grid.GetZoneId(2, 2));
+        Assert.That(firstLeg, Is.Not.EqualTo(-1));
+        Assert.That(_roadGraph.Edges[firstLeg].CurrentVolume, Is.GreaterThan(0f));
+    }
+
+    [Test]
+    public void MacroModel_RezoneCommercialToIndustrial_KeepsCommuteDemand()
+    {
+        var (rId, cId) = BuildCommuteCorridor(3);
+        MacroTestPipeline.Run(_grid, _roadGraph, assignFlows: false);
+
+        _grid.ZoneCell(cId, ZoneType.Industrial);
+        var (taz, od, _) = MacroTestPipeline.Run(_grid, _roadGraph, assignFlows: false);
+
+        Assert.That(_grid.GetZone(cId).Type, Is.EqualTo(ZoneType.Industrial));
+        Assert.That(CarTripsBetween(taz, od, _grid.GetZone(rId).GridPos, _grid.GetZone(cId).GridPos), Is.GreaterThan(0f));
+    }
+}

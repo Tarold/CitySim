@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using CitySim.Simulation;
 using CitySim.UI;
+using CitySim.Tests.Simulation;
 
 namespace CitySim.Tests;
 
@@ -37,7 +38,6 @@ public class TransitDesignerTests
             _roadGraph.AddRoadSegment(z1, z2);
         }
 
-        _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
         _trafficLights.BuildIntersections(_roadGraph);
     }
 
@@ -153,7 +153,6 @@ public class TransitDesignerTests
         _roadGraph.AddRoadSegment(n1, n2);
         _roadGraph.AddRoadSegment(n2, n3);
         _roadGraph.AddRoadSegment(n3, n0);
-        _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
 
         var pathNodes = new List<int> { n0, n1, n2, n3 };
         var stopNodes = new HashSet<int> { n0, n2 };
@@ -297,50 +296,6 @@ public class TransitDesignerTests
         bool priceChanged = _transitManager.SetRouteTicketPrice(route.Id, 20f);
         Assert.That(priceChanged, Is.True);
         Assert.That(route.TicketPrice, Is.EqualTo(20f));
-    }
-
-    [Test]
-    public void DynamicTransitCoverage_ExpandsCoverageAndShiftsODModeSplit()
-    {
-        int zOrigin = _grid.GetZoneId(2, 4);
-        int zDest = _grid.GetZoneId(6, 4);
-
-        // Populate zones
-        _grid.GetZone(zOrigin).Population = 10000;
-        _grid.GetZone(zDest).Jobs = 8000;
-        _grid.GetZone(zDest).Type = ZoneType.Commercial;
-
-        var distMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        var odMatrix = new ODMatrix(_grid.ZoneCount);
-
-        // Before transit route: 0 coverage, 100% car trips
-        var initialCovered = _transitManager.GetCoveredZoneIds(_grid);
-        Assert.That(initialCovered.Count, Is.EqualTo(0));
-
-        odMatrix.Recalculate(8f, _grid, distMatrix, hasTransit: false, coveredZoneIds: initialCovered);
-        Assert.That(odMatrix.Trips[zOrigin, zDest], Is.GreaterThan(0f));
-        Assert.That(odMatrix.TransitTrips[zOrigin, zDest], Is.EqualTo(0f));
-        Assert.That(odMatrix.CarTrips[zOrigin, zDest] + odMatrix.WalkTrips[zOrigin, zDest], Is.EqualTo(odMatrix.Trips[zOrigin, zDest]).Within(0.01f));
-
-        // Create route covering both origin and destination
-        var path = _roadGraph.GetShortestNodePath(zOrigin, zDest);
-        _transitManager.CreateRoute("Commute Express", path, new HashSet<int> { zOrigin, zDest }, Colors.Yellow, false, fleetSize: 4);
-
-        var coveredAfter = _transitManager.GetCoveredZoneIds(_grid, maxDistance: 3);
-        Assert.That(coveredAfter.Contains(zOrigin), Is.True);
-        Assert.That(coveredAfter.Contains(zDest), Is.True);
-
-        float coverageRatio = _transitManager.GetTransitCoverage(_grid);
-        Assert.That(coverageRatio, Is.GreaterThan(0f));
-
-        // Recalculate with covered zones: mode split uses dynamic 3-mode choice model
-        odMatrix.Recalculate(8f, _grid, distMatrix, hasTransit: true, coveredZoneIds: coveredAfter);
-        float totalTrips = odMatrix.Trips[zOrigin, zDest];
-        
-        Assert.That(odMatrix.TransitTrips[zOrigin, zDest], Is.GreaterThan(0f));
-        Assert.That(odMatrix.TransitTrips[zOrigin, zDest] + odMatrix.CarTrips[zOrigin, zDest] + odMatrix.WalkTrips[zOrigin, zDest], 
-            Is.EqualTo(totalTrips).Within(0.01f));
-        Assert.That(odMatrix.TransitTrips[zOrigin, zDest] / totalTrips, Is.GreaterThan(0.05f));
     }
 
     [Test]
@@ -650,5 +605,45 @@ public class TransitDesignerTests
 
         Assert.That(transitTripsWithBusLane, Is.GreaterThan(transitTripsWithoutBusLane * 1.25f),
             "Dedicated Bus Lanes on a congested corridor must significantly shift commuters from cars to public transit");
+    }
+
+    [Test]
+    public void DynamicTransitCoverage_ExpandsCoverageAndShiftsODModeSplit()
+    {
+        int zOrigin = _grid.GetZoneId(2, 4);
+        int zDest = _grid.GetZoneId(6, 4);
+
+        // Populate zones (different 320 px TAZ buckets)
+        _grid.GetZone(zOrigin).Population = 10000;
+        _grid.GetZone(zDest).Jobs = 8000;
+        _grid.GetZone(zDest).Type = ZoneType.Commercial;
+
+        // Before transit route: no coverage, no transit trips between the two TAZs
+        Assert.That(_transitManager.GetCoveredZoneIds(_grid).Count, Is.EqualTo(0));
+        var (tazBefore, odBefore, _) = MacroTestPipeline.Run(_grid, _roadGraph, transit: _transitManager, assignFlows: false);
+        int i = tazBefore.GetTazIdForZoneTile(_grid.GetZone(zOrigin).GridPos);
+        int j = tazBefore.GetTazIdForZoneTile(_grid.GetZone(zDest).GridPos);
+        Assert.That(i, Is.Not.EqualTo(j));
+        Assert.That(odBefore.GetCarTrips(i, j) + odBefore.GetWalkTrips(i, j), Is.GreaterThan(0f));
+        Assert.That(odBefore.GetTransitTrips(i, j), Is.EqualTo(0f));
+
+        // Create route covering both origin and destination
+        var path = _roadGraph.GetShortestNodePath(zOrigin, zDest);
+        _transitManager.CreateRoute("Commute Express", path, new HashSet<int> { zOrigin, zDest }, Colors.Yellow, false, fleetSize: 4);
+
+        var coveredAfter = _transitManager.GetCoveredZoneIds(_grid, maxDistance: 3);
+        Assert.That(coveredAfter.Contains(zOrigin), Is.True);
+        Assert.That(coveredAfter.Contains(zDest), Is.True);
+        Assert.That(_transitManager.GetTransitCoverage(_grid), Is.GreaterThan(0f));
+
+        // Mode split now includes transit for the covered pair
+        var (taz, od, _) = MacroTestPipeline.Run(_grid, _roadGraph, transit: _transitManager, assignFlows: false);
+        i = taz.GetTazIdForZoneTile(_grid.GetZone(zOrigin).GridPos);
+        j = taz.GetTazIdForZoneTile(_grid.GetZone(zDest).GridPos);
+        float transit = od.GetTransitTrips(i, j);
+        float total = transit + od.GetCarTrips(i, j) + od.GetWalkTrips(i, j);
+
+        Assert.That(transit, Is.GreaterThan(0f));
+        Assert.That(transit / total, Is.GreaterThan(0.05f));
     }
 }
