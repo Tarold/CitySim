@@ -616,22 +616,12 @@ public partial class Main : Node2D
             }
         }
 
-        if (targetEdge == null)
+        var result = Execute(new ToggleBusLaneCommand(targetEdge?.Id ?? -1));
+        if (result.IsApplied)
         {
-            _gameUI.SetToolHint("⚠️ Клікніть безпосередньо на сегмент дороги, щоб перемкнути виділену смугу ГТ.", Colors.Coral);
-            return;
+            UpdateHoverTarget();
         }
-
-        bool enabled = _roadGraph.ToggleBusLaneBidirectional(targetEdge.Id);
-        RecalculateODMatrix();
-        _roadRenderer.Refresh();
-        _vehicleRenderer.QueueRedraw();
-        UpdateHoverTarget();
-
-        string stateMsg = enabled
-            ? $"✅ Виділену смугу ГТ УВІМКНЕНО на дорозі #{targetEdge.Id}! Автобуси ігнорують затори (ємність авто: {targetEdge.Capacity:F0})."
-            : $"🔄 Виділену смугу ГТ ВИМКНЕНО на дорозі #{targetEdge.Id}. Повну ємність для авто відновлено ({targetEdge.Capacity:F0}).";
-        _gameUI.SetToolHint(stateMsg, enabled ? new Color(0.3f, 1.0f, 0.5f) : new Color(1.0f, 0.8f, 0.4f));
+        ShowResult(result);
     }
 
     private void HandleInspectClick(int gx, int gy)
