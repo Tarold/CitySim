@@ -20,6 +20,7 @@ public sealed class ToggleBusLaneCommand : IWorldCommand
             return CommandResult.Rejected("⚠️ Клікніть безпосередньо на сегмент дороги, щоб перемкнути виділену смугу ГТ.");
 
         bool enabled = world.RoadGraph.ToggleBusLaneBidirectional(_edgeId);
+        world.InvalidateMacroStructure();
         world.RecalculateMacroModel();
 
         return enabled

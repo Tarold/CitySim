@@ -73,6 +73,7 @@ public sealed class CreateTransitRouteCommand : IWorldCommand
             return CommandResult.Rejected("⚠️ The drafted route no longer follows a connected road. Redraw it.");
 
         world.Economy.Spend(EconomyManager.TransitRouteBaseCost);
+        world.InvalidateMacroStructure();
         world.RecalculateMacroModel();
 
         return CommandResult.Applied(
@@ -99,6 +100,7 @@ public sealed class DeleteTransitRouteCommand : IWorldCommand
         if (!world.Transit.RemoveRoute(_routeId))
             return CommandResult.Rejected(string.Empty);
 
+        world.InvalidateMacroStructure();
         world.RecalculateMacroModel();
         return CommandResult.Applied("🗑️ Route deleted and fleet decommissioned.", CommandTone.Clearing);
     }

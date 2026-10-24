@@ -41,6 +41,7 @@ public sealed class ZoneCellCommand : IWorldCommand
         }
         else
         {
+            world.InvalidateMacroStructure();
             world.RecalculateMacroModel();
         }
 
@@ -138,6 +139,7 @@ public sealed class ZoneParcelsCommand : IWorldCommand
             world.Parcels.ZoneParcel(p.Id, _type, ensureAccessNode: false);
         }
 
+        world.InvalidateMacroStructure();
         world.RecalculateMacroModel();
 
         string sideStr = CommandMessages.SideName(_side);
@@ -176,6 +178,7 @@ public sealed class DezoneParcelsCommand : IWorldCommand
         if (cleared == 0)
             return CommandResult.NoChange("ℹ️ Selected roadside parcel(s) are already empty.");
 
+        world.InvalidateMacroStructure();
         world.RecalculateMacroModel();
 
         string sideStr = CommandMessages.SideName(_side);

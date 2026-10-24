@@ -51,10 +51,62 @@ public sealed class TazManager
     private TransitConnectionInfo[] _transitConnectionsCache = Array.Empty<TransitConnectionInfo>();
     private int _cachedTazCount = 0;
 
+    // Number of grid zones + parcels that contributed to TAZ buckets at the last full rebuild
+    private int _contributingEntityCount = 0;
+
     public IReadOnlyList<TrafficAnalysisZone> ActiveZones => _activeTazList;
     public bool IsDirty { get; set; } = true;
 
     public void MarkDirty() => IsDirty = true;
+
+    /// <summary>
+    /// Brings the TAZ set up to date for a macro recalculation. When nothing structural changed since the
+    /// last <see cref="Rebuild"/> (no <see cref="MarkDirty"/>, same set of contributing zones and parcels),
+    /// only population, job and capacity totals are re-summed; clustering, centroids, road connectors,
+    /// transit catchments and internal edges are kept. Otherwise performs a full <see cref="Rebuild"/>.
+    /// </summary>
+    /// <returns>True when a full rebuild was performed.</returns>
+    public bool RefreshOrRebuild(
+        CityGrid cityGrid,
+        ParcelManager parcelManager,
+        RoadGraph roadGraph,
+        TransitManager transitManager)
+    {
+        if (TryRefreshAggregates(cityGrid, parcelManager)) return false;
+
+        Rebuild(cityGrid, parcelManager, roadGraph, transitManager);
+        return true;
+    }
+
+    /// <summary>
+    /// Re-sums population, jobs and capacity of every active TAZ from its member zones and parcels.
+    /// Fails (returns false) when the TAZ set is dirty or the set of contributing entities changed.
+    /// </summary>
+    public bool TryRefreshAggregates(CityGrid cityGrid, ParcelManager parcelManager)
+    {
+        if (IsDirty || CountContributingEntities(cityGrid, parcelManager) != _contributingEntityCount)
+            return false;
+
+        for (int i = 0; i < _activeTazList.Count; i++)
+        {
+            var taz = _activeTazList[i];
+            taz.TotalPopulation = 0;
+            taz.CommercialJobs = 0;
+            taz.IndustrialJobs = 0;
+            taz.TotalCapacity = 0;
+
+            foreach (var zone in taz.Zones)
+            {
+                AccumulateTotals(taz, zone.Type, zone.Population, zone.Jobs, zone.ResidentialCap + zone.CommercialCap);
+            }
+            foreach (var parcel in taz.Parcels)
+            {
+                AccumulateTotals(taz, parcel.ZoneType, parcel.Population, parcel.Jobs, parcel.ResidentialCap + parcel.CommercialCap);
+            }
+        }
+
+        return true;
+    }
 
     public TrafficAnalysisZone GetTaz(int id)
     {
@@ -79,6 +131,7 @@ public sealed class TazManager
         _zoneTileToTazId.Clear();
         _routeTransferMap.Clear();
         _stopNodeToRoutes.Clear();
+        _contributingEntityCount = CountContributingEntities(cityGrid, parcelManager);
 
         if (roadGraph == null || roadGraph.Nodes.Count == 0)
         {
@@ -515,6 +568,32 @@ public sealed class TazManager
         return taz;
     }
 
+    /// <summary>Zones and parcels that would be aggregated into a TAZ bucket (non-empty with activity or capacity).</summary>
+    private static int CountContributingEntities(CityGrid cityGrid, ParcelManager parcelManager)
+    {
+        int count = 0;
+        if (cityGrid != null)
+        {
+            foreach (int zoneId in cityGrid.ActiveZoneIds)
+            {
+                var zone = cityGrid.GetZone(zoneId);
+                if (zone == null || zone.Type == ZoneType.Empty) continue;
+                if (zone.Population > 0 || zone.Jobs > 0 || zone.ResidentialCap + zone.CommercialCap > 0) count++;
+            }
+        }
+        if (parcelManager != null)
+        {
+            var parcels = parcelManager.Parcels;
+            for (int i = 0; i < parcels.Count; i++)
+            {
+                var parcel = parcels[i];
+                if (parcel == null || parcel.ZoneType == ZoneType.Empty) continue;
+                if (parcel.Population > 0 || parcel.Jobs > 0 || parcel.ResidentialCap + parcel.CommercialCap > 0) count++;
+            }
+        }
+        return count;
+    }
+
     private static void AccumulateToTaz(
         TrafficAnalysisZone taz, Vector2 pos, ZoneType type, int pop, int jobs, int capacity)
     {
@@ -524,6 +603,11 @@ public sealed class TazManager
             taz.Centroid += pos * activityWeight;
         }
 
+        AccumulateTotals(taz, type, pop, jobs, capacity);
+    }
+
+    private static void AccumulateTotals(TrafficAnalysisZone taz, ZoneType type, int pop, int jobs, int capacity)
+    {
         taz.TotalPopulation += pop;
         taz.TotalCapacity += capacity;
 

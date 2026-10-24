@@ -104,12 +104,12 @@ public sealed class SimulationWorld : IDisposable
     }
 
     /// <summary>
-    /// Runs the macro pipeline: TAZ rebuild → OD + mode split → MSA traffic assignment → transit
+    /// Runs the macro pipeline: TAZ refresh/rebuild → OD + mode split → MSA traffic assignment → transit
     /// connections → accessibility → transit demand, then refreshes <see cref="Stats"/>.
     /// </summary>
     public void RecalculateMacroModel()
     {
-        Taz.Rebuild(Grid, Parcels, RoadGraph, Transit);
+        Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit);
         OdMatrix.Recalculate(Taz, RoadGraph, Clock.Hour, GetAverageTicketPrice());
         TrafficEngine.AssignFlowsFromTazMsa(Taz, OdMatrix, RoadGraph, MsaIterations);
         Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
@@ -122,6 +122,13 @@ public sealed class SimulationWorld : IDisposable
 
         MacroModelRecalculated?.Invoke();
     }
+
+    /// <summary>
+    /// Forces a full TAZ rebuild on the next macro recalculation. Call after edits that change which zones
+    /// or parcels exist, their zoning, transit routes or road capacities; population growth alone does not
+    /// need it (TAZ totals are re-summed every recalculation).
+    /// </summary>
+    public void InvalidateMacroStructure() => Taz.MarkDirty();
 
     /// <summary>
     /// Refreshes every topology-dependent subsystem and recalculates the macro model.
