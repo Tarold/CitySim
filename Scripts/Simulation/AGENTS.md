@@ -16,4 +16,4 @@
 - **Криволінійна геометрія:** позицію та дотичну на дорозі обчислюй через `edge.Curve.Evaluate(t)` і `edge.Curve.GetTangent(t)`, а не лінійною інтерполяцією між `FromId` та `ToId`.
 - **Інвалідація після зміни топології:** єдина точка — `TopologyChangeCoordinator` (підписаний на події `RoadGraph`, прапорець `HasPendingChanges`). Статистику HUD рахуй у `CityStatsSnapshot` на макро-тіку, а не щокадрово.
 - **Мутація ребер графа:** при розбитті ребра (`SplitEdgeAtPoint`) або видаленні дороги перенось/очищуй прив'язані `RoadsideParcel` через `ParcelManager` і викликай `TazManager.MarkDirty()`.
-- **Легасі `ODMatrix.cs`:** залишений виключно для сумісності зі старими тестами. Усі зміни макропопиту, тарифів чи LUTI внось у `OptimizedODMatrix.cs`.
+- **Легасі `ODMatrix.cs`:** залишений виключно для сумісності зі старими тестами. Усі зміни макропопиту, тарифів чи LUTI внось у `OptimizedODMatrix.cs`; добова крива — `DemandCurve.cs`. Легасі-API живе в `Legacy/` (`LegacyTrafficAssignment`, `CommuteAnalytics.Legacy.cs`, `RoadGraphLegacyExtensions` з O(N²) матрицями) — не викликай його з продакшн-коду.

@@ -339,8 +339,8 @@ public partial class Main : Node2D, IToolHost
             stats.AverageCongestion,
             _world.TransitRidership,
             stats.TransitCoverage,
-            ODMatrix.GetDemandMultiplier(hour),
-            ODMatrix.GetDirectionalBias(hour),
+            DemandCurve.GetDemandMultiplier(hour),
+            DemandCurve.GetDirectionalBias(hour),
             stats.Jobs
         );
 

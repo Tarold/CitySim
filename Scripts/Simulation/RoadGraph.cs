@@ -529,30 +529,6 @@ public class RoadGraph
         RunShortestPathSearch<DrivingCost>(source, -1, maxId, buffer);
     }
 
-    public float[,] ComputeDistanceMatrix(int zoneCount)
-    {
-        float[,] matrix = new float[zoneCount, zoneCount];
-        for (int i = 0; i < zoneCount; i++)
-        {
-            if (AdjacencyEdges.ContainsKey(i))
-            {
-                float[] dists = Dijkstra(i);
-                for (int j = 0; j < zoneCount; j++)
-                {
-                    matrix[i, j] = j < dists.Length ? dists[j] : float.MaxValue;
-                }
-            }
-            else
-            {
-                for (int j = 0; j < zoneCount; j++)
-                {
-                    matrix[i, j] = float.MaxValue;
-                }
-            }
-        }
-        return matrix;
-    }
-
     public List<int> GetShortestPath(int fromNodeId, int toNodeId)
     {
         if (!AdjacencyEdges.ContainsKey(fromNodeId) || !AdjacencyEdges.ContainsKey(toNodeId)) return null;
@@ -606,30 +582,6 @@ public class RoadGraph
         return dist;
     }
 
-    public float[,] ComputeWalkingDistanceMatrix(int zoneCount)
-    {
-        float[,] matrix = new float[zoneCount, zoneCount];
-        for (int i = 0; i < zoneCount; i++)
-        {
-            if (AdjacencyEdges.ContainsKey(i))
-            {
-                float[] dists = DijkstraWalking(i);
-                for (int j = 0; j < zoneCount; j++)
-                {
-                    matrix[i, j] = j < dists.Length ? dists[j] : float.MaxValue;
-                }
-            }
-            else
-            {
-                for (int j = 0; j < zoneCount; j++)
-                {
-                    matrix[i, j] = float.MaxValue;
-                }
-            }
-        }
-        return matrix;
-    }
-
     public List<int> GetShortestWalkingPath(int fromNodeId, int toNodeId)
     {
         if (!AdjacencyEdges.ContainsKey(fromNodeId) || !AdjacencyEdges.ContainsKey(toNodeId)) return null;
@@ -679,32 +631,6 @@ public class RoadGraph
             }
         }
         return nodePath;
-    }
-
-    public void BuildPathCache(int zoneCount)
-    {
-        PathCache.Clear();
-        WalkingPathCache.Clear();
-        foreach (var u in Nodes)
-        {
-            foreach (var v in Nodes)
-            {
-                if (u.Id != v.Id)
-                {
-                    var path = GetShortestPath(u.Id, v.Id);
-                    if (path != null)
-                    {
-                        PathCache[(u.Id, v.Id)] = path;
-                    }
-
-                    var walkingPath = GetShortestWalkingPath(u.Id, v.Id);
-                    if (walkingPath != null)
-                    {
-                        WalkingPathCache[(u.Id, v.Id)] = walkingPath;
-                    }
-                }
-            }
-        }
     }
 
     public void ClearVolumes()
@@ -1212,18 +1138,6 @@ public class RoadGraph
             WalkingPathCache.Remove(key);
 
         return changed;
-    }
-
-    /// <summary>
-    /// Recomputes the distance matrix and path cache after a graph topology change.
-    /// </summary>
-    public float[,] RebuildAfterTopologyChange(int zoneCount)
-    {
-        PathCache.Clear();
-        WalkingPathCache.Clear();
-        var matrix = ComputeDistanceMatrix(zoneCount);
-        BuildPathCache(zoneCount);
-        return matrix;
     }
 
     /// <summary>

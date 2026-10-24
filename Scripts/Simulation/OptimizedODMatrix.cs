@@ -205,8 +205,8 @@ public sealed class OptimizedODMatrix
         Array.Clear(_transitTrips, 0, required);
         Array.Clear(_walkTrips, 0, required);
 
-        float diurnalMultiplier = ODMatrix.GetDemandMultiplier(currentHour);
-        float morningBias = ODMatrix.GetDirectionalBias(currentHour);
+        float diurnalMultiplier = DemandCurve.GetDemandMultiplier(currentHour);
+        float morningBias = DemandCurve.GetDirectionalBias(currentHour);
 
         int totalCityPop = 0;
         for (int i = 0; i < k; i++)
@@ -390,7 +390,7 @@ public sealed class OptimizedODMatrix
 
         if (morningBias < 0f)
         {
-            morningBias = ODMatrix.GetDirectionalBias(CurrentHour);
+            morningBias = DemandCurve.GetDirectionalBias(CurrentHour);
         }
 
         float totalCityOpportunity = 0f;

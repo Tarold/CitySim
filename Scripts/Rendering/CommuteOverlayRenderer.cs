@@ -4,21 +4,9 @@ using CitySim.Simulation;
 
 namespace CitySim.Rendering;
 
-public class CommuteTarget
-{
-    public int ZoneId = -1;
-    public int ParcelId = -1;
-    public Vector2 Position;
-    public float Volume;
-    public ZoneType Type;
-    public float TravelTime;
-    public List<int> EdgePath = new List<int>();
-}
-
 public partial class CommuteOverlayRenderer : Node2D
 {
     private CityGrid _grid;
-    private ODMatrix _odMatrix;
     private TazManager _tazManager;
     private OptimizedODMatrix _optimizedOd;
     private RoadGraph _graph;
@@ -28,14 +16,6 @@ public partial class CommuteOverlayRenderer : Node2D
     public int SelectedZoneId = -1;
     public int SelectedParcelId = -1;
     public List<CommuteTarget> Targets = new List<CommuteTarget>();
-
-    public void Initialize(CityGrid grid, ODMatrix od, RoadGraph graph, ParcelManager parcelManager = null)
-    {
-        _grid = grid;
-        _odMatrix = od;
-        _graph = graph;
-        _parcelManager = parcelManager;
-    }
 
     /// <summary>
     /// Points the overlay at the current macro-model objects (they are swapped after each background
@@ -47,12 +27,11 @@ public partial class CommuteOverlayRenderer : Node2D
         _optimizedOd = optimizedOd;
     }
 
-    public void Initialize(CityGrid grid, TazManager tazManager, OptimizedODMatrix optimizedOd, RoadGraph graph, ParcelManager parcelManager = null, ODMatrix legacyOd = null)
+    public void Initialize(CityGrid grid, TazManager tazManager, OptimizedODMatrix optimizedOd, RoadGraph graph, ParcelManager parcelManager = null)
     {
         _grid = grid;
         _tazManager = tazManager;
         _optimizedOd = optimizedOd;
-        _odMatrix = legacyOd;
         _graph = graph;
         _parcelManager = parcelManager;
     }
@@ -64,22 +43,12 @@ public partial class CommuteOverlayRenderer : Node2D
 
     public void SelectZone(int zoneId, RoadGraph graph)
     {
-        SelectZone(zoneId, null, graph);
-    }
-
-    public void SelectZone(int zoneId, float[,] distances, RoadGraph graph)
-    {
         _graph = graph;
         SelectedZoneId = zoneId;
         SelectedParcelId = -1;
-        if (_tazManager != null && _optimizedOd != null)
-        {
-            Targets = CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _tazManager, _optimizedOd, graph);
-        }
-        else
-        {
-            Targets = CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _odMatrix, distances, graph);
-        }
+        Targets = _tazManager != null && _optimizedOd != null
+            ? CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _tazManager, _optimizedOd, graph)
+            : new List<CommuteTarget>();
         if (Targets.Count == 0 && (zoneId < 0 || _grid == null || zoneId >= _grid.ZoneCount || _grid.GetZone(zoneId)?.Type == ZoneType.Empty))
         {
             SelectedZoneId = -1;
@@ -94,14 +63,9 @@ public partial class CommuteOverlayRenderer : Node2D
         _parcelManager = parcelManager;
         SelectedParcelId = parcelId;
         SelectedZoneId = -1;
-        if (_tazManager != null && _optimizedOd != null)
-        {
-            Targets = CommuteAnalytics.ComputeCommuteTargetsForParcel(parcelId, _parcelManager, _tazManager, _optimizedOd, graph, _grid);
-        }
-        else
-        {
-            Targets = CommuteAnalytics.ComputeCommuteTargetsForParcel(parcelId, _parcelManager, _odMatrix, graph);
-        }
+        Targets = _tazManager != null && _optimizedOd != null
+            ? CommuteAnalytics.ComputeCommuteTargetsForParcel(parcelId, _parcelManager, _tazManager, _optimizedOd, graph, _grid)
+            : new List<CommuteTarget>();
         if (Targets.Count == 0 && (parcelId <= 0 || _parcelManager == null || !_parcelManager.ParcelMap.ContainsKey(parcelId)))
         {
             SelectedParcelId = -1;
