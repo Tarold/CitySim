@@ -26,6 +26,7 @@ dotnet test Tests/Tests.csproj --filter "FullyQualifiedName~Name" # запуск
   - Архітектура та системи: `docs/architecture.md`
   - План розвитку (Roadmap 1M+): `docs/roadmap.md`
   - Аудит масштабування: `docs/scaling-audit.md`
+  - **План продовження масштабування (етапи C–F, як перевіряти): `docs/scaling-plan.md`** — читати перед роботою над продуктивністю, ГТ чи макромоделлю.
 
 ## Правила
 - **Headless-сумісність симуляції:** класи в `Scripts/Simulation/` не повинні залежати від активного `SceneTree` або візуальних вузлів Godot, бо `Tests/Tests.csproj` тестує їх напряму через `dotnet test` без запуску бінарника Godot.
