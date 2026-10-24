@@ -79,6 +79,14 @@ public class MacroPipelineBenchmark
         var buffer = new ShortestPathTreeBuffer();
         sw.Restart();
         foreach (int origin in origins) graph.ComputeDijkstraIntoBuffer(origin, buffer);
-        TestContext.Progress.WriteLine($"   {origins.Length} single-source searches (sequential): {sw.ElapsedMilliseconds}ms");
+        TestContext.Progress.WriteLine($"   {origins.Length} RoadGraph searches (sequential): {sw.ElapsedMilliseconds}ms");
+
+        var routing = new RoutingSnapshot();
+        sw.Restart();
+        routing.Rebuild(graph);
+        long build = sw.ElapsedMilliseconds;
+        sw.Restart();
+        foreach (int origin in origins) routing.ComputeShortestPathTree(origin, buffer);
+        TestContext.Progress.WriteLine($"   RoutingSnapshot build {build}ms, {origins.Length} searches (sequential): {sw.ElapsedMilliseconds}ms");
     }
 }

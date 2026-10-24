@@ -327,6 +327,7 @@ public class TrafficEngine
     private float[] _msaTransitAlightings = Array.Empty<float>();
     private float[] _msaNodeFlowAccumulator = Array.Empty<float>();
     private readonly List<int> _msaActiveOrigins = new(256);
+    private readonly RoutingSnapshot _msaRouting = new RoutingSnapshot();
     private readonly Dictionary<int, List<(int DestNodeId, float Flow)>> _msaDemandsByOrigin = new(256);
 
     /// <summary>
@@ -471,11 +472,13 @@ public class TrafficEngine
         {
             if (iter > 1)
             {
+                // One compact copy of the graph with travel times under V^(n-1), shared by all origins
+                _msaRouting.Rebuild(roadGraph);
                 Parallel.For(0, _msaActiveOrigins.Count, idx =>
                 {
                     int u = _msaActiveOrigins[idx];
                     var buffer = matrix.CachedTreeBuffers.GetOrAdd(u, _ => new ShortestPathTreeBuffer());
-                    roadGraph.ComputeDijkstraIntoBuffer(u, buffer);
+                    _msaRouting.ComputeShortestPathTree(u, buffer);
                 });
             }
 

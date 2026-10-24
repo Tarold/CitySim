@@ -36,6 +36,7 @@ public sealed class OptimizedODMatrix
     public ConcurrentDictionary<int, (float[] Distances, int[] ParentEdgeIds, int[] ParentNodeIds)> CachedShortestTrees { get; } = new();
 
     private readonly HashSet<int> _uniqueOriginNodes = new();
+    private readonly RoutingSnapshot _routing = new RoutingSnapshot();
     private int[] _uniqueOriginNodesArray = Array.Empty<int>();
 
     public int TazCount => _tazCount;
@@ -116,12 +117,13 @@ public sealed class OptimizedODMatrix
             _uniqueOriginNodesArray = new int[Math.Max(uniqueCount * 2, 64)];
         }
         _uniqueOriginNodes.CopyTo(_uniqueOriginNodesArray);
+        _routing.Rebuild(roadGraph);
 
         Parallel.For(0, uniqueCount, idx =>
         {
             int nodeId = _uniqueOriginNodesArray[idx];
             var buffer = CachedTreeBuffers.GetOrAdd(nodeId, _ => new ShortestPathTreeBuffer());
-            roadGraph.ComputeDijkstraIntoBuffer(nodeId, buffer);
+            _routing.ComputeShortestPathTree(nodeId, buffer);
 
             // Backward compatibility without extra array allocation
             CachedShortestTrees[nodeId] = (buffer.Distances, buffer.ParentEdgeIds, buffer.ParentNodeIds);
