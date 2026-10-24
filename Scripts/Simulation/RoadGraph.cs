@@ -336,122 +336,60 @@ public class RoadGraph
         return maxId;
     }
 
-    public float[] Dijkstra(int sourceNodeId)
+    /// <summary>Edge weight used by the shared shortest-path core (struct for zero-cost generic dispatch).</summary>
+    private interface IEdgeCost
     {
-        int maxId = GetMaxNodeIndex();
-        float[] dist = new float[maxId];
-        Array.Fill(dist, float.MaxValue);
-        
-        if (!AdjacencyEdges.ContainsKey(sourceNodeId) || sourceNodeId >= maxId) return dist;
-
-        dist[sourceNodeId] = 0f;
-        var pq = new PriorityQueue<int, float>();
-        pq.Enqueue(sourceNodeId, 0f);
-
-        while (pq.Count > 0)
-        {
-            pq.TryDequeue(out int u, out float d);
-            if (d > dist[u]) continue;
-
-            foreach (var edgeId in AdjacencyEdges[u])
-            {
-                var edge = Edges[edgeId];
-                int v = edge.ToId;
-                float weight = edge.GetTravelTime();
-
-                if (dist[u] + weight < dist[v])
-                {
-                    dist[v] = dist[u] + weight;
-                    pq.Enqueue(v, dist[v]);
-                }
-            }
-        }
-
-        return dist;
+        float Get(RoadEdge edge);
     }
 
-    /// <summary>
-    /// Thread-safe Dijkstra calculation from a single source node to all other reachable nodes.
-    /// Returns distance times (Distances), incoming predecessor edges (ParentEdgeIds), and predecessor nodes (ParentNodeIds)
-    /// for instant O(path length) route reconstruction without allocating objects or accessing non-thread-safe caches.
-    /// </summary>
-    public (float[] Distances, int[] ParentEdgeIds, int[] ParentNodeIds) DijkstraWithPredecessors(int sourceNodeId)
+    /// <summary>Car travel time with BPR congestion (<see cref="RoadEdge.GetTravelTime"/>).</summary>
+    private readonly struct DrivingCost : IEdgeCost
     {
-        int maxId = GetMaxNodeIndex();
-        float[] dist = new float[maxId];
-        int[] parentEdge = new int[maxId];
-        int[] parentNode = new int[maxId];
+        public float Get(RoadEdge edge) => edge.GetTravelTime();
+    }
 
-        Array.Fill(dist, float.MaxValue);
-        Array.Fill(parentEdge, -1);
-        Array.Fill(parentNode, -1);
-
-        if (sourceNodeId < 0 || sourceNodeId >= maxId || !NodeMap.ContainsKey(sourceNodeId))
-            return (dist, parentEdge, parentNode);
-
-        dist[sourceNodeId] = 0f;
-        var pq = new PriorityQueue<int, float>();
-        pq.Enqueue(sourceNodeId, 0f);
-
-        while (pq.TryDequeue(out int u, out float d))
-        {
-            if (d > dist[u]) continue;
-            if (!AdjacencyEdges.TryGetValue(u, out var edgeIds)) continue;
-
-            for (int i = 0; i < edgeIds.Count; i++)
-            {
-                int eid = edgeIds[i];
-                if (eid < 0 || eid >= Edges.Count) continue;
-                var edge = Edges[eid];
-
-                int v = edge.ToId;
-                if (v < 0 || v >= maxId) continue;
-
-                float weight = edge.GetTravelTime();
-                float newDist = dist[u] + weight;
-
-                if (newDist < dist[v])
-                {
-                    dist[v] = newDist;
-                    parentEdge[v] = eid;
-                    parentNode[v] = u;
-                    pq.Enqueue(v, newDist);
-                }
-            }
-        }
-
-        return (dist, parentEdge, parentNode);
+    /// <summary>Pedestrian travel time with crowding (<see cref="RoadEdge.GetWalkingTravelTime"/>).</summary>
+    private readonly struct WalkingCost : IEdgeCost
+    {
+        public float Get(RoadEdge edge) => edge.GetWalkingTravelTime();
     }
 
     [ThreadStatic]
     private static PriorityQueue<int, float> _tlsPriorityQueue;
 
-    /// <summary>
-    /// Fills an existing ShortestPathTreeBuffer without managed heap allocations (GC-free).
-    /// Concurrently records VisitedNodesOrder in increasing distance order for O(V) leaf-to-root flow accumulation.
-    /// </summary>
-    public void ComputeDijkstraIntoBuffer(int sourceNodeId, ShortestPathTreeBuffer buffer)
-    {
-        int maxId = GetMaxNodeIndex();
-        buffer.EnsureCapacity(maxId);
+    [ThreadStatic]
+    private static ShortestPathTreeBuffer _tlsQueryBuffer;
 
+    /// <summary>
+    /// Shared Dijkstra core behind every public shortest-path method. Fills <paramref name="buffer"/> with
+    /// distances, predecessor edges/nodes and the settle order. Stops as soon as <paramref name="targetNodeId"/>
+    /// is dequeued (pass -1 for a full tree). An invalid <paramref name="sourceNodeId"/> (negative or out of
+    /// range) leaves every node unreachable. Thread-safe for concurrent readers of an unchanging graph.
+    /// </summary>
+    private void RunShortestPathSearch<TCost>(int sourceNodeId, int targetNodeId, int maxId, ShortestPathTreeBuffer buffer)
+        where TCost : struct, IEdgeCost
+    {
+        buffer.EnsureCapacity(maxId);
         Array.Fill(buffer.Distances, float.MaxValue, 0, maxId);
         Array.Fill(buffer.ParentEdgeIds, -1, 0, maxId);
         Array.Fill(buffer.ParentNodeIds, -1, 0, maxId);
         buffer.VisitedCount = 0;
 
-        if (sourceNodeId < 0 || sourceNodeId >= maxId || !NodeMap.ContainsKey(sourceNodeId))
+        if (sourceNodeId < 0 || sourceNodeId >= maxId)
             return;
 
         var pq = _tlsPriorityQueue ??= new PriorityQueue<int, float>(256);
         pq.Clear();
 
-        buffer.Distances[sourceNodeId] = 0f;
+        var cost = default(TCost);
+        float[] dist = buffer.Distances;
+        dist[sourceNodeId] = 0f;
         pq.Enqueue(sourceNodeId, 0f);
 
         while (pq.TryDequeue(out int u, out float d))
         {
-            if (d > buffer.Distances[u]) continue;
+            if (u == targetNodeId) break;
+            if (d > dist[u]) continue;
 
             buffer.VisitedNodesOrder[buffer.VisitedCount++] = u;
 
@@ -464,18 +402,84 @@ public class RoadGraph
                 var edge = Edges[eid];
 
                 int v = edge.ToId;
-                if (v < 0 || v >= maxId) continue;
+                if (v < 0 || v >= maxId || edge.FromId == -1) continue;
 
-                float newDist = d + edge.GetTravelTime();
-                if (newDist < buffer.Distances[v])
+                float newDist = d + cost.Get(edge);
+                if (newDist < dist[v])
                 {
-                    buffer.Distances[v] = newDist;
+                    dist[v] = newDist;
                     buffer.ParentEdgeIds[v] = eid;
                     buffer.ParentNodeIds[v] = u;
                     pq.Enqueue(v, newDist);
                 }
             }
         }
+    }
+
+    private static ShortestPathTreeBuffer QueryBuffer => _tlsQueryBuffer ??= new ShortestPathTreeBuffer();
+
+    /// <summary>Edge ids from <paramref name="fromNodeId"/> to <paramref name="toNodeId"/> along a finished search, or null.</summary>
+    private List<int> ExtractEdgePath(ShortestPathTreeBuffer buffer, int fromNodeId, int toNodeId)
+    {
+        if (buffer.Distances[toNodeId] == float.MaxValue) return null;
+
+        var path = new List<int>();
+        int curr = toNodeId;
+        while (curr != fromNodeId)
+        {
+            int eId = buffer.ParentEdgeIds[curr];
+            if (eId == -1) return null;
+            path.Add(eId);
+            curr = Edges[eId].FromId;
+        }
+        path.Reverse();
+        return path;
+    }
+
+    public float[] Dijkstra(int sourceNodeId)
+    {
+        int maxId = GetMaxNodeIndex();
+        float[] dist = new float[maxId];
+        Array.Fill(dist, float.MaxValue);
+        
+        if (!AdjacencyEdges.ContainsKey(sourceNodeId) || sourceNodeId >= maxId) return dist;
+
+        var buffer = QueryBuffer;
+        RunShortestPathSearch<DrivingCost>(sourceNodeId, -1, maxId, buffer);
+        Array.Copy(buffer.Distances, dist, maxId);
+        return dist;
+    }
+
+    /// <summary>
+    /// Thread-safe Dijkstra calculation from a single source node to all other reachable nodes.
+    /// Returns distance times (Distances), incoming predecessor edges (ParentEdgeIds), and predecessor nodes (ParentNodeIds)
+    /// for instant O(path length) route reconstruction without allocating objects or accessing non-thread-safe caches.
+    /// </summary>
+    public (float[] Distances, int[] ParentEdgeIds, int[] ParentNodeIds) DijkstraWithPredecessors(int sourceNodeId)
+    {
+        int maxId = GetMaxNodeIndex();
+        var buffer = QueryBuffer;
+        int source = NodeMap.ContainsKey(sourceNodeId) ? sourceNodeId : -1;
+        RunShortestPathSearch<DrivingCost>(source, -1, maxId, buffer);
+
+        float[] dist = new float[maxId];
+        int[] parentEdge = new int[maxId];
+        int[] parentNode = new int[maxId];
+        Array.Copy(buffer.Distances, dist, maxId);
+        Array.Copy(buffer.ParentEdgeIds, parentEdge, maxId);
+        Array.Copy(buffer.ParentNodeIds, parentNode, maxId);
+        return (dist, parentEdge, parentNode);
+    }
+
+    /// <summary>
+    /// Fills an existing ShortestPathTreeBuffer without managed heap allocations (GC-free).
+    /// Concurrently records VisitedNodesOrder in increasing distance order for O(V) leaf-to-root flow accumulation.
+    /// </summary>
+    public void ComputeDijkstraIntoBuffer(int sourceNodeId, ShortestPathTreeBuffer buffer)
+    {
+        int maxId = GetMaxNodeIndex();
+        int source = NodeMap.ContainsKey(sourceNodeId) ? sourceNodeId : -1;
+        RunShortestPathSearch<DrivingCost>(source, -1, maxId, buffer);
     }
 
     public float[,] ComputeDistanceMatrix(int zoneCount)
@@ -507,51 +511,11 @@ public class RoadGraph
         if (!AdjacencyEdges.ContainsKey(fromNodeId) || !AdjacencyEdges.ContainsKey(toNodeId)) return null;
 
         int maxId = GetMaxNodeIndex();
-        if (fromNodeId >= maxId || toNodeId >= maxId) return null;
+        if (fromNodeId < 0 || toNodeId < 0 || fromNodeId >= maxId || toNodeId >= maxId) return null;
 
-        float[] dist = new float[maxId];
-        int[] edgeTo = new int[maxId];
-        Array.Fill(dist, float.MaxValue);
-        Array.Fill(edgeTo, -1);
-
-        dist[fromNodeId] = 0f;
-        var pq = new PriorityQueue<int, float>();
-        pq.Enqueue(fromNodeId, 0f);
-
-        while (pq.Count > 0)
-        {
-            pq.TryDequeue(out int u, out float d);
-            if (u == toNodeId) break;
-            if (d > dist[u]) continue;
-
-            foreach (var edgeId in AdjacencyEdges[u])
-            {
-                var edge = Edges[edgeId];
-                int v = edge.ToId;
-                float weight = edge.GetTravelTime();
-
-                if (dist[u] + weight < dist[v])
-                {
-                    dist[v] = dist[u] + weight;
-                    edgeTo[v] = edgeId;
-                    pq.Enqueue(v, dist[v]);
-                }
-            }
-        }
-
-        if (dist[toNodeId] == float.MaxValue) return null;
-
-        var path = new List<int>();
-        int curr = toNodeId;
-        while (curr != fromNodeId)
-        {
-            int eId = edgeTo[curr];
-            if (eId == -1) return null;
-            path.Add(eId);
-            curr = Edges[eId].FromId;
-        }
-        path.Reverse();
-        return path;
+        var buffer = QueryBuffer;
+        RunShortestPathSearch<DrivingCost>(fromNodeId, toNodeId, maxId, buffer);
+        return ExtractEdgePath(buffer, fromNodeId, toNodeId);
     }
 
     /// <summary>
@@ -589,30 +553,9 @@ public class RoadGraph
         
         if (!AdjacencyEdges.ContainsKey(sourceNodeId) || sourceNodeId >= maxId) return dist;
 
-        dist[sourceNodeId] = 0f;
-        var pq = new PriorityQueue<int, float>();
-        pq.Enqueue(sourceNodeId, 0f);
-
-        while (pq.Count > 0)
-        {
-            pq.TryDequeue(out int u, out float d);
-            if (d > dist[u]) continue;
-
-            foreach (var edgeId in AdjacencyEdges[u])
-            {
-                var edge = Edges[edgeId];
-                if (edge.FromId == -1 || edge.ToId == -1) continue;
-                int v = edge.ToId;
-                float weight = edge.GetWalkingTravelTime();
-
-                if (dist[u] + weight < dist[v])
-                {
-                    dist[v] = dist[u] + weight;
-                    pq.Enqueue(v, dist[v]);
-                }
-            }
-        }
-
+        var buffer = QueryBuffer;
+        RunShortestPathSearch<WalkingCost>(sourceNodeId, -1, maxId, buffer);
+        Array.Copy(buffer.Distances, dist, maxId);
         return dist;
     }
 
@@ -645,52 +588,11 @@ public class RoadGraph
         if (!AdjacencyEdges.ContainsKey(fromNodeId) || !AdjacencyEdges.ContainsKey(toNodeId)) return null;
 
         int maxId = GetMaxNodeIndex();
-        if (fromNodeId >= maxId || toNodeId >= maxId) return null;
+        if (fromNodeId < 0 || toNodeId < 0 || fromNodeId >= maxId || toNodeId >= maxId) return null;
 
-        float[] dist = new float[maxId];
-        int[] edgeTo = new int[maxId];
-        Array.Fill(dist, float.MaxValue);
-        Array.Fill(edgeTo, -1);
-
-        dist[fromNodeId] = 0f;
-        var pq = new PriorityQueue<int, float>();
-        pq.Enqueue(fromNodeId, 0f);
-
-        while (pq.Count > 0)
-        {
-            pq.TryDequeue(out int u, out float d);
-            if (u == toNodeId) break;
-            if (d > dist[u]) continue;
-
-            foreach (var edgeId in AdjacencyEdges[u])
-            {
-                var edge = Edges[edgeId];
-                if (edge.FromId == -1 || edge.ToId == -1) continue;
-                int v = edge.ToId;
-                float weight = edge.GetWalkingTravelTime();
-
-                if (dist[u] + weight < dist[v])
-                {
-                    dist[v] = dist[u] + weight;
-                    edgeTo[v] = edgeId;
-                    pq.Enqueue(v, dist[v]);
-                }
-            }
-        }
-
-        if (dist[toNodeId] == float.MaxValue) return null;
-
-        var path = new List<int>();
-        int curr = toNodeId;
-        while (curr != fromNodeId)
-        {
-            int eId = edgeTo[curr];
-            if (eId == -1) return null;
-            path.Add(eId);
-            curr = Edges[eId].FromId;
-        }
-        path.Reverse();
-        return path;
+        var buffer = QueryBuffer;
+        RunShortestPathSearch<WalkingCost>(fromNodeId, toNodeId, maxId, buffer);
+        return ExtractEdgePath(buffer, fromNodeId, toNodeId);
     }
 
     public List<int> GetShortestWalkingNodePath(int fromNodeId, int toNodeId)
