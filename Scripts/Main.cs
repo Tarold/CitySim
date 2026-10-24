@@ -31,13 +31,8 @@ public partial class Main : Node2D
     private Camera2D _camera;
     private GameUI _gameUI;
     
-    private float _gameHour = 6.5f; // Start at 06:30 AM before the morning peak
-    private int _gameDay = 1;
-    private float _gameSpeed = 1.0f;
-    private float _lastODRecalcHour = -10f;
+    private readonly SimulationClock _clock = new SimulationClock();
     private bool _heatmapEnabled = false;
-    private float _odRecalcInterval = 0.5f; // Recalculate OD every 30 game minutes
-    private float _lastFinancialTickHour = 6.5f;
     private EconomyManager _economyManager;
     
     private bool _isDragging = false;
@@ -154,7 +149,7 @@ public partial class Main : Node2D
         _gameUI.SetTransitManager(_transitManager);
         _gameUI.SetEconomyManager(_economyManager);
         
-        _gameUI.SpeedChanged += (speed) => _gameSpeed = speed;
+        _gameUI.SpeedChanged += (speed) => _clock.Speed = speed;
         _gameUI.HeatmapToggled += (enabled) => 
         {
             _heatmapEnabled = enabled;
@@ -283,7 +278,7 @@ public partial class Main : Node2D
         }
 
         _tazManager.Rebuild(_grid, _parcelManager, _roadGraph, _transitManager);
-        _optimizedOdMatrix.Recalculate(_tazManager, _roadGraph, _gameHour, avgPrice);
+        _optimizedOdMatrix.Recalculate(_tazManager, _roadGraph, _clock.Hour, avgPrice);
         _trafficEngine.AssignFlowsFromTazMsa(_tazManager, _optimizedOdMatrix, _roadGraph, msaIterations: 4);
         _tazManager.UpdateTransitConnectionMatrix(_transitManager, _roadGraph);
         _optimizedOdMatrix.UpdateAccessibilityScores(_tazManager, _roadGraph);
@@ -291,7 +286,7 @@ public partial class Main : Node2D
 
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
         _carTrafficManager.RefreshBusyEdges(_roadGraph);
-        _lastODRecalcHour = _gameHour;
+        _clock.MarkMacroRecalculated();
         _cityStats = CityStatsSnapshot.Capture(_grid, _parcelManager, _optimizedOdMatrix, _trafficEngine, _roadGraph, _transitManager);
 
         // Refresh selected parcel or zone overlay
@@ -319,54 +314,45 @@ public partial class Main : Node2D
             ApplyTopologyChange();
         }
 
-        // Realistic clock speed: at 1x speed, 1 real second = 1 game minute (0.01667 hours/sec)
-        // 1 full day takes 24 minutes at 1x, 2.4 minutes at 10x, ~29 seconds at 50x.
-        float clockRate = (1.0f / 60.0f) * _gameSpeed;
-        _gameHour += dt * clockRate;
+        // At 1x speed, 1 real second = 1 game minute; see SimulationClock for tick intervals
+        var ticks = _clock.Advance(dt);
+        float gameSpeed = _clock.Speed;
 
-        // Safe day rollover
-        while (_gameHour >= 24f)
-        {
-            _gameHour -= 24f;
-            _gameDay++;
-            _lastODRecalcHour -= 24f;
-            _lastFinancialTickHour -= 24f;
-        }
-        
-        // Recalculate macro traffic flows when 30 game minutes elapse
-        if (Mathf.Abs(_gameHour - _lastODRecalcHour) >= _odRecalcInterval)
+        if ((ticks & SimulationTicks.MacroRecalculation) != 0)
         {
             RecalculateODMatrix();
         }
 
-        if (Mathf.Abs(_gameHour - _lastFinancialTickHour) >= 1f)
+        if ((ticks & SimulationTicks.Financial) != 0)
         {
             _economyManager.ProcessFinancialTick(_grid, _roadGraph, _transitManager, _parcelManager, _tazManager);
-            _lastFinancialTickHour = _gameHour;
         }
         
         // Update simulation sub-systems
-        _trafficLights.Update(dt, _gameSpeed);
-        _carTrafficManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights, _parcelManager);
-        _transitManager.Update(dt, _gameSpeed, _roadGraph, _trafficLights, _gameHour);
-        _pedestrianManager.Update(dt, _gameSpeed, _roadGraph, _grid, _transitManager);
+        _trafficLights.Update(dt, gameSpeed);
+        _carTrafficManager.Update(dt, gameSpeed, _roadGraph, _trafficLights, _parcelManager);
+        _transitManager.Update(dt, gameSpeed, _roadGraph, _trafficLights, _clock.Hour);
+        _pedestrianManager.Update(dt, gameSpeed, _roadGraph, _grid, _transitManager);
         
-        ProcessPopulationGrowth(dt, _gameSpeed);
+        if ((ticks & SimulationTicks.Growth) != 0)
+        {
+            ProcessPopulationGrowth();
+        }
         
         // Calculate transit ridership
         float transitRidership = 0f;
         foreach (var v in _transitManager.Vehicles) transitRidership += v.Passengers;
         
         // Update HUD from the cached macro-tick snapshot (full scans happen in RecalculateODMatrix)
-        _gameUI.UpdateTime(_gameHour, _gameDay);
+        _gameUI.UpdateTime(_clock.Hour, _clock.Day);
         _gameUI.UpdateStats(
             _cityStats.Population,
             _cityStats.TotalTrips,
             _cityStats.AverageCongestion,
             transitRidership,
             _cityStats.TransitCoverage,
-            ODMatrix.GetDemandMultiplier(_gameHour),
-            ODMatrix.GetDirectionalBias(_gameHour),
+            ODMatrix.GetDemandMultiplier(_clock.Hour),
+            ODMatrix.GetDirectionalBias(_clock.Hour),
             _cityStats.Jobs
         );
         
@@ -391,16 +377,12 @@ public partial class Main : Node2D
         }
     }
     
-    private float _populationGrowthTimer = 0f;
     private readonly HashSet<int> _reachableEntranceNodes = new HashSet<int>();
 
-    private void ProcessPopulationGrowth(float dt, float gameSpeed)
+    private void ProcessPopulationGrowth()
     {
-        _populationGrowthTimer += dt * gameSpeed;
-        if (_populationGrowthTimer >= 1.0f) // roughly every in-game minute
+        // Roughly every in-game minute (scheduled by SimulationClock)
         {
-            _populationGrowthTimer -= 1.0f;
-
             var entrances = new List<int>();
             for (int i = 0; i < _grid.ZoneCount; i++)
             {
