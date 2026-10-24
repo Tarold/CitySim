@@ -58,12 +58,13 @@ public class CurveSegment
         }
 
         Length = totalLength;
+        IsCurved = Length > P0.DistanceTo(P3) + 0.05f;
     }
 
     /// <summary>
     /// Returns true if this curve deviates significantly from a straight line.
     /// </summary>
-    public bool IsCurved => Length > P0.DistanceTo(P3) + 0.1f;
+    public bool IsCurved { get; }
 
     /// <summary>
     /// Constructs a straight road curve segment between two endpoints.
@@ -192,9 +193,17 @@ public class CurveSegment
     /// </summary>
     public (float T, Vector2 Point, float Distance) GetClosestPoint(Vector2 queryPoint, int refinementSteps = 5)
     {
+        if (!IsCurved)
+        {
+            Vector2 ab = P3 - P0;
+            float lenSq = ab.LengthSquared();
+            float t = lenSq > 1e-6f ? Mathf.Clamp((queryPoint - P0).Dot(ab) / lenSq, 0f, 1f) : 0f;
+            Vector2 pt = P0 + ab * t;
+            return (t, pt, queryPoint.DistanceTo(pt));
+        }
+
         int sampleCount = _sampledPoints.Length - 1;
         float bestDistSq = float.MaxValue;
-        int bestIdx = 0;
         float bestT = 0f;
 
         for (int i = 0; i < sampleCount; i++)
@@ -215,7 +224,6 @@ public class CurveSegment
             if (distSq < bestDistSq)
             {
                 bestDistSq = distSq;
-                bestIdx = i;
                 bestT = ((float)i + segT) / sampleCount;
             }
         }
@@ -223,28 +231,30 @@ public class CurveSegment
         // Binary search refinement around bestT
         float step = 1.0f / (sampleCount * 2.0f);
         float currentT = bestT;
+        float dCurr = queryPoint.DistanceSquaredTo(EvaluateRaw(currentT));
         for (int r = 0; r < refinementSteps; r++)
         {
             float tMinus = Mathf.Clamp(currentT - step, 0f, 1f);
             float tPlus = Mathf.Clamp(currentT + step, 0f, 1f);
 
-            float dMinus = queryPoint.DistanceSquaredTo(Evaluate(tMinus));
-            float dPlus = queryPoint.DistanceSquaredTo(Evaluate(tPlus));
-            float dCurr = queryPoint.DistanceSquaredTo(Evaluate(currentT));
+            float dMinus = queryPoint.DistanceSquaredTo(EvaluateRaw(tMinus));
+            float dPlus = queryPoint.DistanceSquaredTo(EvaluateRaw(tPlus));
 
             if (dMinus < dCurr && dMinus < dPlus)
             {
                 currentT = tMinus;
+                dCurr = dMinus;
             }
             else if (dPlus < dCurr)
             {
                 currentT = tPlus;
+                dCurr = dPlus;
             }
             step *= 0.5f;
         }
 
-        Vector2 closestPoint = Evaluate(currentT);
-        return (currentT, closestPoint, queryPoint.DistanceTo(closestPoint));
+        Vector2 closestPoint = EvaluateRaw(currentT);
+        return (currentT, closestPoint, Mathf.Sqrt(dCurr));
     }
 
     /// <summary>

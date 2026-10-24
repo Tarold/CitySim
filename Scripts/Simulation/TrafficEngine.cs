@@ -458,7 +458,11 @@ public class TrafficEngine
             }
         }
 
-        if (_msaActiveOrigins.Count == 0) return;
+        if (_msaActiveOrigins.Count == 0)
+        {
+            matrix.UpdateAccessibilityScores(tazManager, roadGraph);
+            return;
+        }
 
         int iterations = Math.Clamp(msaIterations, 1, 8);
 
@@ -533,11 +537,12 @@ public class TrafficEngine
             }
         }
 
-        // 5. Final synchronization: update shortest trees and _travelTimes using equilibrium volumes V^(n)
+        // 5. Final synchronization: update shortest trees, _travelTimes, and LUTI AccessibilityScores using equilibrium volumes V^(n)
         if (iterations > 1)
         {
             matrix.UpdateEquilibriumTreesAndTimes(tazManager, roadGraph);
         }
+        matrix.UpdateAccessibilityScores(tazManager, roadGraph);
     }
 
     private void AddLocalTazFlow(

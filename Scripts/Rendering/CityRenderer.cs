@@ -166,9 +166,15 @@ public partial class CityRenderer : Node2D
                     // Building center placed inside lot, slightly setback
                     Vector2 bldgCenter = parcel.Center - facingDir * 2.5f;
 
-                    // Footprint dimensions: 25px facade width, 21px depth
-                    float hw = 12.5f; // half lateral width
-                    float hd = 10.5f; // half depth
+                    // Footprint dimensions scale with LUTI DensityLevel
+                    float densityScale = parcel.Density switch
+                    {
+                        DensityLevel.High => 1.18f,
+                        DensityLevel.Medium => 1.08f,
+                        _ => 1.0f
+                    };
+                    float hw = 12.5f * densityScale; // half lateral width
+                    float hd = 10.5f * densityScale; // half depth
 
                     Vector2 fl = bldgCenter + facingDir * hd - lateralDir * hw; // front-left
                     Vector2 fr = bldgCenter + facingDir * hd + lateralDir * hw; // front-right
@@ -214,6 +220,31 @@ public partial class CityRenderer : Node2D
                     };
                     DrawColoredPolygon(roofCap, roofColor);
                     DrawPolyline(closedRoofCap, new Color(0.06f, 0.06f, 0.08f, 0.75f), 1.0f, true);
+
+                    // D2. Upper-Story Tower Tiers for Medium & High Density (LUTI Phase 4)
+                    if (parcel.Density >= DensityLevel.Medium)
+                    {
+                        float mhw = Mathf.Max(3.5f, rhw - 2.6f);
+                        float mhd = Mathf.Max(3.0f, rhd - 2.6f);
+                        Vector2 mfl = bldgCenter + facingDir * mhd - lateralDir * mhw;
+                        Vector2 mfr = bldgCenter + facingDir * mhd + lateralDir * mhw;
+                        Vector2 mrr = bldgCenter - facingDir * mhd + lateralDir * mhw;
+                        Vector2 mrl = bldgCenter - facingDir * mhd - lateralDir * mhw;
+                        Vector2[] midTier = new Vector2[] { mfl, mfr, mrr, mrl };
+                        DrawColoredPolygon(midTier, bldgColor.Lightened(0.14f));
+
+                        if (parcel.Density == DensityLevel.High)
+                        {
+                            float thw = Mathf.Max(2.0f, mhw - 2.4f);
+                            float thd = Mathf.Max(1.8f, mhd - 2.4f);
+                            Vector2 tfl = bldgCenter + facingDir * thd - lateralDir * thw;
+                            Vector2 tfr = bldgCenter + facingDir * thd + lateralDir * thw;
+                            Vector2 trr = bldgCenter - facingDir * thd + lateralDir * thw;
+                            Vector2 trl = bldgCenter - facingDir * thd - lateralDir * thw;
+                            Vector2[] topTier = new Vector2[] { tfl, tfr, trr, trl };
+                            DrawColoredPolygon(topTier, bldgColor.Lightened(0.32f));
+                        }
+                    }
 
                     // E. Facade Border Line (crisp architectural highlight facing road)
                     Color facadeAccent = parcel.ZoneType switch

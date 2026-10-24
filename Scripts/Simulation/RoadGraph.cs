@@ -19,9 +19,11 @@ public class RoadEdge
     public int ToId;
     public float Length;
     public float Capacity;
+    public float BaseCapacity;
     public float FreeFlowSpeed;
     public float CurrentVolume;
     public int Lanes;
+    public bool HasBusLane;
     public CurveSegment Curve;
 
     // Pedestrian flow attributes
@@ -29,9 +31,51 @@ public class RoadEdge
     public float PedestrianCapacity = 1800f; // ped/hour
     public float WalkingSpeed = 5.0f; // km/h (1.39 m/s, matching FreeFlowSpeed unit scale)
 
+    /// <summary>
+    /// Enables or disables a dedicated bus lane on this directed road edge.
+    /// When enabled, reduces private car capacity by one lane equivalent while allowing transit buses
+    /// to travel at free-flow speed ignoring private car congestion.
+    /// </summary>
+    public void SetBusLane(bool enabled)
+    {
+        if (BaseCapacity <= 0f && Capacity > 0f)
+        {
+            BaseCapacity = Capacity;
+        }
+
+        HasBusLane = enabled;
+        if (BaseCapacity > 0f)
+        {
+            if (enabled)
+            {
+                int totalLanes = Mathf.Max(2, Lanes);
+                float laneFactor = (totalLanes - 1.0f) / totalLanes;
+                Capacity = Mathf.Max(250f, BaseCapacity * laneFactor);
+            }
+            else
+            {
+                Capacity = BaseCapacity;
+            }
+        }
+    }
+
     public float GetTravelTime()
     {
         return (Length / FreeFlowSpeed) * (1f + 0.15f * Mathf.Pow(CurrentVolume / Mathf.Max(Capacity, 1f), 4f));
+    }
+
+    /// <summary>
+    /// Returns the travel time for a public transit bus on this edge.
+    /// If a dedicated bus lane is active, the bus bypasses private car congestion and travels at free-flow speed.
+    /// </summary>
+    public float GetBusTravelTime()
+    {
+        float freeFlowTime = Length / Mathf.Max(FreeFlowSpeed, 1f);
+        if (HasBusLane)
+        {
+            return freeFlowTime;
+        }
+        return GetTravelTime();
     }
 
     public float GetCongestionRatio()
@@ -86,12 +130,50 @@ public class RoadGraph
         new Dictionary<int, (int, int, RoadNode)>();
     private readonly Dictionary<int, int> _splitReverseEdges = new Dictionary<int, int>();
 
+    public SpatialGridIndex SpatialIndex { get; } = new SpatialGridIndex();
+    public SpatialGridIndex SpatialGrid => SpatialIndex;
+    private int _syncedNodesCount = 0;
+    private int _syncedEdgesCount = 0;
+
+    public event Action<RoadNode> NodeAdded;
+    public event Action<int> NodeRemoved;
     public event Action<RoadEdge> EdgeAdded;
     public event Action<int> EdgeRemoved;
     public event Action<int, RoadNode> EdgeSplit;
 
     public RoadNode GetNode(int id) => NodeMap.TryGetValue(id, out var n) ? n : null;
     public RoadEdge GetEdge(int id) => (id >= 0 && id < Edges.Count) ? Edges[id] : null;
+
+    /// <summary>
+    /// Fast O(1) guard that synchronizes SpatialIndex if nodes or edges were manually added to Nodes/Edges lists in tests.
+    /// </summary>
+    public void EnsureSpatialIndexSynced()
+    {
+        if (_syncedNodesCount == Nodes.Count && _syncedEdgesCount == Edges.Count)
+            return;
+
+        for (int i = 0; i < Nodes.Count; i++)
+        {
+            var n = Nodes[i];
+            if (n != null)
+            {
+                NodeMap[n.Id] = n;
+                SpatialIndex.AddNode(n);
+            }
+        }
+
+        for (int i = _syncedEdgesCount; i < Edges.Count; i++)
+        {
+            var e = Edges[i];
+            if (e != null && e.FromId != -1 && e.ToId != -1)
+            {
+                SpatialIndex.AddEdge(e, this);
+            }
+        }
+
+        _syncedNodesCount = Nodes.Count;
+        _syncedEdgesCount = Edges.Count;
+    }
 
     /// <summary>
     /// Retrieves the split information (fromId, toId, junction) for a split edge, if any.
@@ -138,6 +220,7 @@ public class RoadGraph
         PathCache.Clear();
         _splitInfo.Clear();
         _splitReverseEdges.Clear();
+        SpatialIndex.ClearNodesAndEdges();
 
         for (int i = 0; i < grid.ZoneCount; i++)
         {
@@ -153,6 +236,7 @@ public class RoadGraph
                 Nodes.Add(node);
                 NodeMap[node.Id] = node;
                 AdjacencyEdges[zone.Id] = new List<int>();
+                SpatialIndex.AddNode(node);
             }
         }
 
@@ -186,6 +270,9 @@ public class RoadGraph
                 }
             }
         }
+
+        _syncedNodesCount = Nodes.Count;
+        _syncedEdgesCount = Edges.Count;
     }
 
     private void AddBidirectionalEdge(ref int edgeIdCounter, Zone z1, Zone z2, float length)
@@ -206,6 +293,7 @@ public class RoadGraph
             ToId = z2.Id,
             Length = curveFwd.Length,
             Capacity = cap,
+            BaseCapacity = cap,
             FreeFlowSpeed = 50f,
             Lanes = 2,
             CurrentVolume = 0f,
@@ -222,6 +310,7 @@ public class RoadGraph
             ToId = z1.Id,
             Length = curveRev.Length,
             Capacity = cap,
+            BaseCapacity = cap,
             FreeFlowSpeed = 50f,
             Lanes = 2,
             CurrentVolume = 0f,
@@ -235,6 +324,8 @@ public class RoadGraph
         Edges.Add(e2);
         AdjacencyEdges[z1.Id].Add(e1.Id);
         AdjacencyEdges[z2.Id].Add(e2.Id);
+        SpatialIndex.AddEdge(e1, this);
+        SpatialIndex.AddEdge(e2, this);
     }
 
     public int GetMaxNodeIndex()
@@ -709,6 +800,10 @@ public class RoadGraph
         NodeMap[id] = node;
         if (!AdjacencyEdges.ContainsKey(id))
             AdjacencyEdges[id] = new List<int>();
+
+        SpatialIndex.AddNode(node);
+        _syncedNodesCount = Nodes.Count;
+        NodeAdded?.Invoke(node);
         return node;
     }
 
@@ -741,6 +836,7 @@ public class RoadGraph
             ToId = toNodeId,
             Length = curve.Length,
             Capacity = capacity,
+            BaseCapacity = capacity,
             FreeFlowSpeed = 50f,
             Lanes = 2,
             CurrentVolume = 0f,
@@ -757,6 +853,7 @@ public class RoadGraph
             ToId = fromNodeId,
             Length = curve.Length,
             Capacity = capacity,
+            BaseCapacity = capacity,
             FreeFlowSpeed = 50f,
             Lanes = 2,
             CurrentVolume = 0f,
@@ -777,10 +874,52 @@ public class RoadGraph
         AdjacencyEdges[fromNodeId].Add(e1.Id);
         AdjacencyEdges[toNodeId].Add(e2.Id);
 
+        SpatialIndex.AddNode(fromNode);
+        SpatialIndex.AddNode(toNode);
+        SpatialIndex.AddEdge(e1, this);
+        SpatialIndex.AddEdge(e2, this);
+        _syncedNodesCount = Nodes.Count;
+        _syncedEdgesCount = Edges.Count;
+
         EdgeAdded?.Invoke(e1);
         EdgeAdded?.Invoke(e2);
 
         return true;
+    }
+
+    /// <summary>
+    /// Sets the dedicated bus lane status on an edge and its reverse counterpart (if any).
+    /// Returns the new bus lane state.
+    /// </summary>
+    public bool SetBusLaneBidirectional(int edgeId, bool enabled)
+    {
+        if (edgeId < 0 || edgeId >= Edges.Count) return false;
+        var edge = Edges[edgeId];
+        if (edge.FromId == -1 || edge.ToId == -1) return false;
+
+        edge.SetBusLane(enabled);
+
+        int revId = FindEdgeId(edge.ToId, edge.FromId);
+        if (revId >= 0 && revId < Edges.Count)
+        {
+            Edges[revId].SetBusLane(enabled);
+        }
+
+        InvalidatePathsWithEdges(edgeId, revId);
+        return enabled;
+    }
+
+    /// <summary>
+    /// Toggles the dedicated bus lane status on an edge and its reverse counterpart (if any).
+    /// Returns the new bus lane state after toggling.
+    /// </summary>
+    public bool ToggleBusLaneBidirectional(int edgeId)
+    {
+        if (edgeId < 0 || edgeId >= Edges.Count) return false;
+        var edge = Edges[edgeId];
+        if (edge.FromId == -1 || edge.ToId == -1) return false;
+
+        return SetBusLaneBidirectional(edgeId, !edge.HasBusLane);
     }
 
     /// <summary>
@@ -837,7 +976,8 @@ public class RoadGraph
 
         int fromId = edge.FromId;
         int toId = edge.ToId;
-        float capacity = edge.Capacity;
+        float baseCapacity = edge.BaseCapacity > 0f ? edge.BaseCapacity : edge.Capacity;
+        bool hadBusLane = edge.HasBusLane;
 
         var curve = edge.Curve ?? new CurveSegment(
             NodeMap[fromId].WorldPosition,
@@ -870,6 +1010,7 @@ public class RoadGraph
         Edges[edgeId].ToId = -1;
         Edges[edgeId].Capacity = 0f;
         Edges[edgeId].CurrentVolume = 0f;
+        SpatialIndex.SplitEdge(edgeId, junction);
 
         // 4. Disconnect original reverse edge
         if (revId != -1)
@@ -881,16 +1022,26 @@ public class RoadGraph
             Edges[revId].ToId = -1;
             Edges[revId].Capacity = 0f;
             Edges[revId].CurrentVolume = 0f;
+            SpatialIndex.SplitEdge(revId, junction);
         }
 
         // 5. Invalidate path caches referencing the split edges
         InvalidatePathsWithEdges(edgeId, revId);
 
         // 6. Connect fromId <-> junction
-        AddCurvedRoadSegment(fromId, junction.Id, leftCurve, capacity);
+        AddCurvedRoadSegment(fromId, junction.Id, leftCurve, baseCapacity);
 
         // 7. Connect junction <-> toId
-        AddCurvedRoadSegment(junction.Id, toId, rightCurve, capacity);
+        AddCurvedRoadSegment(junction.Id, toId, rightCurve, baseCapacity);
+
+        if (hadBusLane)
+        {
+            int leftEid = FindEdgeId(fromId, junction.Id);
+            if (leftEid != -1) SetBusLaneBidirectional(leftEid, true);
+
+            int rightEid = FindEdgeId(junction.Id, toId);
+            if (rightEid != -1) SetBusLaneBidirectional(rightEid, true);
+        }
 
         EdgeSplit?.Invoke(edgeId, junction);
         if (revId != -1)
@@ -963,6 +1114,7 @@ public class RoadGraph
             Edges[eidForward].CurrentVolume = 0f;
             Edges[eidForward].PedestrianCapacity = 0f;
             Edges[eidForward].PedestrianVolume = 0f;
+            SpatialIndex.RemoveEdge(eidForward);
         }
         if (eidReverse != -1)
         {
@@ -972,6 +1124,7 @@ public class RoadGraph
             Edges[eidReverse].CurrentVolume = 0f;
             Edges[eidReverse].PedestrianCapacity = 0f;
             Edges[eidReverse].PedestrianVolume = 0f;
+            SpatialIndex.RemoveEdge(eidReverse);
         }
 
         // Invalidate affected path cache entries
@@ -994,6 +1147,7 @@ public class RoadGraph
             existing.WorldPosition = worldPosition;
             if (!AdjacencyEdges.ContainsKey(zoneId))
                 AdjacencyEdges[zoneId] = new List<int>();
+            SpatialIndex.AddNode(existing);
             return existing;
         }
 
@@ -1008,6 +1162,10 @@ public class RoadGraph
         NodeMap[zoneId] = node;
         if (!AdjacencyEdges.ContainsKey(zoneId))
             AdjacencyEdges[zoneId] = new List<int>();
+
+        SpatialIndex.AddNode(node);
+        _syncedNodesCount = Nodes.Count;
+        NodeAdded?.Invoke(node);
 
         return node;
     }
@@ -1057,6 +1215,9 @@ public class RoadGraph
             Nodes.Remove(node);
             NodeMap.Remove(zoneId);
             AdjacencyEdges.Remove(zoneId);
+            SpatialIndex.RemoveNode(zoneId);
+            _syncedNodesCount = Nodes.Count;
+            NodeRemoved?.Invoke(zoneId);
             changed = true;
         }
 

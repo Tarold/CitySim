@@ -26,6 +26,19 @@ public partial class ToolPreviewRenderer : Node2D
     private Color _draftRouteColor = new Color(0.65f, 0.25f, 0.95f);
     private bool _draftIsLoop = false;
     private RoadSnapResult _transitHoverSnap;
+    private RoadEdge _busLaneHoverEdge;
+
+    /// <summary>
+    /// Updates the hovered road edge for Bus Lane toggle preview.
+    /// </summary>
+    public void SetBusLaneHoverEdge(RoadEdge edge)
+    {
+        if (_busLaneHoverEdge != edge)
+        {
+            _busLaneHoverEdge = edge;
+            QueueRedraw();
+        }
+    }
 
     /// <summary>Active tool mode for preview rendering.</summary>
     public InteractionMode Mode { get; private set; } = InteractionMode.Inspect;
@@ -529,6 +542,27 @@ public partial class ToolPreviewRenderer : Node2D
         if ((Mode == InteractionMode.BuildRoad || Mode == InteractionMode.BuildCurvedRoad) && HasRoadBuildPreview)
         {
             DrawVectorRoadPreview(pulseWidth);
+            return;
+        }
+
+        // 3b. Dedicated Bus Lane Toggle Preview
+        if (Mode == InteractionMode.ToggleBusLane && _busLaneHoverEdge != null && _roadGraph != null)
+        {
+            var fromNode = _roadGraph.GetNode(_busLaneHoverEdge.FromId);
+            var toNode = _roadGraph.GetNode(_busLaneHoverEdge.ToId);
+            if (fromNode != null && toNode != null)
+            {
+                Vector2[] pts = _busLaneHoverEdge.Curve != null
+                    ? _busLaneHoverEdge.Curve.GetSampledPoints(20)
+                    : new Vector2[] { fromNode.WorldPosition, toNode.WorldPosition };
+
+                Color highlightColor = _busLaneHoverEdge.HasBusLane
+                    ? new Color(1.0f, 0.30f, 0.25f, 0.90f)
+                    : new Color(1.0f, 0.65f, 0.15f, 0.90f);
+
+                DrawPolyline(pts, highlightColor, pulseWidth + 2.5f, true);
+                DrawPolyline(pts, Colors.White, 1.5f, true);
+            }
             return;
         }
 

@@ -44,6 +44,12 @@ public class ParcelManager
     private readonly Dictionary<int, RoadsideParcel> _parcelMap = new Dictionary<int, RoadsideParcel>();
     private readonly Dictionary<int, List<RoadsideParcel>> _parcelsByEdge = new Dictionary<int, List<RoadsideParcel>>();
     private RoadGraph _roadGraph;
+    private SpatialGridIndex _spatialIndex = new SpatialGridIndex();
+    private readonly List<int> _parcelQueryBuffer = new List<int>(32);
+    private readonly List<int> _edgeQueryBuffer = new List<int>(32);
+
+    /// <summary>Spatial hash grid index for O(1) parcel and road edge spatial queries.</summary>
+    public SpatialGridIndex SpatialIndex => _spatialIndex;
 
     /// <summary>List of all active roadside ribbon parcels.</summary>
     public IReadOnlyList<RoadsideParcel> Parcels => _parcels;
@@ -53,6 +59,28 @@ public class ParcelManager
 
     /// <summary>All roadside ribbon parcels that are designated with a non-empty active zone.</summary>
     public IEnumerable<RoadsideParcel> ActiveParcels => _parcels.Where(p => p.ZoneType != ZoneType.Empty);
+
+    private void BindSpatialIndex(RoadGraph roadGraph)
+    {
+        if (roadGraph == null) return;
+        roadGraph.EnsureSpatialIndexSynced();
+        if (_spatialIndex != roadGraph.SpatialIndex)
+        {
+            _spatialIndex = roadGraph.SpatialIndex;
+            for (int i = 0; i < _parcels.Count; i++)
+            {
+                _spatialIndex.AddParcel(_parcels[i]);
+            }
+        }
+    }
+
+    private void RemoveParcelInternal(RoadsideParcel p)
+    {
+        if (p == null) return;
+        _parcels.Remove(p);
+        _parcelMap.Remove(p.Id);
+        _spatialIndex.RemoveParcel(p.Id);
+    }
 
     /// <summary>Total population living in residential roadside parcels.</summary>
     public int TotalPopulation
@@ -134,6 +162,7 @@ public class ParcelManager
         }
 
         _roadGraph = roadGraph;
+        BindSpatialIndex(roadGraph);
 
         if (_roadGraph != null)
         {
@@ -164,6 +193,8 @@ public class ParcelManager
             ClearAllParcels();
             return;
         }
+
+        BindSpatialIndex(roadGraph);
 
         // 1. Identify which edge IDs currently exist and are active
         var activeEdgeIds = new HashSet<int>();
@@ -198,17 +229,20 @@ public class ParcelManager
             }
         }
 
-        // 3. Remove parcels whose boundary collides with intersecting roads (other than their own edge)
+        // 3. Remove parcels whose boundary collides with intersecting roads (other than their own edge) via O(1) SpatialGridIndex
         var collidedParcels = new List<RoadsideParcel>();
         for (int i = 0; i < _parcels.Count; i++)
         {
             var p = _parcels[i];
             if (p.ZoneType == ZoneType.Empty) continue;
 
-            for (int e = 0; e < roadGraph.Edges.Count; e++)
+            var (pMin, pMax) = SpatialGridIndex.ComputeParcelAabb(p, RoadOffset + 2f);
+            _spatialIndex.QueryEdgesAabb(pMin, pMax, _edgeQueryBuffer);
+
+            for (int e = 0; e < _edgeQueryBuffer.Count; e++)
             {
-                var edge = roadGraph.Edges[e];
-                if (edge.FromId == -1 || edge.ToId == -1) continue;
+                var edge = roadGraph.GetEdge(_edgeQueryBuffer[e]);
+                if (edge == null || edge.FromId == -1 || edge.ToId == -1) continue;
                 if (edge.Id == p.EdgeId || roadGraph.GetReverseEdgeId(edge.Id) == p.EdgeId ||
                     roadGraph.GetReverseEdgeId(p.EdgeId) == edge.Id) continue;
 
@@ -222,8 +256,7 @@ public class ParcelManager
 
         foreach (var p in collidedParcels)
         {
-            _parcels.Remove(p);
-            _parcelMap.Remove(p.Id);
+            RemoveParcelInternal(p);
             foreach (var list in _parcelsByEdge.Values)
             {
                 list.Remove(p);
@@ -239,6 +272,7 @@ public class ParcelManager
         _parcels.Clear();
         _parcelMap.Clear();
         _parcelsByEdge.Clear();
+        _spatialIndex.ClearParcels();
     }
 
     /// <summary>
@@ -249,6 +283,11 @@ public class ParcelManager
     {
         if (edge == null || edge.FromId == -1 || edge.ToId == -1)
             return new List<RoadsideParcel>();
+
+        if (roadGraph != null)
+        {
+            BindSpatialIndex(roadGraph);
+        }
 
         // Ensure curve geometry is present
         CurveSegment curve = edge.Curve;
@@ -278,8 +317,7 @@ public class ParcelManager
                 var p = existing[i];
                 if (p.ZoneType == ZoneType.Empty)
                 {
-                    _parcels.Remove(p);
-                    _parcelMap.Remove(p.Id);
+                    RemoveParcelInternal(p);
                 }
                 else
                 {
@@ -454,12 +492,14 @@ public class ParcelManager
                     }
                 }
 
-                // 2b. Parcel overlap (SAT): check against other registered parcels across the network
+                // 2b. Parcel overlap (SAT): check against nearby registered parcels via O(1) SpatialGridIndex
                 if (!collides)
                 {
-                    for (int k = 0; k < _parcels.Count; k++)
+                    var (cMin, cMax) = SpatialGridIndex.ComputeParcelAabb(candidate, 2.0f);
+                    _spatialIndex.QueryParcelsAabb(cMin, cMax, _parcelQueryBuffer);
+                    for (int k = 0; k < _parcelQueryBuffer.Count; k++)
                     {
-                        var other = _parcels[k];
+                        if (!_parcelMap.TryGetValue(_parcelQueryBuffer[k], out var other)) continue;
                         if (other.EdgeId == edge.Id) continue;
                         if (ParcelsOverlap(candidate, other))
                         {
@@ -479,6 +519,7 @@ public class ParcelManager
                 newParcels.Add(candidate);
                 _parcels.Add(candidate);
                 _parcelMap[candidate.Id] = candidate;
+                _spatialIndex.AddParcel(candidate);
             }
         }
 
@@ -497,8 +538,10 @@ public class ParcelManager
         return newParcels;
     }
 
+    private static readonly List<RoadsideParcel> _emptyParcelList = new List<RoadsideParcel>(0);
+
     /// <summary>
-    /// Retrieves all roadside parcels associated with the specified road edge ID
+    /// Retrieves all roadside parcels associated with the specified road edge ID in O(1) time
     /// (supports both forward and reverse edge lookups in bidirectional pairs even when disconnected).
     /// </summary>
     public List<RoadsideParcel> GetParcelsForEdge(int edgeId)
@@ -508,32 +551,16 @@ public class ParcelManager
             return list;
         }
 
-        int revId = -1;
         if (_roadGraph != null)
         {
-            revId = _roadGraph.GetReverseEdgeId(edgeId);
+            int revId = _roadGraph.GetReverseEdgeId(edgeId);
             if (revId != -1 && _parcelsByEdge.TryGetValue(revId, out var revList) && revList != null && revList.Count > 0)
             {
                 return revList;
             }
         }
 
-        // Fallback: check if any parcel in _parcels is assigned directly to edgeId or revId
-        var directParcels = new List<RoadsideParcel>();
-        for (int i = 0; i < _parcels.Count; i++)
-        {
-            var p = _parcels[i];
-            if (p.EdgeId == edgeId || (revId != -1 && p.EdgeId == revId))
-            {
-                directParcels.Add(p);
-            }
-        }
-        if (directParcels.Count > 0)
-        {
-            return directParcels;
-        }
-
-        return list ?? new List<RoadsideParcel>();
+        return list ?? _emptyParcelList;
     }
 
     /// <summary>
@@ -554,31 +581,33 @@ public class ParcelManager
     }
 
     /// <summary>
-    /// Returns the parcel whose boundary contains the specified world position, or null if none.
+    /// Returns the parcel whose boundary contains the specified world position in O(1) time via <see cref="SpatialGridIndex"/>, or null if none.
     /// </summary>
     public RoadsideParcel GetParcelAt(Vector2 worldPosition)
     {
-        for (int i = 0; i < _parcels.Count; i++)
+        _spatialIndex.QueryParcelsAtPoint(worldPosition, _parcelQueryBuffer);
+        for (int i = 0; i < _parcelQueryBuffer.Count; i++)
         {
-            if (_parcels[i].ContainsPoint(worldPosition))
+            if (_parcelMap.TryGetValue(_parcelQueryBuffer[i], out var parcel) && parcel.ContainsPoint(worldPosition))
             {
-                return _parcels[i];
+                return parcel;
             }
         }
         return null;
     }
 
     /// <summary>
-    /// Finds the closest parcel to the specified world position within a maximum distance.
+    /// Finds the closest parcel to the specified world position within a maximum distance in O(1) time via <see cref="SpatialGridIndex"/>.
     /// </summary>
     public RoadsideParcel FindClosestParcel(Vector2 worldPosition, float maxDistance = 64f)
     {
         RoadsideParcel best = null;
         float bestDistSq = maxDistance * maxDistance;
 
-        for (int i = 0; i < _parcels.Count; i++)
+        _spatialIndex.QueryParcelsInRadius(worldPosition, maxDistance + DefaultLotDepth, _parcelQueryBuffer);
+        for (int i = 0; i < _parcelQueryBuffer.Count; i++)
         {
-            var p = _parcels[i];
+            if (!_parcelMap.TryGetValue(_parcelQueryBuffer[i], out var p)) continue;
             float distSq = p.Center.DistanceSquaredTo(worldPosition);
             if (distSq < bestDistSq)
             {
@@ -700,8 +729,7 @@ public class ParcelManager
 
         foreach (var p in parcelsToRemove)
         {
-            _parcels.Remove(p);
-            _parcelMap.Remove(p.Id);
+            RemoveParcelInternal(p);
         }
 
         // Clean up reverse edge entry if empty
@@ -745,6 +773,7 @@ public class ParcelManager
             return;
         }
 
+        BindSpatialIndex(roadGraph);
         int revEdgeId = roadGraph.GetReverseEdgeId(originalEdgeId);
 
         // 1. Collect parcels currently registered for originalEdgeId and its reverse edge
@@ -780,8 +809,7 @@ public class ParcelManager
         {
             foreach (var p in originalParcels)
             {
-                _parcels.Remove(p);
-                _parcelMap.Remove(p.Id);
+                RemoveParcelInternal(p);
             }
             _parcelsByEdge.Remove(originalEdgeId);
             if (revEdgeId != -1) _parcelsByEdge.Remove(revEdgeId);
@@ -861,8 +889,7 @@ public class ParcelManager
             var p = originalParcels[i];
             if (p.ZoneType == ZoneType.Empty)
             {
-                _parcels.Remove(p);
-                _parcelMap.Remove(p.Id);
+                RemoveParcelInternal(p);
             }
         }
 
@@ -898,8 +925,7 @@ public class ParcelManager
             {
                 if (DoesParcelCollideWithIntersection(p, junction, intersectingEdges))
                 {
-                    _parcels.Remove(p);
-                    _parcelMap.Remove(p.Id);
+                    RemoveParcelInternal(p);
                     continue;
                 }
             }
@@ -959,8 +985,7 @@ public class ParcelManager
             }
             else
             {
-                _parcels.Remove(p);
-                _parcelMap.Remove(p.Id);
+                RemoveParcelInternal(p);
             }
         }
 
@@ -1077,15 +1102,20 @@ public class ParcelManager
     }
 
     /// <summary>
-    /// Queries the roadside zoning target at a given world position, detecting whether
-    /// a specific parcel or an entire edge side is targeted.
+    /// Queries the roadside zoning target at a given world position in O(1) time via <see cref="SpatialGridIndex"/>,
+    /// detecting whether a specific parcel or an entire edge side is targeted.
     /// </summary>
     public (RoadsideParcel Parcel, RoadEdge Edge, ParcelSide Side, List<RoadsideParcel> SideParcels) QueryZoningTarget(
         Vector2 worldPosition,
         RoadGraph roadGraph,
         bool selectFullSide = false)
     {
-        // 1. Direct hit on parcel polygon
+        if (roadGraph != null)
+        {
+            BindSpatialIndex(roadGraph);
+        }
+
+        // 1. Direct hit on parcel polygon via O(1) SpatialGridIndex lookup
         var hitParcel = GetParcelAt(worldPosition);
         if (hitParcel != null)
         {
@@ -1102,7 +1132,7 @@ public class ParcelManager
             return (hitParcel, edge, hitParcel.Side, sideParcels);
         }
 
-        // 2. Proximity search near active road edges
+        // 2. Proximity search near active road edges in adjacent SpatialGridIndex cells
         if (roadGraph != null)
         {
             float searchRadius = RoadOffset + DefaultLotDepth + 20f;
@@ -1111,10 +1141,11 @@ public class ParcelManager
             float bestT = 0f;
             ParcelSide bestSide = ParcelSide.Right;
 
-            for (int i = 0; i < roadGraph.Edges.Count; i++)
+            roadGraph.SpatialIndex.QueryEdgesInRadius(worldPosition, searchRadius, _edgeQueryBuffer);
+            for (int i = 0; i < _edgeQueryBuffer.Count; i++)
             {
-                var edge = roadGraph.Edges[i];
-                if (edge.FromId == -1 || edge.ToId == -1 || edge.Curve == null) continue;
+                var edge = roadGraph.GetEdge(_edgeQueryBuffer[i]);
+                if (edge == null || edge.FromId == -1 || edge.ToId == -1 || edge.Curve == null) continue;
 
                 var (t, closestPt, dist) = edge.Curve.GetClosestPoint(worldPosition);
                 if (dist < bestDist)
@@ -1239,5 +1270,142 @@ public class ParcelManager
         }
 
         return false;
+    }
+
+    // =========================================================================
+    // PHASE 4: LUTI (Land-Use & Transport Interaction) DENSITY EVOLUTION
+    // =========================================================================
+
+    /// <summary>Congestion ratio threshold (R_congestion &gt; 1.5) above which parcels stagnate.</summary>
+    public const float CongestionStagnationThreshold = 1.5f;
+
+    /// <summary>Minimum normalized Hansen AccessibilityScore required to upgrade from Low to Medium density.</summary>
+    public const float MediumDensityAccessibilityThreshold = 0.85f;
+
+    /// <summary>Minimum normalized Hansen AccessibilityScore required to upgrade from Medium to High density.</summary>
+    public const float HighDensityAccessibilityThreshold = 1.25f;
+
+    /// <summary>
+    /// Evaluates LUTI population growth and automatic density evolution (Low -&gt; Medium -&gt; High) across all active parcels.
+    /// Parcels with high <see cref="RoadsideParcel.AccessibilityScore"/> fill faster and promote to higher density tiers,
+    /// while parcels gridlocked in severe traffic congestion (R_congestion &gt; 1.5) stagnate.
+    /// </summary>
+    public (bool populationChanged, bool densityUpgraded) ProcessLutiEvolution(
+        RoadGraph roadGraph,
+        TazManager tazManager = null,
+        HashSet<int> reachableEntranceNodes = null)
+    {
+        if (roadGraph == null) return (false, false);
+
+        bool popChanged = false;
+        bool densityUpgraded = false;
+        bool checkReachability = reachableEntranceNodes != null && reachableEntranceNodes.Count > 0;
+
+        for (int i = 0; i < _parcels.Count; i++)
+        {
+            var parcel = _parcels[i];
+            if (parcel == null || parcel.ZoneType == ZoneType.Empty) continue;
+            if (parcel.EdgeId < 0 || parcel.EdgeId >= roadGraph.Edges.Count) continue;
+
+            var edge = roadGraph.Edges[parcel.EdgeId];
+            if (edge == null || edge.FromId == -1 || edge.ToId == -1) continue;
+
+            if (checkReachability)
+            {
+                bool reachable = reachableEntranceNodes.Contains(edge.FromId) ||
+                                 reachableEntranceNodes.Contains(edge.ToId) ||
+                                 (parcel.AccessNodeId >= 0 && reachableEntranceNodes.Contains(parcel.AccessNodeId));
+                if (!reachable) continue;
+            }
+
+            // 1. Synchronize LUTI accessibility score and local congestion ratio from TAZ and fronting road
+            if (tazManager != null)
+            {
+                int tazId = tazManager.GetTazIdForParcel(parcel.Id);
+                var taz = tazManager.GetTaz(tazId);
+                if (taz != null)
+                {
+                    parcel.AccessibilityScore = taz.AccessibilityScore;
+                    float edgeCong = OptimizedODMatrix.GetParcelEdgeCongestion(parcel, roadGraph);
+                    parcel.LocalCongestion = MathF.Max(edgeCong, taz.AverageCongestion);
+                }
+                else
+                {
+                    parcel.LocalCongestion = OptimizedODMatrix.GetParcelEdgeCongestion(parcel, roadGraph);
+                }
+            }
+            else
+            {
+                float edgeCong = OptimizedODMatrix.GetParcelEdgeCongestion(parcel, roadGraph);
+                if (edgeCong > 0f)
+                {
+                    parcel.LocalCongestion = MathF.Max(parcel.LocalCongestion, edgeCong);
+                }
+            }
+
+            // 2. Stagnation check: districts blocked in severe traffic jams (R_congestion > 1.5) stagnate
+            if (parcel.LocalCongestion > CongestionStagnationThreshold)
+            {
+                continue;
+            }
+
+            float accessScore = Math.Clamp(parcel.AccessibilityScore, 0.0f, 2.0f);
+            if (accessScore <= 0.01f) continue;
+
+            if (parcel.ZoneType == ZoneType.Residential)
+            {
+                float congDamp = parcel.LocalCongestion > 1.0f
+                    ? (1.0f - 0.5f * (parcel.LocalCongestion - 1.0f))
+                    : 1.0f;
+
+                int growthStep = Math.Max(1, (int)MathF.Round(4.0f * (0.4f + 1.2f * accessScore) * congDamp));
+
+                if (parcel.Population < parcel.ResidentialCap)
+                {
+                    parcel.Population = Math.Min(parcel.ResidentialCap, parcel.Population + growthStep);
+                    popChanged = true;
+                }
+
+                // Automatic density upgrade (Low -> Medium -> High) when occupancy >= 85% and accessibility is sufficient
+                if (parcel.ResidentialCap > 0 && parcel.Population >= (int)(parcel.ResidentialCap * 0.85f))
+                {
+                    if (parcel.Density == DensityLevel.Low && accessScore >= MediumDensityAccessibilityThreshold)
+                    {
+                        if (parcel.UpgradeDensity())
+                        {
+                            densityUpgraded = true;
+                            popChanged = true;
+                        }
+                    }
+                    else if (parcel.Density == DensityLevel.Medium && accessScore >= HighDensityAccessibilityThreshold)
+                    {
+                        if (parcel.UpgradeDensity())
+                        {
+                            densityUpgraded = true;
+                            popChanged = true;
+                        }
+                    }
+                }
+            }
+            else if (parcel.ZoneType == ZoneType.Commercial || parcel.ZoneType == ZoneType.Industrial)
+            {
+                if (parcel.Density == DensityLevel.Low && accessScore >= MediumDensityAccessibilityThreshold)
+                {
+                    if (parcel.UpgradeDensity())
+                    {
+                        densityUpgraded = true;
+                    }
+                }
+                else if (parcel.Density == DensityLevel.Medium && accessScore >= HighDensityAccessibilityThreshold)
+                {
+                    if (parcel.UpgradeDensity())
+                    {
+                        densityUpgraded = true;
+                    }
+                }
+            }
+        }
+
+        return (popChanged, densityUpgraded);
     }
 }

@@ -11,9 +11,9 @@ public partial class Main : Node2D
 {
     private CityGrid _grid;
     private RoadGraph _roadGraph;
-    private float[,] _distanceMatrix;
-    private float[,] _walkingDistanceMatrix;
-    private ODMatrix _odMatrix;
+    private TazManager _tazManager;
+    private OptimizedODMatrix _optimizedOdMatrix;
+    private ShortestPathTreeBuffer _entranceTreeBuffer = new ShortestPathTreeBuffer();
     private TrafficEngine _trafficEngine;
     private TransitManager _transitManager;
     private TrafficLightManager _trafficLights;
@@ -104,11 +104,8 @@ public partial class Main : Node2D
                 break;
         }
         
-        _distanceMatrix = _roadGraph.ComputeDistanceMatrix(_grid.ZoneCount);
-        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
-        _roadGraph.BuildPathCache(_grid.ZoneCount);
-        
-        _odMatrix = new ODMatrix(_grid.ZoneCount);
+        _tazManager = new TazManager();
+        _optimizedOdMatrix = new OptimizedODMatrix();
         _trafficEngine = new TrafficEngine();
         
         _trafficLights = new TrafficLightManager();
@@ -135,7 +132,7 @@ public partial class Main : Node2D
 
         _commuteOverlay = new CommuteOverlayRenderer();
         AddChild(_commuteOverlay);
-        _commuteOverlay.Initialize(_grid, _odMatrix, _roadGraph, _parcelManager);
+        _commuteOverlay.Initialize(_grid, _tazManager, _optimizedOdMatrix, _roadGraph, _parcelManager);
         
         _vehicleRenderer = new VehicleRenderer();
         AddChild(_vehicleRenderer);
@@ -178,7 +175,7 @@ public partial class Main : Node2D
         _gameUI.RouteDeleted += OnRouteDeleted;
         
         RecalculateODMatrix();
-        _gameUI.ShowCityOverview(_grid, _odMatrix, _parcelManager);
+        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
     }
 
     private void OnInteractionModeChanged(int modeInt)
@@ -205,9 +202,9 @@ public partial class Main : Node2D
         _selectedParcelId = -1;
         _cityRenderer.SetSelectedZone(-1);
         _cityRenderer.SetSelectedParcel(-1);
-        _commuteOverlay.SelectZone(-1, _distanceMatrix, _roadGraph);
+        _commuteOverlay.SelectZone(-1, _roadGraph);
         _commuteOverlay.SelectParcel(-1, _parcelManager, _roadGraph);
-        _gameUI.ShowCityOverview(_grid, _odMatrix, _parcelManager);
+        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
     }
 
     private void CancelPendingOperation()
@@ -233,7 +230,6 @@ public partial class Main : Node2D
     
     private void RecalculateODMatrix()
     {
-        var coveredZones = _transitManager.GetCoveredZoneIds(_grid, 3, _roadGraph, _parcelManager);
         float avgPrice = 12f;
         if (_transitManager.Routes.Count > 0)
         {
@@ -242,8 +238,13 @@ public partial class Main : Node2D
             avgPrice = total / _transitManager.Routes.Count;
         }
 
-        _odMatrix.Recalculate(_gameHour, _grid, _distanceMatrix, _transitManager.Routes.Count > 0, coveredZones, avgPrice, _walkingDistanceMatrix, _transitManager, _parcelManager, _roadGraph);
-        _trafficEngine.AssignFlows(_odMatrix, _roadGraph, _grid, _transitManager);
+        _tazManager.Rebuild(_grid, _parcelManager, _roadGraph, _transitManager);
+        _optimizedOdMatrix.Recalculate(_tazManager, _roadGraph, _gameHour, avgPrice);
+        _trafficEngine.AssignFlowsFromTazMsa(_tazManager, _optimizedOdMatrix, _roadGraph, msaIterations: 4);
+        _tazManager.UpdateTransitConnectionMatrix(_transitManager, _roadGraph);
+        _optimizedOdMatrix.UpdateAccessibilityScores(_tazManager, _roadGraph);
+        _transitManager.AssignPassengerDemandFromTaz(_tazManager, _optimizedOdMatrix, _roadGraph);
+
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
         _carTrafficManager.RefreshBusyEdges(_roadGraph);
         _lastODRecalcHour = _gameHour;
@@ -252,13 +253,13 @@ public partial class Main : Node2D
         if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
         {
             _commuteOverlay.SelectParcel(_selectedParcelId, _parcelManager, _roadGraph);
-            _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _odMatrix, _grid);
+            _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _tazManager, _optimizedOdMatrix, _grid);
         }
         else if (_selectedZoneId != -1)
         {
-            _commuteOverlay.SelectZone(_selectedZoneId, _distanceMatrix, _roadGraph);
+            _commuteOverlay.SelectZone(_selectedZoneId, _roadGraph);
             var zone = _grid.GetZone(_selectedZoneId);
-            _gameUI.ShowZoneInfographics(zone, _grid, _odMatrix, _distanceMatrix);
+            _gameUI.ShowZoneInfographics(zone, _grid, _tazManager, _optimizedOdMatrix);
         }
     }
     
@@ -288,7 +289,7 @@ public partial class Main : Node2D
 
         if (Mathf.Abs(_gameHour - _lastFinancialTickHour) >= 1f)
         {
-            _economyManager.ProcessFinancialTick(_grid, _roadGraph, _transitManager, _parcelManager);
+            _economyManager.ProcessFinancialTick(_grid, _roadGraph, _transitManager, _parcelManager, _tazManager);
             _lastFinancialTickHour = _gameHour;
         }
         
@@ -310,7 +311,7 @@ public partial class Main : Node2D
         _gameUI.UpdateTime(_gameHour, _gameDay);
         _gameUI.UpdateStats(
             totalPop,
-            _odMatrix.TotalTrips,
+            _optimizedOdMatrix.TotalTrips,
             _trafficEngine.GetAverageCongestion(_roadGraph),
             transitRidership,
             _transitManager.GetTransitCoverage(_grid, _roadGraph, _parcelManager),
@@ -341,6 +342,7 @@ public partial class Main : Node2D
     }
     
     private float _populationGrowthTimer = 0f;
+    private readonly HashSet<int> _reachableEntranceNodes = new HashSet<int>();
 
     private void ProcessPopulationGrowth(float dt, float gameSpeed)
     {
@@ -358,62 +360,108 @@ public partial class Main : Node2D
 
             if (entrances.Count == 0) return;
 
+            _reachableEntranceNodes.Clear();
+            foreach (int ent in entrances)
+            {
+                _roadGraph.ComputeDijkstraIntoBuffer(ent, _entranceTreeBuffer);
+                for (int k = 0; k < _entranceTreeBuffer.VisitedCount; k++)
+                {
+                    _reachableEntranceNodes.Add(_entranceTreeBuffer.VisitedNodesOrder[k]);
+                }
+            }
+
             bool uiNeedsUpdate = false;
+            bool densityChanged = false;
+
             for (int i = 0; i < _grid.ZoneCount; i++)
             {
                 var zone = _grid.GetZone(i);
-                if (zone.Type == ZoneType.Residential && zone.Population < zone.ResidentialCap)
+                if (zone == null || zone.Type == ZoneType.Empty || zone.Type == ZoneType.Entrance) continue;
+                if (!_reachableEntranceNodes.Contains(i)) continue;
+
+                if (_tazManager != null)
                 {
-                    bool isConnected = false;
-                    foreach (int ent in entrances)
+                    int tazId = _tazManager.GetTazIdForZoneTile(zone.GridPos);
+                    var taz = _tazManager.GetTaz(tazId);
+                    if (taz != null)
                     {
-                        // Check if path exists from entrance to residential zone
-                        if (_distanceMatrix[ent, i] < float.MaxValue)
-                        {
-                            isConnected = true;
-                            break;
-                        }
+                        zone.AccessibilityScore = taz.AccessibilityScore;
+                        float nodeCong = OptimizedODMatrix.GetNodeCongestion(zone.Id, _roadGraph);
+                        zone.LocalCongestion = Mathf.Max(nodeCong, taz.AverageCongestion);
+                    }
+                    else
+                    {
+                        zone.LocalCongestion = OptimizedODMatrix.GetNodeCongestion(zone.Id, _roadGraph);
+                    }
+                }
+                else
+                {
+                    zone.LocalCongestion = OptimizedODMatrix.GetNodeCongestion(zone.Id, _roadGraph);
+                }
+
+                // Stagnation check: zones gridlocked in traffic jams (R_congestion > 1.5) stagnate
+                if (zone.LocalCongestion > ParcelManager.CongestionStagnationThreshold)
+                    continue;
+
+                float accessScore = Mathf.Clamp(zone.AccessibilityScore, 0.0f, 2.0f);
+                if (accessScore <= 0.01f) continue;
+
+                if (zone.Type == ZoneType.Residential)
+                {
+                    float congDamp = zone.LocalCongestion > 1.0f
+                        ? (1.0f - 0.5f * (zone.LocalCongestion - 1.0f))
+                        : 1.0f;
+
+                    int growthStep = Mathf.Max(10, Mathf.RoundToInt(50f * (0.4f + 1.2f * accessScore) * congDamp));
+
+                    if (zone.Population < zone.ResidentialCap)
+                    {
+                        zone.Population = Mathf.Min(zone.ResidentialCap, zone.Population + growthStep);
+                        uiNeedsUpdate = true;
                     }
 
-                    if (isConnected)
+                    if (zone.ResidentialCap > 0 && zone.Population >= Mathf.RoundToInt(zone.ResidentialCap * 0.85f))
                     {
-                        zone.Population = Mathf.Min(zone.ResidentialCap, zone.Population + 50);
-                        uiNeedsUpdate = true;
+                        if ((zone.Density == DensityLevel.Low && accessScore >= ParcelManager.MediumDensityAccessibilityThreshold) ||
+                            (zone.Density == DensityLevel.Medium && accessScore >= ParcelManager.HighDensityAccessibilityThreshold))
+                        {
+                            if (zone.UpgradeDensity())
+                            {
+                                densityChanged = true;
+                                uiNeedsUpdate = true;
+                            }
+                        }
                     }
                 }
             }
 
             if (_parcelManager != null)
             {
-                foreach (var parcel in _parcelManager.Parcels)
-                {
-                    if (parcel.ZoneType == ZoneType.Residential && parcel.Population < parcel.ResidentialCap)
-                    {
-                        if (parcel.EdgeId >= 0 && parcel.EdgeId < _roadGraph.Edges.Count && _roadGraph.Edges[parcel.EdgeId].FromId != -1)
-                        {
-                            parcel.Population = Mathf.Min(parcel.ResidentialCap, parcel.Population + 4);
-                            uiNeedsUpdate = true;
-                        }
-                    }
-                }
+                var (parcelPopChanged, parcelDensityUpgraded) = _parcelManager.ProcessLutiEvolution(
+                    _roadGraph,
+                    _tazManager,
+                    _reachableEntranceNodes);
+
+                if (parcelPopChanged) uiNeedsUpdate = true;
+                if (parcelDensityUpgraded) densityChanged = true;
+            }
+
+            if (densityChanged)
+            {
+                _tazManager?.MarkDirty();
+                _cityRenderer?.Refresh();
             }
 
             if (uiNeedsUpdate)
             {
                 if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
                 {
-                    if (selectedParcel.ZoneType == ZoneType.Residential)
-                    {
-                        _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _odMatrix, _grid);
-                    }
+                    _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _tazManager, _optimizedOdMatrix, _grid);
                 }
                 else if (_selectedZoneId != -1)
                 {
                     var selectedZone = _grid.GetZone(_selectedZoneId);
-                    if (selectedZone.Type == ZoneType.Residential)
-                    {
-                        _gameUI.ShowZoneInfographics(selectedZone, _grid, _odMatrix, _distanceMatrix);
-                    }
+                    _gameUI.ShowZoneInfographics(selectedZone, _grid, _tazManager, _optimizedOdMatrix);
                 }
             }
         }
@@ -491,6 +539,36 @@ public partial class Main : Node2D
         {
             UpdateRoadBuildHover();
             return;
+        }
+
+        if (_currentMode == InteractionMode.ToggleBusLane)
+        {
+            Vector2 mouse = GetGlobalMousePosition();
+            var snap = RoadSnappingEngine.FindSnap(mouse, _roadGraph, snapRadius: 28f);
+            RoadEdge hoveredEdge = snap.SnappedEdge;
+            if (hoveredEdge == null && snap.Type == SnapType.Node && snap.SnappedNode != null)
+            {
+                if (_roadGraph.AdjacencyEdges.TryGetValue(snap.SnappedNode.Id, out var inc) && inc.Count > 0)
+                {
+                    hoveredEdge = _roadGraph.GetEdge(inc[0]);
+                }
+            }
+
+            _previewRenderer.SetBusLaneHoverEdge(hoveredEdge);
+            if (hoveredEdge != null)
+            {
+                string status = hoveredEdge.HasBusLane ? "УВІМКНЕНО (Клік — прибрати)" : "ВИМКНЕНО (Клік — виділити смугу ГТ)";
+                _gameUI.SetToolHint($"🚌 [Bus Lane] Дорога #{hoveredEdge.Id}: {status} | Ємність авто: {hoveredEdge.Capacity:F0} авт/год", new Color(1.0f, 0.75f, 0.25f));
+            }
+            else
+            {
+                _gameUI.SetToolHint("🚌 [Bus Lane] Наведіть курсор на дорогу та клікніть, щоб перемкнути виділену смугу ГТ.", new Color(1.0f, 0.65f, 0.2f));
+            }
+            return;
+        }
+        else
+        {
+            _previewRenderer.SetBusLaneHoverEdge(null);
         }
 
         if (_currentMode == InteractionMode.CreateTransitRoute)
@@ -618,6 +696,9 @@ public partial class Main : Node2D
             case InteractionMode.BuildCurvedRoad:
                 HandleRoadBuildClick();
                 break;
+            case InteractionMode.ToggleBusLane:
+                HandleToggleBusLaneClick(mouseWorld);
+                break;
             case InteractionMode.Demolish:
                 HandleDemolishClick(gx, gy);
                 break;
@@ -639,6 +720,36 @@ public partial class Main : Node2D
         }
     }
 
+    private void HandleToggleBusLaneClick(Vector2 mouseWorld)
+    {
+        var snap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, snapRadius: 28f);
+        RoadEdge targetEdge = snap.SnappedEdge;
+        if (targetEdge == null && snap.Type == SnapType.Node && snap.SnappedNode != null)
+        {
+            if (_roadGraph.AdjacencyEdges.TryGetValue(snap.SnappedNode.Id, out var inc) && inc.Count > 0)
+            {
+                targetEdge = _roadGraph.GetEdge(inc[0]);
+            }
+        }
+
+        if (targetEdge == null)
+        {
+            _gameUI.SetToolHint("⚠️ Клікніть безпосередньо на сегмент дороги, щоб перемкнути виділену смугу ГТ.", Colors.Coral);
+            return;
+        }
+
+        bool enabled = _roadGraph.ToggleBusLaneBidirectional(targetEdge.Id);
+        RecalculateODMatrix();
+        _roadRenderer.Refresh();
+        _vehicleRenderer.QueueRedraw();
+        UpdateHoverTarget();
+
+        string stateMsg = enabled
+            ? $"✅ Виділену смугу ГТ УВІМКНЕНО на дорозі #{targetEdge.Id}! Автобуси ігнорують затори (ємність авто: {targetEdge.Capacity:F0})."
+            : $"🔄 Виділену смугу ГТ ВИМКНЕНО на дорозі #{targetEdge.Id}. Повну ємність для авто відновлено ({targetEdge.Capacity:F0}).";
+        _gameUI.SetToolHint(stateMsg, enabled ? new Color(0.3f, 1.0f, 0.5f) : new Color(1.0f, 0.8f, 0.4f));
+    }
+
     private void HandleInspectClick(int gx, int gy)
     {
         Vector2 mouseWorld = GetGlobalMousePosition();
@@ -657,7 +768,7 @@ public partial class Main : Node2D
             _cityRenderer.SetSelectedZone(-1);
             _cityRenderer.SetSelectedParcel(clickedParcel.Id);
             _commuteOverlay.SelectParcel(clickedParcel.Id, _parcelManager, _roadGraph);
-            _gameUI.ShowParcelInfographics(clickedParcel, _parcelManager, _odMatrix, _grid);
+            _gameUI.ShowParcelInfographics(clickedParcel, _parcelManager, _tazManager, _optimizedOdMatrix, _grid);
             return;
         }
 
@@ -673,8 +784,8 @@ public partial class Main : Node2D
                 _selectedZoneId = zoneId;
                 _cityRenderer.SetSelectedParcel(-1);
                 _cityRenderer.SetSelectedZone(zoneId);
-                _commuteOverlay.SelectZone(zoneId, _distanceMatrix, _roadGraph);
-                _gameUI.ShowZoneInfographics(zone, _grid, _odMatrix, _distanceMatrix);
+                _commuteOverlay.SelectZone(zoneId, _roadGraph);
+                _gameUI.ShowZoneInfographics(zone, _grid, _tazManager, _optimizedOdMatrix);
                 return;
             }
         }
@@ -932,13 +1043,13 @@ public partial class Main : Node2D
 
     private void CompleteRoadConstruction()
     {
-        _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+        _roadGraph.PathCache.Clear();
+        _roadGraph.WalkingPathCache.Clear();
         _trafficLights.BuildIntersections(_roadGraph);
         _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
         _pedestrianManager.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
-        RecalculateODMatrix();
         _parcelManager?.RefreshParcels(_roadGraph);
+        RecalculateODMatrix();
         _roadRenderer.Refresh();
         _cityRenderer.Refresh();
         _vehicleRenderer.QueueRedraw();
@@ -992,8 +1103,8 @@ public partial class Main : Node2D
                         {
                             ClearInspectSelection();
                         }
-                        _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-                        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+                        _roadGraph.PathCache.Clear();
+                        _roadGraph.WalkingPathCache.Clear();
                         _trafficLights.BuildIntersections(_roadGraph);
                         _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
                         _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
@@ -1001,7 +1112,7 @@ public partial class Main : Node2D
                         _cityRenderer.Refresh();
                         _roadRenderer.Refresh();
                         _vehicleRenderer.QueueRedraw();
-                        _gameUI.ShowCityOverview(_grid, _odMatrix);
+                        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
                         _gameUI.SetToolHint($"💥 Demolished isolated building/node at ({gx}, {gy}).", new Color(1f, 0.4f, 0.3f));
                         return;
@@ -1078,13 +1189,13 @@ public partial class Main : Node2D
                     _roadGraph.DetachAndRemoveNode(zone.Id);
                 }
 
-                _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-                _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+                _roadGraph.PathCache.Clear();
+                _roadGraph.WalkingPathCache.Clear();
                 _trafficLights.BuildIntersections(_roadGraph);
                 _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
                 _pedestrianManager.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
-                RecalculateODMatrix();
                 _parcelManager?.RefreshParcels(_roadGraph);
+                RecalculateODMatrix();
                 _roadRenderer.Refresh();
                 _cityRenderer.Refresh();
                 _vehicleRenderer.QueueRedraw();
@@ -1141,14 +1252,12 @@ public partial class Main : Node2D
         {
             _economyManager.Spend(EconomyManager.ZoningCost);
             _roadGraph.EnsureNode(zoneId, _grid.GetWorldCenter(zoneId));
-            _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-            _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
             RecalculateODMatrix();
             _cityRenderer.Refresh();
             _roadRenderer.Refresh();
             _vehicleRenderer.QueueRedraw();
 
-            _gameUI.ShowCityOverview(_grid, _odMatrix);
+            _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
             string typeName = type switch
             {
@@ -1188,8 +1297,6 @@ public partial class Main : Node2D
             if (_roadGraph.GetNode(zoneId) != null && _roadGraph.GetNodeDegree(zoneId) == 0)
             {
                 _roadGraph.DetachAndRemoveNode(zoneId);
-                _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-                _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
                 _trafficLights.BuildIntersections(_roadGraph);
                 _roadRenderer.Refresh();
                 _gameUI.SetToolHint($"🧹 Cleared orphan connector dot at ({gx}, {gy}).", new Color(1f, 0.7f, 0.4f));
@@ -1213,8 +1320,6 @@ public partial class Main : Node2D
             _roadGraph.DetachAndRemoveNode(zoneId);
         }
 
-        _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-        _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
         _trafficLights.BuildIntersections(_roadGraph);
         _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
         _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
@@ -1223,7 +1328,7 @@ public partial class Main : Node2D
         _roadRenderer.Refresh();
         _vehicleRenderer.QueueRedraw();
 
-        _gameUI.ShowCityOverview(_grid, _odMatrix);
+        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
         _gameUI.SetToolHint($"🧹 Cleared cell ({gx}, {gy}) back to empty terrain.", new Color(1f, 0.7f, 0.4f));
     }
@@ -1250,10 +1355,12 @@ public partial class Main : Node2D
             _parcelManager.ZoneParcel(p.Id, type, ensureAccessNode: false);
         }
 
+        RecalculateODMatrix();
         _cityRenderer.Refresh();
         _roadRenderer.Refresh();
         _previewRenderer.ClearHoveredParcels();
         UpdateHoverTarget();
+        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
         string sideStr = side == ParcelSide.Left ? "Left" : "Right";
         string typeName = type switch
@@ -1284,9 +1391,11 @@ public partial class Main : Node2D
             _parcelManager.DezoneParcel(p.Id);
         }
 
+        RecalculateODMatrix();
         _cityRenderer.Refresh();
         _previewRenderer.ClearHoveredParcels();
         UpdateHoverTarget();
+        _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
 
         string sideStr = side == ParcelSide.Left ? "Left" : "Right";
         string msg = toDezone.Count == 1
@@ -1352,12 +1461,13 @@ public partial class Main : Node2D
             stopNodeId = newNode.Id;
 
             // Rebuild topology and matrices
-            _distanceMatrix = _roadGraph.RebuildAfterTopologyChange(_grid.ZoneCount);
-            _walkingDistanceMatrix = _roadGraph.ComputeWalkingDistanceMatrix(_grid.ZoneCount);
+            _roadGraph.PathCache.Clear();
+            _roadGraph.WalkingPathCache.Clear();
             _trafficLights.BuildIntersections(_roadGraph);
             _carTrafficManager.HandleInvalidatedEdges(_roadGraph);
             _pedestrianManager.HandleInvalidatedEdges(_roadGraph);
             _parcelManager?.RefreshParcels(_roadGraph);
+            RecalculateODMatrix();
             _roadRenderer.Refresh();
             _cityRenderer.Refresh();
             _vehicleRenderer.QueueRedraw();

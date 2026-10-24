@@ -18,10 +18,13 @@ public class TransitStop
     public int ZoneId;
     public float WaitingPassengers;
     public string Name;
+    public float HourlyArrivalRate { get; set; }
 }
 
 public class TransitRoute
 {
+    public const float StopDwellPenaltyMinutes = 0.35f;
+
     public int Id;
     public string Name;
     public List<int> PathNodeIds = new List<int>(); // Complete sequential road nodes
@@ -30,16 +33,155 @@ public class TransitRoute
     public float FrequencyMinutes;
     public bool IsLoop;
 
+    // Prefix sum arrays of bus travel time in minutes along PathNodeIds
+    public float[] ForwardCumulativeMinutes = Array.Empty<float>();
+    public float[] BackwardCumulativeMinutes = Array.Empty<float>();
+    public float LoopClosureSegmentMinutes = 0f;
+    public readonly Dictionary<int, int> NodeToFirstPathIndex = new Dictionary<int, int>();
+
     // Financial & Operational Turnovers
     public float TicketPrice = 12.0f; // 12 ₴ / $ per ticket
+    public float AssignedHourlyDemand { get; set; } = 0f;
     public float DailyPassengers = 0f;
     public float DailyRevenue = 0f;
     public float DailyOperatingCost = 0f;
     public float NetDailyProfit => DailyRevenue - DailyOperatingCost;
     public float RoundTripTimeMinutes = 35f; // Cycle time
     public int FleetSize = 6;
-    public float HeadwayMinutes => FleetSize > 0 ? (RoundTripTimeMinutes / FleetSize) : FrequencyMinutes;
+    public float HeadwayMinutes => FleetSize > 0 ? (RoundTripTimeMinutes / FleetSize) : Mathf.Max(1f, FrequencyMinutes);
     public float AverageOccupancy = 65f; // % capacity utilized
+
+    /// <summary>
+    /// Recomputes prefix sums of bus travel times along PathNodeIds using RoadEdge.GetBusTravelTime()
+    /// plus StopDwellPenaltyMinutes (0.35 min) per intermediate stop.
+    /// </summary>
+    public void UpdatePrefixTravelTimes(RoadGraph graph)
+    {
+        int n = PathNodeIds.Count;
+        if (n == 0)
+        {
+            NodeToFirstPathIndex.Clear();
+            return;
+        }
+
+        if (ForwardCumulativeMinutes.Length < n)
+        {
+            ForwardCumulativeMinutes = new float[Math.Max(n * 2, 32)];
+            BackwardCumulativeMinutes = new float[Math.Max(n * 2, 32)];
+        }
+
+        NodeToFirstPathIndex.Clear();
+        for (int i = 0; i < n; i++)
+        {
+            int nodeId = PathNodeIds[i];
+            if (!NodeToFirstPathIndex.ContainsKey(nodeId))
+            {
+                NodeToFirstPathIndex[nodeId] = i;
+            }
+        }
+
+        ForwardCumulativeMinutes[0] = 0f;
+        BackwardCumulativeMinutes[0] = 0f;
+
+        for (int k = 0; k < n - 1; k++)
+        {
+            int u = PathNodeIds[k];
+            int v = PathNodeIds[k + 1];
+
+            float fwdEdgeTime = 1.28f;
+            float bwdEdgeTime = 1.28f;
+
+            if (graph != null)
+            {
+                int fwdId = graph.FindEdgeId(u, v);
+                if (fwdId >= 0 && fwdId < graph.Edges.Count)
+                {
+                    fwdEdgeTime = graph.Edges[fwdId].GetBusTravelTime();
+                }
+
+                int bwdId = graph.FindEdgeId(v, u);
+                if (bwdId >= 0 && bwdId < graph.Edges.Count)
+                {
+                    bwdEdgeTime = graph.Edges[bwdId].GetBusTravelTime();
+                }
+                else
+                {
+                    bwdEdgeTime = fwdEdgeTime;
+                }
+            }
+
+            float fwdDwell = StopNodeIds.Contains(v) ? StopDwellPenaltyMinutes : 0f;
+            float bwdDwell = StopNodeIds.Contains(u) ? StopDwellPenaltyMinutes : 0f;
+
+            ForwardCumulativeMinutes[k + 1] = ForwardCumulativeMinutes[k] + fwdEdgeTime + fwdDwell;
+            BackwardCumulativeMinutes[k + 1] = BackwardCumulativeMinutes[k] + bwdEdgeTime + bwdDwell;
+        }
+
+        LoopClosureSegmentMinutes = 0f;
+        if (IsLoop && n > 1)
+        {
+            int lastNode = PathNodeIds[n - 1];
+            int firstNode = PathNodeIds[0];
+            float closeTime = 1.28f;
+            if (graph != null)
+            {
+                int closeId = graph.FindEdgeId(lastNode, firstNode);
+                if (closeId >= 0 && closeId < graph.Edges.Count)
+                {
+                    closeTime = graph.Edges[closeId].GetBusTravelTime();
+                }
+            }
+            float closeDwell = StopNodeIds.Contains(firstNode) ? StopDwellPenaltyMinutes : 0f;
+            LoopClosureSegmentMinutes = closeTime + closeDwell;
+        }
+    }
+
+    /// <summary>
+    /// Returns the exact in-vehicle bus travel time in minutes between two stops on this route in O(1) time.
+    /// </summary>
+    public float GetInVehicleTimeBetweenStops(int boardStopNodeId, int alightStopNodeId, RoadGraph graph = null)
+    {
+        int n = PathNodeIds.Count;
+        if (n < 2 || boardStopNodeId == alightStopNodeId) return 0.5f;
+
+        if (NodeToFirstPathIndex.Count == 0 || ForwardCumulativeMinutes.Length < n)
+        {
+            UpdatePrefixTravelTimes(graph);
+        }
+
+        if (!NodeToFirstPathIndex.TryGetValue(boardStopNodeId, out int idxA) ||
+            !NodeToFirstPathIndex.TryGetValue(alightStopNodeId, out int idxB))
+        {
+            return 5.0f;
+        }
+
+        if (idxA == idxB) return 0.5f;
+
+        if (!IsLoop)
+        {
+            if (idxA < idxB)
+            {
+                return MathF.Max(0.5f, ForwardCumulativeMinutes[idxB] - ForwardCumulativeMinutes[idxA]);
+            }
+            else
+            {
+                return MathF.Max(0.5f, BackwardCumulativeMinutes[idxA] - BackwardCumulativeMinutes[idxB]);
+            }
+        }
+        else
+        {
+            float totalLoop = ForwardCumulativeMinutes[n - 1] + LoopClosureSegmentMinutes;
+            if (idxA < idxB)
+            {
+                return MathF.Max(0.5f, ForwardCumulativeMinutes[idxB] - ForwardCumulativeMinutes[idxA]);
+            }
+            else
+            {
+                float wrapTime = (totalLoop - ForwardCumulativeMinutes[idxA]) + ForwardCumulativeMinutes[idxB];
+                return MathF.Max(0.5f, wrapTime);
+            }
+        }
+    }
 
     /// <summary>
     /// Calculates the operational target headway in minutes modulated by time of day (rush hour vs. off-peak vs. night).
@@ -246,6 +388,9 @@ public class TransitManager
     private Random _random = new Random(123);
     private int _nextRouteId = 0;
     private int _nextVehicleId = 0;
+    private bool _hasTazDemandAssignment = false;
+    private readonly List<int> _directRouteBuffer = new List<int>();
+    private readonly List<(int FirstRouteId, int SecondRouteId, int TransferStopNodeId)> _transferRouteBuffer = new List<(int, int, int)>();
 
     /// <summary>Next available route ID counter.</summary>
     public int NextRouteId => _nextRouteId;
@@ -759,7 +904,215 @@ public class TransitManager
         var route = Routes.FirstOrDefault(r => r.Id == routeId);
         if (route == null) return false;
         route.TicketPrice = Mathf.Max(1f, price);
+        if (_hasTazDemandAssignment)
+        {
+            route.DailyRevenue = route.DailyPassengers * route.TicketPrice;
+        }
         return true;
+    }
+
+    /// <summary>
+    /// Recomputes prefix travel times for all active transit routes based on current road graph BPR congestion and bus lanes.
+    /// </summary>
+    public void UpdateAllRouteTravelTimes(RoadGraph graph)
+    {
+        for (int i = 0; i < Routes.Count; i++)
+        {
+            Routes[i].UpdatePrefixTravelTimes(graph);
+        }
+    }
+
+    /// <summary>
+    /// Assigns macroscopic transit passenger demand from OptimizedODMatrix across direct and 1-transfer routes
+    /// and updates stop arrival rates and route financial turnovers.
+    /// </summary>
+    public void AssignPassengerDemandFromTaz(TazManager tazManager, OptimizedODMatrix matrix, RoadGraph graph)
+    {
+        _hasTazDemandAssignment = true;
+        UpdateAllRouteTravelTimes(graph);
+
+        for (int i = 0; i < Routes.Count; i++)
+        {
+            var route = Routes[i];
+            route.AssignedHourlyDemand = 0f;
+            foreach (int stopNodeId in route.StopNodeIds)
+            {
+                if (!Stops.ContainsKey(stopNodeId))
+                {
+                    Stops[stopNodeId] = new TransitStop
+                    {
+                        NodeId = stopNodeId,
+                        ZoneId = stopNodeId,
+                        WaitingPassengers = 0f,
+                        HourlyArrivalRate = 0f,
+                        Name = $"Station ({stopNodeId})"
+                    };
+                }
+            }
+        }
+
+        foreach (var stop in Stops.Values)
+        {
+            stop.HourlyArrivalRate = 0f;
+        }
+
+        if (tazManager != null && matrix != null && Routes.Count > 0)
+        {
+            int k = tazManager.ActiveZones.Count;
+            for (int i = 0; i < k; i++)
+            {
+                var origTaz = tazManager.GetTaz(i);
+                if (origTaz == null) continue;
+
+                for (int j = 0; j < k; j++)
+                {
+                    if (i == j) continue;
+                    float transitTrips = matrix.GetTransitTrips(i, j);
+                    if (transitTrips <= 0.001f) continue;
+
+                    var destTaz = tazManager.GetTaz(j);
+                    if (destTaz == null) continue;
+
+                    int connType = tazManager.GetTransitConnectionType(origTaz, destTaz);
+                    if (connType == 1)
+                    {
+                        tazManager.GetDirectRouteIds(origTaz, destTaz, _directRouteBuffer);
+                        if (_directRouteBuffer.Count > 0)
+                        {
+                            float weightSum = 0f;
+                            for (int m = 0; m < _directRouteBuffer.Count; m++)
+                            {
+                                var r = FindRouteById(_directRouteBuffer[m]);
+                                if (r == null) continue;
+                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r, graph);
+                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r, graph);
+                                float ivt = (sOrig != -1 && sDest != -1) ? r.GetInVehicleTimeBetweenStops(sOrig, sDest, graph) : 10f;
+                                float effCost = Mathf.Max(1.0f, r.HeadwayMinutes * 0.5f + ivt);
+                                weightSum += 1.0f / effCost;
+                            }
+
+                            for (int m = 0; m < _directRouteBuffer.Count; m++)
+                            {
+                                var r = FindRouteById(_directRouteBuffer[m]);
+                                if (r == null) continue;
+
+                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r, graph);
+                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r, graph);
+                                float ivt = (sOrig != -1 && sDest != -1) ? r.GetInVehicleTimeBetweenStops(sOrig, sDest, graph) : 10f;
+                                float effCost = Mathf.Max(1.0f, r.HeadwayMinutes * 0.5f + ivt);
+                                float w = 1.0f / effCost;
+                                float flowShare = weightSum > 0f
+                                    ? transitTrips * (w / weightSum)
+                                    : (transitTrips / _directRouteBuffer.Count);
+
+                                r.AssignedHourlyDemand += flowShare;
+
+                                if (sOrig != -1 && Stops.TryGetValue(sOrig, out var boardStop))
+                                {
+                                    boardStop.HourlyArrivalRate += flowShare;
+                                }
+                            }
+                        }
+                    }
+                    else if (connType == 2)
+                    {
+                        tazManager.GetTransferRoutes(origTaz, destTaz, this, graph, _transferRouteBuffer);
+                        if (_transferRouteBuffer.Count > 0)
+                        {
+                            float weightSum = 0f;
+                            for (int c = 0; c < _transferRouteBuffer.Count; c++)
+                            {
+                                var chain = _transferRouteBuffer[c];
+                                var r1 = FindRouteById(chain.FirstRouteId);
+                                var r2 = FindRouteById(chain.SecondRouteId);
+                                if (r1 == null || r2 == null) continue;
+
+                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r1, graph);
+                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r2, graph);
+                                float ivt1 = (sOrig != -1 && chain.TransferStopNodeId != -1) ? r1.GetInVehicleTimeBetweenStops(sOrig, chain.TransferStopNodeId, graph) : 8f;
+                                float ivt2 = (chain.TransferStopNodeId != -1 && sDest != -1) ? r2.GetInVehicleTimeBetweenStops(chain.TransferStopNodeId, sDest, graph) : 8f;
+                                float combinedCost = Mathf.Max(1.0f, (r1.HeadwayMinutes + r2.HeadwayMinutes) * 0.5f + ivt1 + ivt2);
+                                weightSum += 1.0f / combinedCost;
+                            }
+
+                            for (int c = 0; c < _transferRouteBuffer.Count; c++)
+                            {
+                                var chain = _transferRouteBuffer[c];
+                                var r1 = FindRouteById(chain.FirstRouteId);
+                                var r2 = FindRouteById(chain.SecondRouteId);
+                                if (r1 == null || r2 == null) continue;
+
+                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r1, graph);
+                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r2, graph);
+                                float ivt1 = (sOrig != -1 && chain.TransferStopNodeId != -1) ? r1.GetInVehicleTimeBetweenStops(sOrig, chain.TransferStopNodeId, graph) : 8f;
+                                float ivt2 = (chain.TransferStopNodeId != -1 && sDest != -1) ? r2.GetInVehicleTimeBetweenStops(chain.TransferStopNodeId, sDest, graph) : 8f;
+                                float combinedCost = Mathf.Max(1.0f, (r1.HeadwayMinutes + r2.HeadwayMinutes) * 0.5f + ivt1 + ivt2);
+                                float w = 1.0f / combinedCost;
+                                float flowShare = weightSum > 0f
+                                    ? transitTrips * (w / weightSum)
+                                    : (transitTrips / _transferRouteBuffer.Count);
+
+                                r1.AssignedHourlyDemand += flowShare;
+                                if (sOrig != -1 && Stops.TryGetValue(sOrig, out var boardStop))
+                                {
+                                    boardStop.HourlyArrivalRate += flowShare;
+                                }
+
+                                r2.AssignedHourlyDemand += flowShare;
+                                if (chain.TransferStopNodeId != -1 && Stops.TryGetValue(chain.TransferStopNodeId, out var transferStop))
+                                {
+                                    transferStop.HourlyArrivalRate += flowShare;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update route daily projections and stop queues
+        for (int i = 0; i < Routes.Count; i++)
+        {
+            var route = Routes[i];
+            if (route.AssignedHourlyDemand <= 0.001f)
+            {
+                route.AssignedHourlyDemand = 0f;
+                route.DailyPassengers = 0f;
+                route.DailyRevenue = 0f;
+                route.AverageOccupancy = 0f;
+            }
+            else
+            {
+                route.DailyPassengers = route.AssignedHourlyDemand * 24.0f;
+                route.DailyRevenue = route.DailyPassengers * route.TicketPrice;
+                float hourlyCapacity = (60.0f / Mathf.Max(1.0f, route.HeadwayMinutes)) * 75.0f;
+                route.AverageOccupancy = Mathf.Clamp((route.AssignedHourlyDemand / Mathf.Max(1.0f, hourlyCapacity)) * 100.0f, 5.0f, 100.0f);
+            }
+
+            if (route.DailyOperatingCost <= 0f)
+            {
+                route.DailyOperatingCost = route.FleetSize * 360.0f + 1200.0f;
+            }
+        }
+
+        foreach (var stop in Stops.Values)
+        {
+            if (stop.HourlyArrivalRate <= 0.001f)
+            {
+                stop.HourlyArrivalRate = 0f;
+                stop.WaitingPassengers = 0f;
+            }
+        }
+    }
+
+    private TransitRoute FindRouteById(int routeId)
+    {
+        for (int i = 0; i < Routes.Count; i++)
+        {
+            if (Routes[i].Id == routeId)
+                return Routes[i];
+        }
+        return null;
     }
 
     private void DeployLineVehicles(TransitRoute route, int count)
@@ -841,11 +1194,29 @@ public class TransitManager
 
         float speedMult = Mathf.Clamp(gameSpeedMultiplier, 0.2f, 15.0f);
 
-        // Periodically refresh passenger demand at stops (elevated during peak periods)
-        float demandRate = IsPeakHour(CurrentGameHour) ? 0.7f : 0.4f;
-        foreach (var stop in Stops.Values)
+        // Periodically refresh passenger demand at stops
+        if (_hasTazDemandAssignment)
         {
-            stop.WaitingPassengers = Mathf.Min(stop.WaitingPassengers + delta * speedMult * demandRate, 80f);
+            float clockRateHours = (1.0f / 60.0f) * speedMult;
+            foreach (var stop in Stops.Values)
+            {
+                if (stop.HourlyArrivalRate > 0f)
+                {
+                    stop.WaitingPassengers = Mathf.Clamp(stop.WaitingPassengers + stop.HourlyArrivalRate * delta * clockRateHours, 0f, 120f);
+                }
+                else
+                {
+                    stop.WaitingPassengers = 0f;
+                }
+            }
+        }
+        else
+        {
+            float demandRate = IsPeakHour(CurrentGameHour) ? 0.7f : 0.4f;
+            foreach (var stop in Stops.Values)
+            {
+                stop.WaitingPassengers = Mathf.Min(stop.WaitingPassengers + delta * speedMult * demandRate, 80f);
+            }
         }
 
         foreach (var vehicle in Vehicles)
@@ -1001,9 +1372,27 @@ public class TransitManager
                 continue;
             }
 
-            // 5. Advance vehicle along the segment
+            // 5. Advance vehicle along the segment (affected by road congestion unless edge has a dedicated Bus Lane)
+            float congestionFactor = 1.0f;
+            if (graph != null)
+            {
+                int segEdgeId = graph.FindEdgeId(currNodeId, nextNodeId);
+                if (segEdgeId >= 0 && segEdgeId < graph.Edges.Count)
+                {
+                    var segEdge = graph.Edges[segEdgeId];
+                    if (!segEdge.HasBusLane)
+                    {
+                        float congRatio = segEdge.GetCongestionRatio();
+                        if (congRatio > 0.4f)
+                        {
+                            congestionFactor = Mathf.Clamp(1.0f / (1.0f + 0.35f * Mathf.Pow(congRatio, 2f)), 0.25f, 1.0f);
+                        }
+                    }
+                }
+            }
+
             float rushBonus = IsPeakHour(CurrentGameHour) ? 1.15f : 1.0f;
-            float moveSpeed = 0.55f * speedMult * speedFactor * rushBonus;
+            float moveSpeed = 0.55f * speedMult * speedFactor * congestionFactor * rushBonus;
             vehicle.ProgressToNext += delta * moveSpeed;
 
             // 6. Reached next node:
@@ -1041,9 +1430,16 @@ public class TransitManager
                     vehicle.StateTimer = baseDwell + holdingTime;
                     vehicle.IsHolding = (holdingTime > 0.2f);
 
-                    // Passengers alight (20% to 40%)
-                    int alighting = Mathf.RoundToInt(vehicle.Passengers * (0.20f + (float)_random.NextDouble() * 0.20f));
-                    vehicle.Passengers = Mathf.Max(0, vehicle.Passengers - alighting);
+                    // Passengers alight (20% to 40%, or 100% if route has 0 TAZ demand)
+                    if (_hasTazDemandAssignment && route.AssignedHourlyDemand <= 0.001f)
+                    {
+                        vehicle.Passengers = 0f;
+                    }
+                    else
+                    {
+                        int alighting = Mathf.RoundToInt(vehicle.Passengers * (0.20f + (float)_random.NextDouble() * 0.20f));
+                        vehicle.Passengers = Mathf.Max(0, vehicle.Passengers - alighting);
+                    }
 
                     // Passengers board from waiting stop queue
                     if (Stops.TryGetValue(arrivedNodeId, out var stop))
@@ -1054,17 +1450,25 @@ public class TransitManager
                             vehicle.Passengers += boarding;
                             stop.WaitingPassengers = Mathf.Max(0, stop.WaitingPassengers - boarding);
 
-                            // Real-time financial turnover tracking
-                            route.DailyPassengers += boarding * 6f;
-                            route.DailyRevenue += (boarding * 6f) * route.TicketPrice;
+                            if (!_hasTazDemandAssignment)
+                            {
+                                // Real-time financial turnover tracking (legacy fallback)
+                                route.DailyPassengers += boarding * 6f;
+                                route.DailyRevenue += (boarding * 6f) * route.TicketPrice;
+                            }
                         }
                     }
                 }
             }
 
             // Real-time operating expenses (fuel, driver salary, vehicle maintenance)
-            route.DailyOperatingCost += delta * speedMult * 6.5f;
-            route.AverageOccupancy = Mathf.Lerp(route.AverageOccupancy, (vehicle.Passengers / vehicle.Capacity) * 100f, 0.02f);
+            if (!_hasTazDemandAssignment)
+            {
+                route.DailyOperatingCost += delta * speedMult * 6.5f;
+            }
+            route.AverageOccupancy = _hasTazDemandAssignment && route.AssignedHourlyDemand <= 0.001f
+                ? 0f
+                : Mathf.Lerp(route.AverageOccupancy, (vehicle.Passengers / vehicle.Capacity) * 100f, 0.02f);
         }
     }
 

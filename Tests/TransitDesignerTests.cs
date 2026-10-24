@@ -534,4 +534,121 @@ public class TransitDesignerTests
         Assert.That(v2.State, Is.EqualTo(VehicleState.TerminusLayover), "Turnaround dispatch must hold v2 while v1 is still clearing terminus");
         Assert.That(v2.StateTimer, Is.GreaterThan(0f));
     }
+
+    [Test]
+    public void RoutePrefixTravelTimes_AccountsForIntermediateStopsAndDetours()
+    {
+        int sStart = _grid.GetZoneId(2, 4);
+        int sMid = _grid.GetZoneId(4, 4);
+        int sEnd = _grid.GetZoneId(6, 4);
+
+        var path = _roadGraph.GetShortestNodePath(sStart, sEnd);
+        Assert.That(path, Is.Not.Null);
+
+        // Express route (only start and end stops)
+        var expressRoute = _transitManager.CreateRoute(
+            "Express",
+            path,
+            new HashSet<int> { sStart, sEnd },
+            Colors.Blue,
+            isLoop: false,
+            fleetSize: 4);
+
+        // Local route with intermediate stop sMid
+        var localRoute = _transitManager.CreateRoute(
+            "Local",
+            path,
+            new HashSet<int> { sStart, sMid, sEnd },
+            Colors.Green,
+            isLoop: false,
+            fleetSize: 4);
+
+        expressRoute.UpdatePrefixTravelTimes(_roadGraph);
+        localRoute.UpdatePrefixTravelTimes(_roadGraph);
+
+        float expressTime = expressRoute.GetInVehicleTimeBetweenStops(sStart, sEnd, _roadGraph);
+        float localTime = localRoute.GetInVehicleTimeBetweenStops(sStart, sEnd, _roadGraph);
+
+        // Local route has 1 extra intermediate stop (+0.35 min dwell penalty)
+        Assert.That(localTime - expressTime, Is.EqualTo(TransitRoute.StopDwellPenaltyMinutes).Within(0.01f),
+            "Intermediate bus stop must add exactly 0.35 minutes to route prefix sum travel time");
+    }
+
+    [Test]
+    public void DedicatedBusLane_BypassesRoadCongestion_AndIncreasesTransitModeShare()
+    {
+        var grid = new CityGrid(20, 20, 64f);
+        for (int x = 1; x <= 3; x++)
+        {
+            int id = grid.GetZoneId(x, 10);
+            grid.ZoneCell(id, ZoneType.Residential);
+            grid.GetZone(id).Population = 5000;
+        }
+        for (int x = 14; x <= 16; x++)
+        {
+            int id = grid.GetZoneId(x, 10);
+            grid.ZoneCell(id, ZoneType.Commercial);
+            grid.GetZone(id).Jobs = 5000;
+        }
+        for (int x = 1; x <= 16; x++)
+        {
+            int id = grid.GetZoneId(x, 10);
+            if (grid.GetZone(id).Type == ZoneType.Empty)
+            {
+                grid.ZoneCell(id, ZoneType.Residential);
+                grid.GetZone(id).Population = 10;
+            }
+        }
+
+        var roadGraph = new RoadGraph();
+        roadGraph.BuildFromGrid(grid);
+
+        var transit = new TransitManager();
+        int sWest = grid.GetZoneId(2, 10);
+        int sEast = grid.GetZoneId(15, 10);
+        var trunkPath = roadGraph.GetShortestNodePath(sWest, sEast);
+        var route = transit.CreateRoute("Trunk Express", trunkPath, new HashSet<int> { sWest, sEast }, Colors.Cyan, isLoop: false, fleetSize: 8);
+
+        // Severely congest the trunk corridor edges with heavy traffic
+        for (int i = 0; i < trunkPath.Count - 1; i++)
+        {
+            int eid = roadGraph.FindEdgeId(trunkPath[i], trunkPath[i + 1]);
+            if (eid != -1)
+            {
+                roadGraph.Edges[eid].CurrentVolume = roadGraph.Edges[eid].Capacity * 2.2f;
+            }
+        }
+
+        var tazManager = new TazManager();
+        var odMatrix = new OptimizedODMatrix();
+
+        // 1. Evaluate without Bus Lanes (bus is stuck in the same BPR traffic jam as cars)
+        tazManager.Rebuild(grid, null, roadGraph, transit);
+        odMatrix.Recalculate(tazManager, roadGraph, currentHour: 8.0f, ticketFare: 12f);
+        float transitTripsWithoutBusLane = odMatrix.TotalTransitTrips;
+        float ivtMixedTraffic = route.GetInVehicleTimeBetweenStops(sWest, sEast, roadGraph);
+
+        // 2. Enable Dedicated Bus Lanes along the trunk corridor
+        for (int i = 0; i < trunkPath.Count - 1; i++)
+        {
+            int eid = roadGraph.FindEdgeId(trunkPath[i], trunkPath[i + 1]);
+            if (eid != -1)
+            {
+                float capBefore = roadGraph.Edges[eid].Capacity;
+                roadGraph.SetBusLaneBidirectional(eid, true);
+                Assert.That(roadGraph.Edges[eid].HasBusLane, Is.True);
+                Assert.That(roadGraph.Edges[eid].Capacity, Is.LessThan(capBefore), "Enabling Bus Lane must reduce private car capacity");
+            }
+        }
+
+        tazManager.UpdateTransitConnectionMatrix(transit, roadGraph);
+        float ivtBusLane = route.GetInVehicleTimeBetweenStops(sWest, sEast, roadGraph);
+        Assert.That(ivtBusLane, Is.LessThan(ivtMixedTraffic * 0.5f), "Bus on dedicated Bus Lane must travel at free-flow speed, bypassing congestion");
+
+        odMatrix.Recalculate(tazManager, roadGraph, currentHour: 8.0f, ticketFare: 12f);
+        float transitTripsWithBusLane = odMatrix.TotalTransitTrips;
+
+        Assert.That(transitTripsWithBusLane, Is.GreaterThan(transitTripsWithoutBusLane * 1.25f),
+            "Dedicated Bus Lanes on a congested corridor must significantly shift commuters from cars to public transit");
+    }
 }

@@ -95,6 +95,25 @@ public class RoadsideParcel
     /// <summary>Maximum commercial capacity for this parcel.</summary>
     public int CommercialCap { get; set; }
 
+    /// <summary>Current urban development density tier (Low, Medium, High).</summary>
+    public DensityLevel Density { get; set; } = DensityLevel.Low;
+
+    /// <summary>Alias for <see cref="Density"/>.</summary>
+    public DensityLevel DensityLevel
+    {
+        get => Density;
+        set => Density = value;
+    }
+
+    /// <summary>Normalized Hansen accessibility score in [0.0, 2.0] inherited from the parent TAZ.</summary>
+    public float AccessibilityScore { get; set; } = 1.0f;
+
+    /// <summary>Local road volume-to-capacity ratio (R_congestion) on the fronting road segment / TAZ.</summary>
+    public float LocalCongestion { get; set; } = 0.0f;
+
+    /// <summary>True when local road congestion exceeds 1.5 (R_congestion &gt; 1.5), causing growth stagnation and reduced tax attractiveness.</summary>
+    public bool IsStagnant => LocalCongestion > 1.5f;
+
     /// <summary>Calculated geometric center of the parcel lot boundary.</summary>
     public Vector2 Center
     {
@@ -139,6 +158,7 @@ public class RoadsideParcel
     public void SetZone(ZoneType type, int population = 0, int residentialCap = -1, int jobs = -1, int commercialCap = -1)
     {
         ZoneType = type;
+        Density = DensityLevel.Low;
         switch (type)
         {
             case ZoneType.Residential:
@@ -146,18 +166,24 @@ public class RoadsideParcel
                 Population = population;
                 Jobs = 0;
                 CommercialCap = 0;
+                if (ResidentialCap >= 360) Density = DensityLevel.High;
+                else if (ResidentialCap >= 200) Density = DensityLevel.Medium;
                 break;
             case ZoneType.Commercial:
                 ResidentialCap = 0;
                 Population = 0;
                 Jobs = jobs >= 0 ? jobs : 80;
                 CommercialCap = commercialCap >= 0 ? commercialCap : 100;
+                if (Jobs >= 240) Density = DensityLevel.High;
+                else if (Jobs >= 140) Density = DensityLevel.Medium;
                 break;
             case ZoneType.Industrial:
                 ResidentialCap = 0;
                 Population = 0;
                 Jobs = jobs >= 0 ? jobs : 90;
                 CommercialCap = 0;
+                if (Jobs >= 270) Density = DensityLevel.High;
+                else if (Jobs >= 150) Density = DensityLevel.Medium;
                 break;
             case ZoneType.Empty:
             default:
@@ -170,8 +196,54 @@ public class RoadsideParcel
         }
     }
 
+    /// <summary>
+    /// Sets the parcel's density tier (Low = 1x, Medium = 2x, High = 4x capacity) and updates capacities accordingly.
+    /// </summary>
+    public void SetDensity(DensityLevel targetDensity)
+    {
+        if (ZoneType == ZoneType.Empty) return;
+
+        Density = targetDensity;
+        int mult = targetDensity switch
+        {
+            DensityLevel.High => 4,
+            DensityLevel.Medium => 2,
+            _ => 1
+        };
+
+        switch (ZoneType)
+        {
+            case ZoneType.Residential:
+                ResidentialCap = 120 * mult;
+                if (Population > ResidentialCap) Population = ResidentialCap;
+                break;
+            case ZoneType.Commercial:
+                Jobs = 80 * mult;
+                CommercialCap = 100 * mult;
+                break;
+            case ZoneType.Industrial:
+                Jobs = 90 * mult;
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Upgrades the parcel to the next density tier (Low -&gt; Medium -&gt; High) if not already at High.
+    /// Returns true if an upgrade occurred.
+    /// </summary>
+    public bool UpgradeDensity()
+    {
+        if (ZoneType == ZoneType.Empty || Density == DensityLevel.High)
+            return false;
+
+        SetDensity(Density == DensityLevel.Low ? DensityLevel.Medium : DensityLevel.High);
+        return true;
+    }
+
     /// <summary>Dedicated access road node ID for driveways and citizen access.</summary>
     public int AccessNodeId { get; set; } = -1;
+
+    private static readonly System.Collections.Generic.List<int> _nodeQueryBuffer = new(16);
 
     /// <summary>
     /// Ensures that this parcel connects to a dedicated access node at its access point on the road network.
@@ -187,14 +259,28 @@ public class RoadsideParcel
             return existing;
         }
 
+        graph.EnsureSpatialIndexSynced();
+        graph.SpatialIndex.QueryNodesInRadius(AccessPoint, 10f, _nodeQueryBuffer);
+
         // Check if an existing node is already within 10 px of AccessPoint
-        foreach (var node in graph.Nodes)
+        RoadNode closestNode = null;
+        float bestDist = 10f;
+        for (int i = 0; i < _nodeQueryBuffer.Count; i++)
         {
-            if (node.WorldPosition.DistanceTo(AccessPoint) <= 10f)
+            var node = graph.GetNode(_nodeQueryBuffer[i]);
+            if (node == null) continue;
+            float dist = node.WorldPosition.DistanceTo(AccessPoint);
+            if (dist <= bestDist)
             {
-                AccessNodeId = node.Id;
-                return node;
+                bestDist = dist;
+                closestNode = node;
             }
+        }
+
+        if (closestNode != null)
+        {
+            AccessNodeId = closestNode.Id;
+            return closestNode;
         }
 
         // Not at an existing node: split edge at AccessPoint
@@ -225,14 +311,28 @@ public class RoadsideParcel
         if (AccessNodeId >= 0 && graph.NodeMap.ContainsKey(AccessNodeId))
             return AccessNodeId;
 
+        graph.EnsureSpatialIndexSynced();
+        graph.SpatialIndex.QueryNodesInRadius(AccessPoint, 16f, _nodeQueryBuffer);
+
         // Check proximity to existing nodes (within 16 px)
-        foreach (var node in graph.Nodes)
+        int closestNodeId = -1;
+        float bestDist = 16f;
+        for (int i = 0; i < _nodeQueryBuffer.Count; i++)
         {
-            if (node.WorldPosition.DistanceTo(AccessPoint) <= 16f)
+            var node = graph.GetNode(_nodeQueryBuffer[i]);
+            if (node == null) continue;
+            float dist = node.WorldPosition.DistanceTo(AccessPoint);
+            if (dist <= bestDist)
             {
-                AccessNodeId = node.Id;
-                return node.Id;
+                bestDist = dist;
+                closestNodeId = node.Id;
             }
+        }
+
+        if (closestNodeId != -1)
+        {
+            AccessNodeId = closestNodeId;
+            return closestNodeId;
         }
 
         // Fallback: closest endpoint of the edge

@@ -19,6 +19,8 @@ public partial class CommuteOverlayRenderer : Node2D
 {
     private CityGrid _grid;
     private ODMatrix _odMatrix;
+    private TazManager _tazManager;
+    private OptimizedODMatrix _optimizedOd;
     private RoadGraph _graph;
     private ParcelManager _parcelManager;
     private float _pulseTime = 0f;
@@ -35,9 +37,24 @@ public partial class CommuteOverlayRenderer : Node2D
         _parcelManager = parcelManager;
     }
 
+    public void Initialize(CityGrid grid, TazManager tazManager, OptimizedODMatrix optimizedOd, RoadGraph graph, ParcelManager parcelManager = null, ODMatrix legacyOd = null)
+    {
+        _grid = grid;
+        _tazManager = tazManager;
+        _optimizedOd = optimizedOd;
+        _odMatrix = legacyOd;
+        _graph = graph;
+        _parcelManager = parcelManager;
+    }
+
     public void SetParcelManager(ParcelManager parcelManager)
     {
         _parcelManager = parcelManager;
+    }
+
+    public void SelectZone(int zoneId, RoadGraph graph)
+    {
+        SelectZone(zoneId, null, graph);
     }
 
     public void SelectZone(int zoneId, float[,] distances, RoadGraph graph)
@@ -45,7 +62,14 @@ public partial class CommuteOverlayRenderer : Node2D
         _graph = graph;
         SelectedZoneId = zoneId;
         SelectedParcelId = -1;
-        Targets = CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _odMatrix, distances, graph);
+        if (_tazManager != null && _optimizedOd != null)
+        {
+            Targets = CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _tazManager, _optimizedOd, graph);
+        }
+        else
+        {
+            Targets = CommuteAnalytics.ComputeCommuteTargets(zoneId, _grid, _odMatrix, distances, graph);
+        }
         if (Targets.Count == 0 && (zoneId < 0 || _grid == null || zoneId >= _grid.ZoneCount || _grid.GetZone(zoneId)?.Type == ZoneType.Empty))
         {
             SelectedZoneId = -1;
@@ -60,7 +84,14 @@ public partial class CommuteOverlayRenderer : Node2D
         _parcelManager = parcelManager;
         SelectedParcelId = parcelId;
         SelectedZoneId = -1;
-        Targets = CommuteAnalytics.ComputeCommuteTargetsForParcel(parcelId, _parcelManager, _odMatrix, graph);
+        if (_tazManager != null && _optimizedOd != null)
+        {
+            Targets = CommuteAnalytics.ComputeCommuteTargetsForParcel(parcelId, _parcelManager, _tazManager, _optimizedOd, graph, _grid);
+        }
+        else
+        {
+            Targets = CommuteAnalytics.ComputeCommuteTargetsForParcel(parcelId, _parcelManager, _odMatrix, graph);
+        }
         if (Targets.Count == 0 && (parcelId <= 0 || _parcelManager == null || !_parcelManager.ParcelMap.ContainsKey(parcelId)))
         {
             SelectedParcelId = -1;

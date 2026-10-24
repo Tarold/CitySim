@@ -53,6 +53,43 @@ public sealed class TrafficAnalysisZone
     public float AvgTransitAccessDistance { get; set; } = float.MaxValue;
     public float BestTransitWaitTime { get; set; } = 15.0f;
 
+    // LUTI (Land-Use & Transport Interaction) Hansen Accessibility & Congestion metrics
+    /// <summary>
+    /// Raw gravity denominator / Hansen accessibility sum (_rowScoreSums[i]) before normalization.
+    /// </summary>
+    public float RawAccessibility { get; set; } = 0.0f;
+
+    /// <summary>
+    /// Normalized Hansen transport accessibility index in [0.0, 2.0].
+    /// Reflects how many jobs and services are reachable from this TAZ considering road congestion and transit.
+    /// </summary>
+    public float AccessibilityScore { get; set; } = 1.0f;
+
+    /// <summary>
+    /// Alias for <see cref="AccessibilityScore"/> matching the Hansen AccessibilityIndex terminology.
+    /// </summary>
+    public float AccessibilityIndex
+    {
+        get => AccessibilityScore;
+        set => AccessibilityScore = value;
+    }
+
+    /// <summary>
+    /// Average road volume-to-capacity ratio (R_congestion) across edges serving this TAZ.
+    /// </summary>
+    public float AverageCongestion { get; set; } = 0.0f;
+
+    /// <summary>
+    /// Peak road volume-to-capacity ratio (R_congestion) among edges serving this TAZ.
+    /// </summary>
+    public float MaxCongestion { get; set; } = 0.0f;
+
+    /// <summary>
+    /// Indicates whether this TAZ is gridlocked in severe traffic congestion (R_congestion &gt; 1.5),
+    /// causing growth stagnation and reduced tax attractiveness.
+    /// </summary>
+    public bool IsCongestionStagnant => AverageCongestion > 1.5f || MaxCongestion > 1.5f;
+
     // Direct reverse references for UI inspectors and analytics deaggregation
     public List<Zone> Zones { get; } = new();
     public List<RoadsideParcel> Parcels { get; } = new();
@@ -66,6 +103,10 @@ public sealed class TrafficAnalysisZone
         PrimaryRoadNodeId = -1;
         AvgTransitAccessDistance = float.MaxValue;
         BestTransitWaitTime = 15.0f;
+        RawAccessibility = 0.0f;
+        AccessibilityScore = 0.0f;
+        AverageCongestion = 0.0f;
+        MaxCongestion = 0.0f;
         Connectors.Clear();
         InternalEdgeIds.Clear();
         AccessibleTransitRoutes.Clear();

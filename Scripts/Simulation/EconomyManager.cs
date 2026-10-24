@@ -126,17 +126,49 @@ public class EconomyManager
     }
 
     /// <summary>
+    /// Gets the tax revenue lost due to severe traffic congestion (R_congestion &gt; 1.5) during the last financial tick.
+    /// </summary>
+    public float LastCongestionTaxLoss { get; private set; }
+
+    /// <summary>
+    /// Computes the LUTI tax attractiveness multiplier for a zone or parcel based on local road congestion (R_congestion).
+    /// Districts gridlocked in severe traffic jams (R_congestion &gt; 1.5) lose tax attractiveness.
+    /// </summary>
+    public static float CalculateTaxAttractivenessMultiplier(float congestionRatio, float accessibilityScore = 1.0f)
+    {
+        if (congestionRatio > ParcelManager.CongestionStagnationThreshold)
+        {
+            float excess = congestionRatio - ParcelManager.CongestionStagnationThreshold;
+            float penalty = 1.0f / (1.0f + 0.85f * excess);
+            if (accessibilityScore < 0.8f)
+            {
+                penalty *= Mathf.Lerp(0.75f, 1.0f, Mathf.Clamp(accessibilityScore / 0.8f, 0f, 1f));
+            }
+            return Mathf.Clamp(penalty, 0.25f, 0.95f);
+        }
+        return 1.0f;
+    }
+
+    /// <summary>
     /// Processes a periodic financial tick, deducting maintenance costs and adding tax revenues.
+    /// Districts blocked in severe congestion (R_congestion &gt; 1.5) suffer reduced tax attractiveness.
     /// </summary>
     /// <param name="grid">The city grid used to calculate tax revenues from zones.</param>
-    /// <param name="roadGraph">The road graph used to calculate road maintenance expenses.</param>
+    /// <param name="roadGraph">The road graph used to calculate road maintenance expenses and local congestion.</param>
     /// <param name="transitManager">The transit manager used to calculate transit network expenses.</param>
     /// <param name="parcelManager">Optional roadside parcel manager for ribbon parcel tax revenues.</param>
-    public void ProcessFinancialTick(CityGrid grid, RoadGraph roadGraph, TransitManager transitManager, ParcelManager parcelManager = null)
+    /// <param name="tazManager">Optional TAZ manager for macro-district congestion and accessibility lookup.</param>
+    public void ProcessFinancialTick(
+        CityGrid grid,
+        RoadGraph roadGraph,
+        TransitManager transitManager,
+        ParcelManager parcelManager = null,
+        TazManager tazManager = null)
     {
         float expenses = 0f;
         float popTax = 0f;
         float jobTax = 0f;
+        float baseTaxWithoutPenalty = 0f;
         float transitIncome = 0f;
 
         // 1. Road Maintenance
@@ -164,7 +196,7 @@ public class EconomyManager
             }
         }
         
-        // 3. Taxes from Grid Zones
+        // 3. Taxes from Grid Zones (with LUTI congestion attractiveness evaluation)
         if (grid != null)
         {
             for (int i = 0; i < grid.ZoneCount; i++)
@@ -172,22 +204,83 @@ public class EconomyManager
                 var zone = grid.GetZone(i);
                 if (zone == null || zone.Type == ZoneType.Empty || zone.Type == ZoneType.Entrance) continue;
 
+                float rCong = zone.LocalCongestion;
+                float access = zone.AccessibilityScore;
+
+                if (roadGraph != null)
+                {
+                    rCong = Mathf.Max(rCong, OptimizedODMatrix.GetNodeCongestion(zone.Id, roadGraph));
+                }
+                if (tazManager != null)
+                {
+                    int tazId = tazManager.GetTazIdForZoneTile(zone.GridPos);
+                    var taz = tazManager.GetTaz(tazId);
+                    if (taz != null)
+                    {
+                        rCong = Mathf.Max(rCong, Mathf.Max(taz.AverageCongestion, taz.MaxCongestion));
+                        access = taz.AccessibilityScore;
+                    }
+                }
+
+                float taxMult = CalculateTaxAttractivenessMultiplier(rCong, access);
+
                 if (zone.Type == ZoneType.Residential)
                 {
-                    popTax += (zone.Population * TaxPerPopulation) / 24f;
+                    float baseZ = (zone.Population * TaxPerPopulation) / 24f;
+                    baseTaxWithoutPenalty += baseZ;
+                    popTax += baseZ * taxMult;
                 }
                 else if (zone.Type == ZoneType.Commercial || zone.Type == ZoneType.Industrial)
                 {
-                    jobTax += (zone.Jobs * TaxPerJob) / 24f;
+                    float baseZ = (zone.Jobs * TaxPerJob) / 24f;
+                    baseTaxWithoutPenalty += baseZ;
+                    jobTax += baseZ * taxMult;
                 }
             }
         }
 
-        // 4. Taxes from Roadside Parcels
+        // 4. Taxes from Roadside Parcels (with LUTI congestion attractiveness evaluation)
         if (parcelManager != null)
         {
-            popTax += (parcelManager.TotalPopulation * TaxPerPopulation) / 24f;
-            jobTax += (parcelManager.TotalJobs * TaxPerJob) / 24f;
+            var parcels = parcelManager.Parcels;
+            for (int i = 0; i < parcels.Count; i++)
+            {
+                var parcel = parcels[i];
+                if (parcel == null || parcel.ZoneType == ZoneType.Empty) continue;
+
+                float rCong = parcel.LocalCongestion;
+                float access = parcel.AccessibilityScore;
+
+                if (roadGraph != null)
+                {
+                    rCong = Mathf.Max(rCong, OptimizedODMatrix.GetParcelEdgeCongestion(parcel, roadGraph));
+                }
+                if (tazManager != null)
+                {
+                    int tazId = tazManager.GetTazIdForParcel(parcel.Id);
+                    var taz = tazManager.GetTaz(tazId);
+                    if (taz != null)
+                    {
+                        rCong = Mathf.Max(rCong, taz.AverageCongestion);
+                        access = taz.AccessibilityScore;
+                    }
+                }
+
+                float taxMult = CalculateTaxAttractivenessMultiplier(rCong, access);
+
+                if (parcel.ZoneType == ZoneType.Residential)
+                {
+                    float baseP = (parcel.Population * TaxPerPopulation) / 24f;
+                    baseTaxWithoutPenalty += baseP;
+                    popTax += baseP * taxMult;
+                }
+                else if (parcel.ZoneType == ZoneType.Commercial || parcel.ZoneType == ZoneType.Industrial)
+                {
+                    float baseP = (parcel.Jobs * TaxPerJob) / 24f;
+                    baseTaxWithoutPenalty += baseP;
+                    jobTax += baseP * taxMult;
+                }
+            }
         }
 
         float taxIncome = popTax + jobTax;
@@ -201,6 +294,7 @@ public class EconomyManager
         LastPopulationTax = popTax;
         LastJobTax = jobTax;
         LastTaxRevenue = taxIncome;
+        LastCongestionTaxLoss = Mathf.Max(0f, baseTaxWithoutPenalty - taxIncome);
         LastTransitRevenue = transitIncome;
         LastExpenses = expenses;
     }
