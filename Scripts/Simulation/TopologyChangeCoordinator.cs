@@ -29,7 +29,7 @@ public readonly struct TopologyChangeResult
 /// </summary>
 /// <remarks>
 /// Order: graph path caches → traffic lights → roadside parcels → transit routes → car agents →
-/// pedestrian agents (they depend on transit stops) → TAZ dirty flag. Demand recalculation and
+/// pedestrian agents (they depend on transit stops) → LUTI entrance reachability → TAZ dirty flag. Demand recalculation and
 /// rendering refresh stay with the caller.
 /// </remarks>
 public sealed class TopologyChangeCoordinator : IDisposable
@@ -42,6 +42,7 @@ public sealed class TopologyChangeCoordinator : IDisposable
     private readonly CarTrafficManager _carTrafficManager;
     private readonly PedestrianManager _pedestrianManager;
     private readonly TazManager _tazManager;
+    private readonly LutiGrowthSystem _growthSystem;
 
     public TopologyChangeCoordinator(
         RoadGraph roadGraph,
@@ -51,7 +52,8 @@ public sealed class TopologyChangeCoordinator : IDisposable
         TransitManager transitManager,
         CarTrafficManager carTrafficManager,
         PedestrianManager pedestrianManager,
-        TazManager tazManager)
+        TazManager tazManager,
+        LutiGrowthSystem growthSystem = null)
     {
         _roadGraph = roadGraph ?? throw new ArgumentNullException(nameof(roadGraph));
         _grid = grid;
@@ -61,6 +63,7 @@ public sealed class TopologyChangeCoordinator : IDisposable
         _carTrafficManager = carTrafficManager;
         _pedestrianManager = pedestrianManager;
         _tazManager = tazManager;
+        _growthSystem = growthSystem;
 
         _roadGraph.NodeAdded += OnNodeAdded;
         _roadGraph.NodeRemoved += OnNodeOrEdgeRemoved;
@@ -100,6 +103,7 @@ public sealed class TopologyChangeCoordinator : IDisposable
 
         _carTrafficManager?.HandleInvalidatedEdges(_roadGraph);
         _pedestrianManager?.HandleInvalidatedEdges(_roadGraph, _grid, _transitManager);
+        _growthSystem?.InvalidateReachability();
         _tazManager?.MarkDirty();
 
         HasPendingChanges = false;

@@ -13,7 +13,6 @@ public partial class Main : Node2D
     private RoadGraph _roadGraph;
     private TazManager _tazManager;
     private OptimizedODMatrix _optimizedOdMatrix;
-    private ShortestPathTreeBuffer _entranceTreeBuffer = new ShortestPathTreeBuffer();
     private TrafficEngine _trafficEngine;
     private TransitManager _transitManager;
     private TrafficLightManager _trafficLights;
@@ -21,6 +20,7 @@ public partial class Main : Node2D
     private PedestrianManager _pedestrianManager;
     private ParcelManager _parcelManager;
     private TopologyChangeCoordinator _topology;
+    private readonly LutiGrowthSystem _growthSystem = new LutiGrowthSystem();
     private CityStatsSnapshot _cityStats;
     
     private CityRenderer _cityRenderer;
@@ -116,7 +116,7 @@ public partial class Main : Node2D
 
         _topology = new TopologyChangeCoordinator(
             _roadGraph, _grid, _trafficLights, _parcelManager,
-            _transitManager, _carTrafficManager, _pedestrianManager, _tazManager);
+            _transitManager, _carTrafficManager, _pedestrianManager, _tazManager, _growthSystem);
 
         _camera = new Camera2D();
         _camera.Position = new Vector2(672f, 672f);
@@ -377,126 +377,27 @@ public partial class Main : Node2D
         }
     }
     
-    private readonly HashSet<int> _reachableEntranceNodes = new HashSet<int>();
-
     private void ProcessPopulationGrowth()
     {
-        // Roughly every in-game minute (scheduled by SimulationClock)
+        var growth = _growthSystem.Process(_grid, _roadGraph, _tazManager, _parcelManager);
+
+        if (growth.DensityChanged)
         {
-            var entrances = new List<int>();
-            for (int i = 0; i < _grid.ZoneCount; i++)
+            _cityRenderer?.Refresh();
+        }
+
+        if (growth.LandUseChanged)
+        {
+            _cityStats = _cityStats.WithLandUse(_grid, _parcelManager);
+
+            if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
             {
-                if (_grid.GetZone(i).Type == ZoneType.Entrance)
-                    entrances.Add(i);
+                _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _tazManager, _optimizedOdMatrix, _grid);
             }
-
-            if (entrances.Count == 0) return;
-
-            _reachableEntranceNodes.Clear();
-            foreach (int ent in entrances)
+            else if (_selectedZoneId != -1)
             {
-                _roadGraph.ComputeDijkstraIntoBuffer(ent, _entranceTreeBuffer);
-                for (int k = 0; k < _entranceTreeBuffer.VisitedCount; k++)
-                {
-                    _reachableEntranceNodes.Add(_entranceTreeBuffer.VisitedNodesOrder[k]);
-                }
-            }
-
-            bool uiNeedsUpdate = false;
-            bool densityChanged = false;
-
-            for (int i = 0; i < _grid.ZoneCount; i++)
-            {
-                var zone = _grid.GetZone(i);
-                if (zone == null || zone.Type == ZoneType.Empty || zone.Type == ZoneType.Entrance) continue;
-                if (!_reachableEntranceNodes.Contains(i)) continue;
-
-                if (_tazManager != null)
-                {
-                    int tazId = _tazManager.GetTazIdForZoneTile(zone.GridPos);
-                    var taz = _tazManager.GetTaz(tazId);
-                    if (taz != null)
-                    {
-                        zone.AccessibilityScore = taz.AccessibilityScore;
-                        float nodeCong = OptimizedODMatrix.GetNodeCongestion(zone.Id, _roadGraph);
-                        zone.LocalCongestion = Mathf.Max(nodeCong, taz.AverageCongestion);
-                    }
-                    else
-                    {
-                        zone.LocalCongestion = OptimizedODMatrix.GetNodeCongestion(zone.Id, _roadGraph);
-                    }
-                }
-                else
-                {
-                    zone.LocalCongestion = OptimizedODMatrix.GetNodeCongestion(zone.Id, _roadGraph);
-                }
-
-                // Stagnation check: zones gridlocked in traffic jams (R_congestion > 1.5) stagnate
-                if (zone.LocalCongestion > ParcelManager.CongestionStagnationThreshold)
-                    continue;
-
-                float accessScore = Mathf.Clamp(zone.AccessibilityScore, 0.0f, 2.0f);
-                if (accessScore <= 0.01f) continue;
-
-                if (zone.Type == ZoneType.Residential)
-                {
-                    float congDamp = zone.LocalCongestion > 1.0f
-                        ? (1.0f - 0.5f * (zone.LocalCongestion - 1.0f))
-                        : 1.0f;
-
-                    int growthStep = Mathf.Max(10, Mathf.RoundToInt(50f * (0.4f + 1.2f * accessScore) * congDamp));
-
-                    if (zone.Population < zone.ResidentialCap)
-                    {
-                        zone.Population = Mathf.Min(zone.ResidentialCap, zone.Population + growthStep);
-                        uiNeedsUpdate = true;
-                    }
-
-                    if (zone.ResidentialCap > 0 && zone.Population >= Mathf.RoundToInt(zone.ResidentialCap * 0.85f))
-                    {
-                        if ((zone.Density == DensityLevel.Low && accessScore >= ParcelManager.MediumDensityAccessibilityThreshold) ||
-                            (zone.Density == DensityLevel.Medium && accessScore >= ParcelManager.HighDensityAccessibilityThreshold))
-                        {
-                            if (zone.UpgradeDensity())
-                            {
-                                densityChanged = true;
-                                uiNeedsUpdate = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (_parcelManager != null)
-            {
-                var (parcelPopChanged, parcelDensityUpgraded) = _parcelManager.ProcessLutiEvolution(
-                    _roadGraph,
-                    _tazManager,
-                    _reachableEntranceNodes);
-
-                if (parcelPopChanged) uiNeedsUpdate = true;
-                if (parcelDensityUpgraded) densityChanged = true;
-            }
-
-            if (densityChanged)
-            {
-                _tazManager?.MarkDirty();
-                _cityRenderer?.Refresh();
-            }
-
-            if (uiNeedsUpdate)
-            {
-                _cityStats = _cityStats.WithLandUse(_grid, _parcelManager);
-
-                if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
-                {
-                    _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _tazManager, _optimizedOdMatrix, _grid);
-                }
-                else if (_selectedZoneId != -1)
-                {
-                    var selectedZone = _grid.GetZone(_selectedZoneId);
-                    _gameUI.ShowZoneInfographics(selectedZone, _grid, _tazManager, _optimizedOdMatrix);
-                }
+                var selectedZone = _grid.GetZone(_selectedZoneId);
+                _gameUI.ShowZoneInfographics(selectedZone, _grid, _tazManager, _optimizedOdMatrix);
             }
         }
     }
