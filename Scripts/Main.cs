@@ -269,17 +269,6 @@ public partial class Main : Node2D
             _gameUI.UpdateTransitRoutesView();
         }
     }
-
-    private static string DescribeTransitChanges(TopologyChangeResult result)
-    {
-        var transit = result.Transit;
-        if (!transit.HasChanges) return string.Empty;
-
-        string note = "";
-        if (transit.ReroutedRouteIds.Count > 0) note += $" 🚌 {transit.ReroutedRouteIds.Count} bus route(s) re-routed.";
-        if (transit.RemovedRouteIds.Count > 0) note += $" ⚠️ {transit.RemovedRouteIds.Count} bus route(s) removed (no road path).";
-        return note;
-    }
     
     private void RecalculateODMatrix() => _world.RecalculateMacroModel();
 
@@ -712,7 +701,7 @@ public partial class Main : Node2D
         {
             _currentCursorSnap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, _roadStartPoint, _roadStartNode, forceAngle);
             var curve = new CurveSegment(_roadStartPoint, _currentCursorSnap.Position);
-            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (curve.Length / 64f)));
+            float cost = BuildRoadCommand.CalculateCost(curve);
             bool canAfford = _economyManager.CanAfford(cost);
             _previewRenderer.SetRoadBuildPreview(
                 1,
@@ -728,7 +717,7 @@ public partial class Main : Node2D
         else if (_roadBuildStep == 2)
         {
             var curve = CurveSegment.CreateFromThreePoints(_roadStartPoint, mouseWorld, _roadEndPoint);
-            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (curve.Length / 64f)));
+            float cost = BuildRoadCommand.CalculateCost(curve);
             bool canAfford = _economyManager.CanAfford(cost);
             var snap = RoadSnappingEngine.FindSnap(mouseWorld, _roadGraph, null, null, false);
             _previewRenderer.SetRoadBuildPreview(
@@ -844,33 +833,8 @@ public partial class Main : Node2D
                 }
             }
 
-            if (_roadStartNode.Id == _roadEndNode.Id)
-            {
-                _gameUI.SetToolHint("⚠️ Start and end points must be different.", Colors.Yellow);
-                return;
-            }
-
-            if (_roadGraph.HasEdge(_roadStartNode.Id, _roadEndNode.Id))
-            {
-                _gameUI.SetToolHint("⚠️ Road already exists between these points.", Colors.Yellow);
-                return;
-            }
-
             var straightCurve = new CurveSegment(_roadStartNode.WorldPosition, _roadEndNode.WorldPosition);
-            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (straightCurve.Length / 64f)));
-
-            if (!_economyManager.CanAfford(cost))
-            {
-                _gameUI.SetToolHint($"⚠️ Insufficient funds! Costs ${cost:F0}.", Colors.Coral);
-                return;
-            }
-
-            bool added = _roadGraph.AddCurvedRoadSegment(_roadStartNode.Id, _roadEndNode.Id, straightCurve);
-            if (added)
-            {
-                _economyManager.Spend(cost);
-                CompleteRoadConstruction();
-            }
+            ExecuteBuildRoad(new BuildRoadCommand(_roadStartNode.Id, _roadEndNode.Id, straightCurve));
         }
         else if (_roadBuildStep == 2)
         {
@@ -906,45 +870,22 @@ public partial class Main : Node2D
                 }
             }
 
-            if (_roadStartNode.Id == _roadEndNode.Id)
-            {
-                _gameUI.SetToolHint("⚠️ Start and end points must be different.", Colors.Yellow);
-                return;
-            }
-
-            if (_roadGraph.HasEdge(_roadStartNode.Id, _roadEndNode.Id))
-            {
-                _gameUI.SetToolHint("⚠️ Road already exists between these points.", Colors.Yellow);
-                return;
-            }
-
             var curve = CurveSegment.CreateFromThreePoints(_roadStartNode.WorldPosition, mouseWorld, _roadEndNode.WorldPosition);
-            float cost = Mathf.Max(50f, Mathf.Round(EconomyManager.RoadSegmentCost * (curve.Length / 64f)));
-
-            if (!_economyManager.CanAfford(cost))
-            {
-                _gameUI.SetToolHint($"⚠️ Insufficient funds! Costs ${cost:F0}.", Colors.Coral);
-                return;
-            }
-
-            bool added = _roadGraph.AddCurvedRoadSegment(_roadStartNode.Id, _roadEndNode.Id, curve);
-            if (added)
-            {
-                _economyManager.Spend(cost);
-                CompleteRoadConstruction();
-            }
+            ExecuteBuildRoad(new BuildRoadCommand(_roadStartNode.Id, _roadEndNode.Id, curve));
         }
     }
 
-    private void CompleteRoadConstruction()
+    private void ExecuteBuildRoad(BuildRoadCommand command)
     {
-        var topologyResult = ApplyTopologyChange();
-
-        _roadBuildStep = 0;
-        _roadStartNode = null;
-        _roadEndNode = null;
-        _previewRenderer.ClearRoadBuildPreview();
-        _gameUI.SetToolHint("✅ Road built successfully! Click to build another." + DescribeTransitChanges(topologyResult), new Color(0.3f, 1f, 0.5f));
+        var result = Execute(command);
+        if (result.IsApplied)
+        {
+            _roadBuildStep = 0;
+            _roadStartNode = null;
+            _roadEndNode = null;
+            _previewRenderer.ClearRoadBuildPreview();
+        }
+        ShowResult(result);
     }
 
     private void HandleDemolishClick(int gx, int gy)
