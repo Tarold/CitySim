@@ -31,6 +31,8 @@ public sealed class BuildRoadCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         if (_startNodeId == _endNodeId)
             return CommandResult.Rejected("⚠️ Start and end points must be different.", CommandTone.Warning);
 

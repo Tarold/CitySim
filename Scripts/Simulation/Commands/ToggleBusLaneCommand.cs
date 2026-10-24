@@ -15,6 +15,8 @@ public sealed class ToggleBusLaneCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         var edge = world.RoadGraph.GetEdge(_edgeId);
         if (edge == null || edge.FromId == -1 || edge.ToId == -1)
             return CommandResult.Rejected("⚠️ Клікніть безпосередньо на сегмент дороги, щоб перемкнути виділену смугу ГТ.");

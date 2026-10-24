@@ -18,6 +18,8 @@ public sealed class ZoneCellCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         var zone = world.Grid.GetZone(_zoneId);
         if (zone == null) return CommandResult.Rejected(string.Empty);
 
@@ -67,6 +69,8 @@ public sealed class DezoneCellCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         if (_zoneId < 0 || _zoneId >= world.Grid.ZoneCount) return CommandResult.Rejected(string.Empty);
 
         var zone = world.Grid.GetZone(_zoneId);
@@ -120,6 +124,8 @@ public sealed class ZoneParcelsCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         var toZone = new List<RoadsideParcel>(_parcels.Count);
         foreach (var p in _parcels)
         {
@@ -167,6 +173,8 @@ public sealed class DezoneParcelsCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         int cleared = 0;
         foreach (var p in _parcels)
         {

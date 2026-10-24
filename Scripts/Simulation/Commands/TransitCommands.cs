@@ -20,6 +20,8 @@ public sealed class InsertTransitStopCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         var junction = world.RoadGraph.SplitEdgeAtPoint(_edgeId, _position);
         if (junction == null)
             return CommandResult.Rejected("⚠️ Failed to insert mid-road stop at this position.");
@@ -51,6 +53,8 @@ public sealed class CreateTransitRouteCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         if (_stopNodeIds.Count < 2 || _pathNodeIds.Count < 2)
             return CommandResult.Rejected("⚠️ At least 2 stops are required to launch a transit route.");
 
@@ -97,6 +101,8 @@ public sealed class DeleteTransitRouteCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         if (!world.Transit.RemoveRoute(_routeId))
             return CommandResult.Rejected(string.Empty);
 

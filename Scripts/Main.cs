@@ -62,6 +62,7 @@ public partial class Main : Node2D, IToolHost
     public override void _Ready()
     {
         _world = SimulationWorld.Create(SelectedScenario);
+        _world.UseBackgroundMacroModel = true;
 
         _camera = new Camera2D();
         _camera.Position = new Vector2(672f, 672f);
@@ -271,6 +272,7 @@ public partial class Main : Node2D, IToolHost
 
     private void OnMacroModelRecalculated()
     {
+        _commuteOverlay.SetMacroModel(_world.Taz, _world.OdMatrix);
         _roadRenderer.UpdateMaxVolume(_world.TrafficEngine.GetMaxVolume(_world.RoadGraph));
 
         // Refresh selected parcel or zone overlay
@@ -283,6 +285,11 @@ public partial class Main : Node2D, IToolHost
         {
             _commuteOverlay.SelectZone(_selectedZoneId, _world.RoadGraph);
             ShowSelectedZoneInfographics();
+        }
+        else
+        {
+            // Results arrive asynchronously in background mode; keep the overview panel current
+            ShowCityOverview();
         }
     }
 

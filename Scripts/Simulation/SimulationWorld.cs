@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 
 namespace CitySim.Simulation;
 
@@ -8,8 +9,34 @@ namespace CitySim.Simulation;
 /// LUTI growth steps and updates the microscopic agents. The Godot layer (<c>Main</c>) only forwards
 /// input, reacts to the world events to refresh rendering, and reads <see cref="Stats"/> for the HUD.
 /// </summary>
+/// <remarks>
+/// <para><b>Background macro model.</b> With <see cref="UseBackgroundMacroModel"/> the expensive part of a
+/// macro recalculation (TAZ refresh/rebuild, OD + mode split, MSA assignment) runs on a worker thread
+/// into a second set of macro-model objects while the front set (<see cref="Taz"/>, <see cref="OdMatrix"/>,
+/// <see cref="TrafficEngine"/>) stays readable by UI, growth and economy. When the job completes,
+/// <see cref="Tick"/> applies it on the main thread in the same order as the synchronous pipeline
+/// (publish volumes → accessibility → transit connections → accessibility → transit demand), swaps the
+/// sets and raises <see cref="MacroModelRecalculated"/>.</para>
+/// <para>While a job runs, the worker reads the road graph, zoning, parcels and transit routes; the main
+/// thread must not change their structure. Every edit therefore starts with <see cref="BeginEdit"/>, which
+/// waits for and applies the in-flight job (commands and tools do this). Population growth and agent
+/// updates only change scalar fields and keep running.</para>
+/// </remarks>
 public sealed class SimulationWorld : IDisposable
 {
+    /// <summary>One set of macro-model objects (double-buffered in background mode).</summary>
+    private sealed class MacroModelBuffers
+    {
+        public readonly TazManager Taz = new TazManager();
+        public readonly OptimizedODMatrix OdMatrix = new OptimizedODMatrix();
+        public readonly TrafficEngine Engine = new TrafficEngine();
+    }
+
+    private MacroModelBuffers _front = new MacroModelBuffers();
+    private MacroModelBuffers _back = new MacroModelBuffers();
+    private Task _macroJob;
+    private bool _macroRecalculationRequested;
+
     public const int DefaultGridWidth = 20;
     public const int DefaultGridHeight = 20;
     public const float DefaultCellSize = 64f;
@@ -27,9 +54,6 @@ public sealed class SimulationWorld : IDisposable
         Parcels = new ParcelManager();
         Transit = new TransitManager();
         Economy = new EconomyManager();
-        Taz = new TazManager();
-        OdMatrix = new OptimizedODMatrix();
-        TrafficEngine = new TrafficEngine();
         TrafficLights = new TrafficLightManager();
         Cars = new CarTrafficManager();
         Pedestrians = new PedestrianManager();
@@ -42,15 +66,32 @@ public sealed class SimulationWorld : IDisposable
     public ParcelManager Parcels { get; }
     public TransitManager Transit { get; }
     public EconomyManager Economy { get; }
-    public TazManager Taz { get; }
-    public OptimizedODMatrix OdMatrix { get; }
-    public TrafficEngine TrafficEngine { get; }
+    /// <summary>Current (front) TAZ set; replaced after each background recalculation.</summary>
+    public TazManager Taz => _front.Taz;
+
+    /// <summary>Current (front) OD matrix; replaced after each background recalculation.</summary>
+    public OptimizedODMatrix OdMatrix => _front.OdMatrix;
+
+    /// <summary>Current (front) traffic engine; replaced after each background recalculation.</summary>
+    public TrafficEngine TrafficEngine => _front.Engine;
     public TrafficLightManager TrafficLights { get; }
     public CarTrafficManager Cars { get; }
     public PedestrianManager Pedestrians { get; }
     public LutiGrowthSystem Growth { get; }
     public SimulationClock Clock { get; }
     public TopologyChangeCoordinator Topology { get; private set; }
+
+    /// <summary>
+    /// Run macro recalculations on a worker thread (game). False (default) keeps them synchronous, which
+    /// headless tests rely on.
+    /// </summary>
+    public bool UseBackgroundMacroModel { get; set; }
+
+    /// <summary>True while a background macro job is computing or waiting to be applied.</summary>
+    public bool IsMacroJobPending => _macroJob != null;
+
+    /// <summary>True when a background macro job has finished computing and will be applied by the next <see cref="Tick"/>.</summary>
+    public bool IsMacroJobReady => _macroJob != null && _macroJob.IsCompleted;
 
     /// <summary>City-wide statistics from the last macro recalculation (population/jobs also after growth).</summary>
     public CityStatsSnapshot Stats { get; private set; }
@@ -95,32 +136,36 @@ public sealed class SimulationWorld : IDisposable
         world.Cars.Initialize(world.RoadGraph, world.Parcels);
         world.Pedestrians.Initialize(world.RoadGraph, world.Grid, world.Transit);
 
-        // Created after scenario generation so the initial build does not count as a pending change
+        // Created after scenario generation so the initial build does not count as a pending change.
+        // TAZ invalidation is done by ApplyTopologyChange for both macro-model buffers.
         world.Topology = new TopologyChangeCoordinator(
             world.RoadGraph, world.Grid, world.TrafficLights, world.Parcels,
-            world.Transit, world.Cars, world.Pedestrians, world.Taz, world.Growth);
+            world.Transit, world.Cars, world.Pedestrians, tazManager: null, world.Growth);
 
         return world;
     }
 
     /// <summary>
-    /// Runs the macro pipeline: TAZ refresh/rebuild → OD + mode split → MSA traffic assignment → transit
-    /// connections → accessibility → transit demand, then refreshes <see cref="Stats"/>.
+    /// Recalculates the macro model: TAZ refresh/rebuild → OD + mode split → MSA traffic assignment →
+    /// transit connections → accessibility → transit demand, then refreshes <see cref="Stats"/> and raises
+    /// <see cref="MacroModelRecalculated"/>. Synchronous by default; with <see cref="UseBackgroundMacroModel"/>
+    /// it schedules a background job (coalescing requests made while one is running).
     /// </summary>
     public void RecalculateMacroModel()
     {
-        Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit);
-        OdMatrix.Recalculate(Taz, RoadGraph, Clock.Hour, GetAverageTicketPrice());
-        TrafficEngine.AssignFlowsFromTazMsa(Taz, OdMatrix, RoadGraph, MsaIterations);
-        Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
-        OdMatrix.UpdateAccessibilityScores(Taz, RoadGraph);
-        Transit.AssignPassengerDemandFromTaz(Taz, OdMatrix, RoadGraph);
+        if (!UseBackgroundMacroModel)
+        {
+            RecalculateSynchronously();
+            return;
+        }
 
-        Cars.RefreshBusyEdges(RoadGraph);
-        Clock.MarkMacroRecalculated();
-        Stats = CityStatsSnapshot.Capture(Grid, Parcels, OdMatrix, TrafficEngine, RoadGraph, Transit);
+        if (_macroJob != null)
+        {
+            _macroRecalculationRequested = true;
+            return;
+        }
 
-        MacroModelRecalculated?.Invoke();
+        StartMacroJob();
     }
 
     /// <summary>
@@ -128,17 +173,116 @@ public sealed class SimulationWorld : IDisposable
     /// or parcels exist, their zoning, transit routes or road capacities; population growth alone does not
     /// need it (TAZ totals are re-summed every recalculation).
     /// </summary>
-    public void InvalidateMacroStructure() => Taz.MarkDirty();
+    public void InvalidateMacroStructure()
+    {
+        _front.Taz.MarkDirty();
+        _back.Taz.MarkDirty();
+    }
+
+    /// <summary>
+    /// Call on the main thread before changing world structure (roads, zoning, parcels, transit routes).
+    /// Waits for an in-flight background macro job and applies its results. No-op in synchronous mode.
+    /// </summary>
+    public void BeginEdit()
+    {
+        if (_macroJob == null) return;
+
+        _macroJob.Wait();
+        ApplyMacroJob(startFollowUp: false);
+    }
+
+    /// <summary>
+    /// Blocks until no background macro job is pending or requested, applying each result (tests, shutdown).
+    /// </summary>
+    public void WaitForMacroModel()
+    {
+        while (_macroJob != null || (_macroRecalculationRequested && UseBackgroundMacroModel))
+        {
+            if (_macroJob == null)
+            {
+                _macroRecalculationRequested = false;
+                StartMacroJob();
+            }
+            _macroJob.Wait();
+            ApplyMacroJob(startFollowUp: false);
+        }
+    }
 
     /// <summary>
     /// Refreshes every topology-dependent subsystem and recalculates the macro model.
     /// </summary>
     public TopologyChangeResult ApplyTopologyChange()
     {
+        BeginEdit();
         var result = Topology.ApplyChanges();
+        InvalidateMacroStructure();
         RecalculateMacroModel();
         TopologyApplied?.Invoke(result);
         return result;
+    }
+
+    private void RecalculateSynchronously()
+    {
+        var model = _front;
+        model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit);
+        model.OdMatrix.Recalculate(model.Taz, RoadGraph, Clock.Hour, GetAverageTicketPrice());
+        model.Engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations);
+        model.Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
+        model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
+        Transit.AssignPassengerDemandFromTaz(model.Taz, model.OdMatrix, RoadGraph);
+
+        Clock.MarkMacroRecalculated();
+        FinishMacroRecalculation();
+    }
+
+    private void StartMacroJob()
+    {
+        // Main-thread part of what TAZ rebuild would do: refresh bus travel times from the published volumes,
+        // so the worker only reads TransitRoute state.
+        Transit.UpdateAllRouteTravelTimes(RoadGraph);
+
+        float hour = Clock.Hour;
+        float ticketPrice = GetAverageTicketPrice();
+        Clock.MarkMacroRecalculated();
+
+        var model = _back;
+        _macroJob = Task.Run(() =>
+        {
+            model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit, refreshRouteTimes: false);
+            model.OdMatrix.Recalculate(model.Taz, RoadGraph, hour, ticketPrice);
+            model.Engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations, deferPublish: true);
+        });
+    }
+
+    /// <summary>Applies a finished background job on the main thread and swaps the macro-model buffers.</summary>
+    private void ApplyMacroJob(bool startFollowUp)
+    {
+        var job = _macroJob;
+        _macroJob = null;
+        job.GetAwaiter().GetResult(); // surface worker exceptions on the main thread
+
+        var model = _back;
+        model.Engine.PublishPendingVolumes(RoadGraph);
+        model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
+        model.Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
+        model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
+        Transit.AssignPassengerDemandFromTaz(model.Taz, model.OdMatrix, RoadGraph);
+
+        (_front, _back) = (_back, _front);
+        FinishMacroRecalculation();
+
+        if (startFollowUp && _macroRecalculationRequested)
+        {
+            _macroRecalculationRequested = false;
+            StartMacroJob();
+        }
+    }
+
+    private void FinishMacroRecalculation()
+    {
+        Cars.RefreshBusyEdges(RoadGraph);
+        Stats = CityStatsSnapshot.Capture(Grid, Parcels, OdMatrix, TrafficEngine, RoadGraph, Transit);
+        MacroModelRecalculated?.Invoke();
     }
 
     /// <summary>
@@ -146,6 +290,11 @@ public sealed class SimulationWorld : IDisposable
     /// </summary>
     public void Tick(float realDeltaSeconds)
     {
+        if (_macroJob != null && _macroJob.IsCompleted)
+        {
+            ApplyMacroJob(startFollowUp: true);
+        }
+
         // Safety net: graph edits not followed by an explicit ApplyTopologyChange() (e.g. an edge split
         // while drafting a road) are applied before agents move on stale edges.
         if (Topology.HasPendingChanges)
@@ -161,6 +310,13 @@ public sealed class SimulationWorld : IDisposable
             RecalculateMacroModel();
         }
 
+        // A request deferred by BeginEdit (edit that did not recalculate) starts here
+        if (UseBackgroundMacroModel && _macroRecalculationRequested && _macroJob == null)
+        {
+            _macroRecalculationRequested = false;
+            StartMacroJob();
+        }
+
         if ((ticks & SimulationTicks.Financial) != 0)
         {
             Economy.ProcessFinancialTick(Grid, RoadGraph, Transit, Parcels, Taz);
@@ -174,6 +330,10 @@ public sealed class SimulationWorld : IDisposable
         if ((ticks & SimulationTicks.Growth) != 0)
         {
             var growth = Growth.Process(Grid, RoadGraph, Taz, Parcels);
+            if (growth.DensityChanged)
+            {
+                InvalidateMacroStructure();
+            }
             if (growth.LandUseChanged || growth.DensityChanged)
             {
                 Stats = Stats.WithLandUse(Grid, Parcels);
@@ -184,6 +344,15 @@ public sealed class SimulationWorld : IDisposable
 
     public void Dispose()
     {
+        try
+        {
+            _macroJob?.Wait();
+        }
+        catch (AggregateException)
+        {
+            // Shutting down: a failed background job has nothing left to apply
+        }
+        _macroJob = null;
         Topology?.Dispose();
     }
 

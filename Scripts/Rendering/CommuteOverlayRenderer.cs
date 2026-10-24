@@ -37,6 +37,16 @@ public partial class CommuteOverlayRenderer : Node2D
         _parcelManager = parcelManager;
     }
 
+    /// <summary>
+    /// Points the overlay at the current macro-model objects (they are swapped after each background
+    /// recalculation).
+    /// </summary>
+    public void SetMacroModel(TazManager tazManager, OptimizedODMatrix optimizedOd)
+    {
+        _tazManager = tazManager;
+        _optimizedOd = optimizedOd;
+    }
+
     public void Initialize(CityGrid grid, TazManager tazManager, OptimizedODMatrix optimizedOd, RoadGraph graph, ParcelManager parcelManager = null, ODMatrix legacyOd = null)
     {
         _grid = grid;

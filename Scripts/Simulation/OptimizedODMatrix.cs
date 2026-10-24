@@ -94,7 +94,11 @@ public sealed class OptimizedODMatrix
     /// Updates shortest path trees in CachedTreeBuffers and populates travel times in _travelTimes.
     /// Called at the start of Recalculate() and after final MSA iterations.
     /// </summary>
-    public void UpdateEquilibriumTreesAndTimes(TazManager tazManager, RoadGraph roadGraph)
+    /// <param name="carVolumes">
+    /// Optional per-edge car volumes to evaluate travel times with (an unpublished assignment result);
+    /// null uses the published <see cref="RoadEdge.CurrentVolume"/>.
+    /// </param>
+    public void UpdateEquilibriumTreesAndTimes(TazManager tazManager, RoadGraph roadGraph, float[] carVolumes = null)
     {
         if (tazManager == null || roadGraph == null) return;
 
@@ -117,7 +121,7 @@ public sealed class OptimizedODMatrix
             _uniqueOriginNodesArray = new int[Math.Max(uniqueCount * 2, 64)];
         }
         _uniqueOriginNodes.CopyTo(_uniqueOriginNodesArray);
-        _routing.Rebuild(roadGraph);
+        _routing.Rebuild(roadGraph, carVolumes);
 
         Parallel.For(0, uniqueCount, idx =>
         {

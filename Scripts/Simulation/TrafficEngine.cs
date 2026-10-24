@@ -330,6 +330,12 @@ public class TrafficEngine
     // Flow state of the running assignment, published to RoadEdge.CurrentVolume/PedestrianVolume at the end
     private float[] _carVolumes = Array.Empty<float>();
     private float[] _pedestrianVolumes = Array.Empty<float>();
+    private int _pendingEdgeCount;
+
+    /// <summary>
+    /// True after a deferred assignment (<c>deferPublish: true</c>) until <see cref="PublishPendingVolumes"/>.
+    /// </summary>
+    public bool HasPendingVolumes { get; private set; }
     private readonly List<int> _msaActiveOrigins = new(256);
     private readonly RoutingSnapshot _msaRouting = new RoutingSnapshot();
     private readonly Dictionary<int, List<(int DestNodeId, float Flow)>> _msaDemandsByOrigin = new(256);
@@ -354,7 +360,8 @@ public class TrafficEngine
         TazManager tazManager,
         OptimizedODMatrix matrix,
         RoadGraph roadGraph,
-        int msaIterations = 4)
+        int msaIterations = 4,
+        bool deferPublish = false)
     {
         if (tazManager == null || matrix == null || roadGraph == null) return;
 
@@ -369,7 +376,7 @@ public class TrafficEngine
 
         if (k == 0 || edgeCount == 0 || maxNodeId <= 0)
         {
-            PublishVolumes(roadGraph, edgeCount);
+            CommitVolumes(roadGraph, edgeCount, deferPublish);
             return;
         }
 
@@ -470,8 +477,8 @@ public class TrafficEngine
 
         if (_msaActiveOrigins.Count == 0)
         {
-            PublishVolumes(roadGraph, edgeCount);
-            matrix.UpdateAccessibilityScores(tazManager, roadGraph);
+            CommitVolumes(roadGraph, edgeCount, deferPublish);
+            if (!deferPublish) matrix.UpdateAccessibilityScores(tazManager, roadGraph);
             return;
         }
 
@@ -549,14 +556,42 @@ public class TrafficEngine
             }
         }
 
-        PublishVolumes(roadGraph, edgeCount);
+        CommitVolumes(roadGraph, edgeCount, deferPublish);
 
         // 5. Final synchronization: update shortest trees, _travelTimes, and LUTI AccessibilityScores using equilibrium volumes V^(n)
         if (iterations > 1)
         {
-            matrix.UpdateEquilibriumTreesAndTimes(tazManager, roadGraph);
+            matrix.UpdateEquilibriumTreesAndTimes(tazManager, roadGraph, deferPublish ? _carVolumes : null);
         }
-        matrix.UpdateAccessibilityScores(tazManager, roadGraph);
+        // Accessibility reads congestion from the published edge volumes; deferred callers run it after publishing
+        if (!deferPublish)
+        {
+            matrix.UpdateAccessibilityScores(tazManager, roadGraph);
+        }
+    }
+
+    /// <summary>
+    /// Writes the volumes of the last deferred assignment to the road edges. Main thread only.
+    /// </summary>
+    public void PublishPendingVolumes(RoadGraph roadGraph)
+    {
+        if (!HasPendingVolumes || roadGraph == null) return;
+
+        PublishVolumes(roadGraph, Math.Min(_pendingEdgeCount, roadGraph.Edges.Count));
+        HasPendingVolumes = false;
+    }
+
+    private void CommitVolumes(RoadGraph roadGraph, int edgeCount, bool deferPublish)
+    {
+        if (deferPublish)
+        {
+            _pendingEdgeCount = edgeCount;
+            HasPendingVolumes = true;
+        }
+        else
+        {
+            PublishVolumes(roadGraph, edgeCount);
+        }
     }
 
     private void AddLocalTazFlow(

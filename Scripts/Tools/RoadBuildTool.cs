@@ -150,6 +150,9 @@ public sealed class RoadBuildTool : ITool
     /// </summary>
     private RoadNode ResolveEndpoint(RoadSnapResult snap, Vector2 point)
     {
+        // May split an edge or create a node: no background macro job may be reading the graph
+        _host.World.BeginEdit();
+
         if (snap.Type == SnapType.Node)
         {
             return snap.SnappedNode;

@@ -15,6 +15,8 @@ public sealed class DemolishIsolatedCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         var zone = world.Grid.GetZone(_zoneId);
         if (zone == null) return CommandResult.Rejected(string.Empty);
 
@@ -59,6 +61,8 @@ public sealed class DemolishRoadCommand : IWorldCommand
 
     public CommandResult Execute(SimulationWorld world)
     {
+        world.BeginEdit();
+
         var fromZone = world.Grid.GetZone(_fromZoneId);
         var toZone = world.Grid.GetZone(_toZoneId);
         if (fromZone == null || toZone == null || !world.RoadGraph.RemoveRoadSegment(_fromZoneId, _toZoneId))

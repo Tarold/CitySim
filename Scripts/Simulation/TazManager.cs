@@ -66,15 +66,17 @@ public sealed class TazManager
     /// transit catchments and internal edges are kept. Otherwise performs a full <see cref="Rebuild"/>.
     /// </summary>
     /// <returns>True when a full rebuild was performed.</returns>
+    /// <param name="refreshRouteTimes">See <see cref="UpdateTransitConnectionMatrix"/>.</param>
     public bool RefreshOrRebuild(
         CityGrid cityGrid,
         ParcelManager parcelManager,
         RoadGraph roadGraph,
-        TransitManager transitManager)
+        TransitManager transitManager,
+        bool refreshRouteTimes = true)
     {
         if (TryRefreshAggregates(cityGrid, parcelManager)) return false;
 
-        Rebuild(cityGrid, parcelManager, roadGraph, transitManager);
+        Rebuild(cityGrid, parcelManager, roadGraph, transitManager, refreshRouteTimes);
         return true;
     }
 
@@ -119,11 +121,13 @@ public sealed class TazManager
     /// Full rebuild of all Traffic Analysis Zones in O(N + K) time using <see cref="SpatialGridIndex"/>.
     /// Triggered when zoning or road topology changes.
     /// </summary>
+    /// <param name="refreshRouteTimes">See <see cref="UpdateTransitConnectionMatrix"/>.</param>
     public void Rebuild(
         CityGrid cityGrid,
         ParcelManager parcelManager,
         RoadGraph roadGraph,
-        TransitManager transitManager)
+        TransitManager transitManager,
+        bool refreshRouteTimes = true)
     {
         _spatialBuckets.Clear();
         _activeTazList.Clear();
@@ -229,7 +233,7 @@ public sealed class TazManager
         AssignInternalEdgesToBuckets(roadGraph);
 
         // 6. Precompute exact in-vehicle transit travel times between all TAZ pairs
-        UpdateTransitConnectionMatrix(transitManager, roadGraph);
+        UpdateTransitConnectionMatrix(transitManager, roadGraph, refreshRouteTimes);
 
         IsDirty = false;
     }
@@ -238,7 +242,12 @@ public sealed class TazManager
     /// Updates the cached K*K matrix of real public transit in-vehicle times and wait times
     /// using current route prefix sums (reflecting BPR road congestion and dedicated bus lanes).
     /// </summary>
-    public void UpdateTransitConnectionMatrix(TransitManager transit, RoadGraph roadGraph)
+    /// <param name="refreshRouteTimes">
+    /// True (default) first recomputes every route's bus travel-time prefix sums from current road volumes.
+    /// False only reads the existing prefix sums (no writes to shared <see cref="TransitRoute"/> state), which
+    /// is required when running off the main thread.
+    /// </param>
+    public void UpdateTransitConnectionMatrix(TransitManager transit, RoadGraph roadGraph, bool refreshRouteTimes = true)
     {
         int k = _activeTazList.Count;
         _cachedTazCount = k;
@@ -255,7 +264,10 @@ public sealed class TazManager
         if (transit == null || transit.Routes.Count == 0 || roadGraph == null)
             return;
 
-        transit.UpdateAllRouteTravelTimes(roadGraph);
+        if (refreshRouteTimes)
+        {
+            transit.UpdateAllRouteTravelTimes(roadGraph);
+        }
 
         for (int i = 0; i < k; i++)
         {
