@@ -9,6 +9,9 @@ namespace CitySim;
 
 public partial class Main : Node2D
 {
+    private SimulationWorld _world;
+
+    // Shortcuts into _world for the tool handlers that still live here (moved to commands in Phase 2.4)
     private CityGrid _grid;
     private RoadGraph _roadGraph;
     private TazManager _tazManager;
@@ -19,9 +22,6 @@ public partial class Main : Node2D
     private CarTrafficManager _carTrafficManager;
     private PedestrianManager _pedestrianManager;
     private ParcelManager _parcelManager;
-    private TopologyChangeCoordinator _topology;
-    private readonly LutiGrowthSystem _growthSystem = new LutiGrowthSystem();
-    private CityStatsSnapshot _cityStats;
     
     private CityRenderer _cityRenderer;
     private RoadRenderer _roadRenderer;
@@ -31,7 +31,6 @@ public partial class Main : Node2D
     private Camera2D _camera;
     private GameUI _gameUI;
     
-    private readonly SimulationClock _clock = new SimulationClock();
     private bool _heatmapEnabled = false;
     private EconomyManager _economyManager;
     
@@ -72,51 +71,18 @@ public partial class Main : Node2D
 
     public override void _Ready()
     {
-        _grid = new CityGrid(20, 20, 64f);
-        _roadGraph = new RoadGraph();
-        _parcelManager = new ParcelManager();
-        _transitManager = new TransitManager();
-        _economyManager = new EconomyManager();
-        _parcelManager.Initialize(_roadGraph);
-        
-        switch (SelectedScenario)
-        {
-            case ScenarioType.Tutorial:
-                TutorialCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
-                break;
-            case ScenarioType.EconomyTest:
-                EconomyTestCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
-                break;
-            case ScenarioType.RoutingTest:
-                RoutingTestCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
-                break;
-            case ScenarioType.MapEditingTest:
-                MapEditingTestCityGenerator.Generate(_grid, _roadGraph, _parcelManager, _transitManager, _economyManager);
-                break;
-            case ScenarioType.Sandbox:
-            default:
-                _roadGraph.BuildFromGrid(_grid);
-                _transitManager.CreateDefaultRoutes(_grid, _roadGraph);
-                _parcelManager.RefreshParcels(_roadGraph);
-                break;
-        }
-        
-        _tazManager = new TazManager();
-        _optimizedOdMatrix = new OptimizedODMatrix();
-        _trafficEngine = new TrafficEngine();
-        
-        _trafficLights = new TrafficLightManager();
-        _trafficLights.BuildIntersections(_roadGraph);
-        
-        _carTrafficManager = new CarTrafficManager();
-        _carTrafficManager.Initialize(_roadGraph, _parcelManager);
-        
-        _pedestrianManager = new PedestrianManager();
-        _pedestrianManager.Initialize(_roadGraph, _grid, _transitManager);
-
-        _topology = new TopologyChangeCoordinator(
-            _roadGraph, _grid, _trafficLights, _parcelManager,
-            _transitManager, _carTrafficManager, _pedestrianManager, _tazManager, _growthSystem);
+        _world = SimulationWorld.Create(SelectedScenario);
+        _grid = _world.Grid;
+        _roadGraph = _world.RoadGraph;
+        _parcelManager = _world.Parcels;
+        _transitManager = _world.Transit;
+        _economyManager = _world.Economy;
+        _tazManager = _world.Taz;
+        _optimizedOdMatrix = _world.OdMatrix;
+        _trafficEngine = _world.TrafficEngine;
+        _trafficLights = _world.TrafficLights;
+        _carTrafficManager = _world.Cars;
+        _pedestrianManager = _world.Pedestrians;
 
         _camera = new Camera2D();
         _camera.Position = new Vector2(672f, 672f);
@@ -149,7 +115,7 @@ public partial class Main : Node2D
         _gameUI.SetTransitManager(_transitManager);
         _gameUI.SetEconomyManager(_economyManager);
         
-        _gameUI.SpeedChanged += (speed) => _clock.Speed = speed;
+        _gameUI.SpeedChanged += (speed) => _world.Clock.Speed = speed;
         _gameUI.HeatmapToggled += (enabled) => 
         {
             _heatmapEnabled = enabled;
@@ -174,9 +140,18 @@ public partial class Main : Node2D
         _gameUI.RouteLaunchRequested += OnRouteLaunchRequested;
         _gameUI.RouteCancelRequested += OnRouteCancelRequested;
         _gameUI.RouteDeleted += OnRouteDeleted;
+
+        _world.MacroModelRecalculated += OnMacroModelRecalculated;
+        _world.TopologyApplied += OnTopologyApplied;
+        _world.LandUseChanged += OnLandUseChanged;
         
-        RecalculateODMatrix();
+        _world.RecalculateMacroModel();
         _gameUI.ShowCityOverview(_grid, _optimizedOdMatrix, _parcelManager);
+    }
+
+    public override void _ExitTree()
+    {
+        _world?.Dispose();
     }
 
     private void OnInteractionModeChanged(int modeInt)
@@ -230,20 +205,10 @@ public partial class Main : Node2D
     }
 
     /// <summary>
-    /// Runs the shared road-topology invalidation chain (see <see cref="TopologyChangeCoordinator"/>),
-    /// then recalculates demand and refreshes rendering.
+    /// Runs the shared road-topology invalidation chain and macro recalculation in the world;
+    /// rendering is refreshed by <see cref="OnTopologyApplied"/>.
     /// </summary>
-    private TopologyChangeResult ApplyTopologyChange()
-    {
-        var result = _topology.ApplyChanges();
-        RefreshAfterSimulationEdit();
-
-        if (result.Transit.HasChanges)
-        {
-            _gameUI.UpdateTransitRoutesView();
-        }
-        return result;
-    }
+    private TopologyChangeResult ApplyTopologyChange() => _world.ApplyTopologyChange();
 
     /// <summary>
     /// Recalculates the macro model and redraws map layers after a non-topological edit (zoning, demand).
@@ -251,9 +216,23 @@ public partial class Main : Node2D
     private void RefreshAfterSimulationEdit()
     {
         RecalculateODMatrix();
+        RefreshMapLayers();
+    }
+
+    private void RefreshMapLayers()
+    {
         _roadRenderer.Refresh();
         _cityRenderer.Refresh();
         _vehicleRenderer.QueueRedraw();
+    }
+
+    private void OnTopologyApplied(TopologyChangeResult result)
+    {
+        RefreshMapLayers();
+        if (result.Transit.HasChanges)
+        {
+            _gameUI.UpdateTransitRoutesView();
+        }
     }
 
     private static string DescribeTransitChanges(TopologyChangeResult result)
@@ -267,27 +246,11 @@ public partial class Main : Node2D
         return note;
     }
     
-    private void RecalculateODMatrix()
+    private void RecalculateODMatrix() => _world.RecalculateMacroModel();
+
+    private void OnMacroModelRecalculated()
     {
-        float avgPrice = 12f;
-        if (_transitManager.Routes.Count > 0)
-        {
-            float total = 0f;
-            foreach (var r in _transitManager.Routes) total += r.TicketPrice;
-            avgPrice = total / _transitManager.Routes.Count;
-        }
-
-        _tazManager.Rebuild(_grid, _parcelManager, _roadGraph, _transitManager);
-        _optimizedOdMatrix.Recalculate(_tazManager, _roadGraph, _clock.Hour, avgPrice);
-        _trafficEngine.AssignFlowsFromTazMsa(_tazManager, _optimizedOdMatrix, _roadGraph, msaIterations: 4);
-        _tazManager.UpdateTransitConnectionMatrix(_transitManager, _roadGraph);
-        _optimizedOdMatrix.UpdateAccessibilityScores(_tazManager, _roadGraph);
-        _transitManager.AssignPassengerDemandFromTaz(_tazManager, _optimizedOdMatrix, _roadGraph);
-
         _roadRenderer.UpdateMaxVolume(_trafficEngine.GetMaxVolume(_roadGraph));
-        _carTrafficManager.RefreshBusyEdges(_roadGraph);
-        _clock.MarkMacroRecalculated();
-        _cityStats = CityStatsSnapshot.Capture(_grid, _parcelManager, _optimizedOdMatrix, _trafficEngine, _roadGraph, _transitManager);
 
         // Refresh selected parcel or zone overlay
         if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
@@ -305,55 +268,21 @@ public partial class Main : Node2D
     
     public override void _Process(double delta)
     {
-        float dt = (float)delta;
+        _world.Tick((float)delta);
 
-        // Safety net: graph edits not followed by an explicit ApplyTopologyChange() (e.g. an edge split
-        // while drafting a road) are applied before agents move on stale edges.
-        if (_topology.HasPendingChanges)
-        {
-            ApplyTopologyChange();
-        }
-
-        // At 1x speed, 1 real second = 1 game minute; see SimulationClock for tick intervals
-        var ticks = _clock.Advance(dt);
-        float gameSpeed = _clock.Speed;
-
-        if ((ticks & SimulationTicks.MacroRecalculation) != 0)
-        {
-            RecalculateODMatrix();
-        }
-
-        if ((ticks & SimulationTicks.Financial) != 0)
-        {
-            _economyManager.ProcessFinancialTick(_grid, _roadGraph, _transitManager, _parcelManager, _tazManager);
-        }
-        
-        // Update simulation sub-systems
-        _trafficLights.Update(dt, gameSpeed);
-        _carTrafficManager.Update(dt, gameSpeed, _roadGraph, _trafficLights, _parcelManager);
-        _transitManager.Update(dt, gameSpeed, _roadGraph, _trafficLights, _clock.Hour);
-        _pedestrianManager.Update(dt, gameSpeed, _roadGraph, _grid, _transitManager);
-        
-        if ((ticks & SimulationTicks.Growth) != 0)
-        {
-            ProcessPopulationGrowth();
-        }
-        
-        // Calculate transit ridership
-        float transitRidership = 0f;
-        foreach (var v in _transitManager.Vehicles) transitRidership += v.Passengers;
-        
-        // Update HUD from the cached macro-tick snapshot (full scans happen in RecalculateODMatrix)
-        _gameUI.UpdateTime(_clock.Hour, _clock.Day);
+        // Update HUD from the cached macro-tick snapshot (full scans happen in RecalculateMacroModel)
+        var stats = _world.Stats;
+        float hour = _world.Clock.Hour;
+        _gameUI.UpdateTime(hour, _world.Clock.Day);
         _gameUI.UpdateStats(
-            _cityStats.Population,
-            _cityStats.TotalTrips,
-            _cityStats.AverageCongestion,
-            transitRidership,
-            _cityStats.TransitCoverage,
-            ODMatrix.GetDemandMultiplier(_clock.Hour),
-            ODMatrix.GetDirectionalBias(_clock.Hour),
-            _cityStats.Jobs
+            stats.Population,
+            stats.TotalTrips,
+            stats.AverageCongestion,
+            _world.TransitRidership,
+            stats.TransitCoverage,
+            ODMatrix.GetDemandMultiplier(hour),
+            ODMatrix.GetDirectionalBias(hour),
+            stats.Jobs
         );
         
         _gameUI.UpdateEconomy(_economyManager.Money, _economyManager.LastDelta);
@@ -377,10 +306,8 @@ public partial class Main : Node2D
         }
     }
     
-    private void ProcessPopulationGrowth()
+    private void OnLandUseChanged(LutiGrowthResult growth)
     {
-        var growth = _growthSystem.Process(_grid, _roadGraph, _tazManager, _parcelManager);
-
         if (growth.DensityChanged)
         {
             _cityRenderer?.Refresh();
@@ -388,8 +315,6 @@ public partial class Main : Node2D
 
         if (growth.LandUseChanged)
         {
-            _cityStats = _cityStats.WithLandUse(_grid, _parcelManager);
-
             if (_selectedParcelId != -1 && _parcelManager != null && _parcelManager.ParcelMap.TryGetValue(_selectedParcelId, out var selectedParcel))
             {
                 _gameUI.ShowParcelInfographics(selectedParcel, _parcelManager, _tazManager, _optimizedOdMatrix, _grid);
@@ -1161,7 +1086,7 @@ public partial class Main : Node2D
         {
             _economyManager.Spend(EconomyManager.ZoningCost);
             _roadGraph.EnsureNode(zoneId, _grid.GetWorldCenter(zoneId));
-            if (_topology.HasPendingChanges)
+            if (_world.Topology.HasPendingChanges)
             {
                 ApplyTopologyChange();
             }
