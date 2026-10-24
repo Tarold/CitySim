@@ -660,17 +660,61 @@ public class RoadGraph
     /// </summary>
     public bool HasEdge(int fromId, int toId) => FindEdgeId(fromId, toId) != -1;
 
+    // Next free node id (max NodeMap key + 1) for the graph state it was computed for; kept current by
+    // CreateNode/EnsureNode so bulk construction does not rescan NodeMap per node.
+    private (int TopologyVersion, int NodeCount, int NextId) _nextNodeIdCache = (-1, -1, 0);
+
+    // Next free edge id for the Edges count it was computed for (edges are only appended or cleared).
+    private (int EdgeCount, int NextId) _nextEdgeIdCache = (-1, 0);
+
     /// <summary>
-    /// Computes the next unique node identifier.
+    /// Computes the next unique node identifier (largest existing id + 1).
     /// </summary>
     public int GetNextNodeId()
     {
+        var cache = _nextNodeIdCache;
+        if (cache.TopologyVersion == TopologyVersion && cache.NodeCount == NodeMap.Count)
+            return cache.NextId;
+
         int maxId = 0;
         foreach (var k in NodeMap.Keys)
         {
             if (k >= maxId) maxId = k + 1;
         }
+        _nextNodeIdCache = (TopologyVersion, NodeMap.Count, maxId);
         return maxId;
+    }
+
+    /// <summary>
+    /// Records a node registered by a graph method: keeps the next-id cache valid when it was valid before
+    /// (call after the node is in <see cref="NodeMap"/> and the topology version was bumped).
+    /// </summary>
+    private void NoteNodeAdded(int nodeId, bool cacheWasValid)
+    {
+        if (cacheWasValid)
+        {
+            _nextNodeIdCache = (TopologyVersion, NodeMap.Count, Math.Max(_nextNodeIdCache.NextId, nodeId + 1));
+        }
+    }
+
+    private bool IsNextNodeIdCacheValid() =>
+        _nextNodeIdCache.TopologyVersion == TopologyVersion && _nextNodeIdCache.NodeCount == NodeMap.Count;
+
+    /// <summary>Next free edge id (max(edge count, largest edge id + 1)).</summary>
+    private int GetNextEdgeId()
+    {
+        var cache = _nextEdgeIdCache;
+        if (cache.EdgeCount == Edges.Count)
+            return cache.NextId;
+
+        int maxId = -1;
+        for (int i = 0; i < Edges.Count; i++)
+        {
+            if (Edges[i].Id > maxId) maxId = Edges[i].Id;
+        }
+        int nextId = Math.Max(Edges.Count, maxId + 1);
+        _nextEdgeIdCache = (Edges.Count, nextId);
+        return nextId;
     }
 
     /// <summary>
@@ -679,6 +723,7 @@ public class RoadGraph
     public RoadNode CreateNode(Vector2 worldPosition, int zoneId = -1)
     {
         int id = zoneId >= 0 && !NodeMap.ContainsKey(zoneId) ? zoneId : GetNextNodeId();
+        bool idCacheValid = IsNextNodeIdCacheValid();
         var node = new RoadNode
         {
             Id = id,
@@ -693,6 +738,7 @@ public class RoadGraph
         SpatialIndex.AddNode(node);
         _syncedNodesCount = Nodes.Count;
         BumpTopologyVersion();
+        NoteNodeAdded(id, idCacheValid);
         NodeAdded?.Invoke(node);
         return node;
     }
@@ -717,7 +763,7 @@ public class RoadGraph
             curve = new CurveSegment(fromNode.WorldPosition, toNode.WorldPosition);
         }
 
-        int nextId = Math.Max(Edges.Count, Edges.Count > 0 ? Edges.Max(e => e.Id) + 1 : 0);
+        int nextId = GetNextEdgeId();
 
         var e1 = new RoadEdge
         {
@@ -755,6 +801,7 @@ public class RoadGraph
 
         Edges.Add(e1);
         Edges.Add(e2);
+        _nextEdgeIdCache = (Edges.Count, Math.Max(Edges.Count, nextId + 2));
 
         if (!AdjacencyEdges.ContainsKey(fromNodeId))
             AdjacencyEdges[fromNodeId] = new List<int>();
@@ -1029,6 +1076,7 @@ public class RoadGraph
             return existing;
         }
 
+        bool idCacheValid = IsNextNodeIdCacheValid();
         var node = new RoadNode
         {
             Id = zoneId,
@@ -1044,6 +1092,7 @@ public class RoadGraph
         SpatialIndex.AddNode(node);
         _syncedNodesCount = Nodes.Count;
         BumpTopologyVersion();
+        NoteNodeAdded(zoneId, idCacheValid);
         NodeAdded?.Invoke(node);
 
         return node;

@@ -131,19 +131,41 @@ public sealed class SimulationWorld : IDisposable
         world.Parcels.Initialize(world.RoadGraph);
 
         ScenarioLoader.Load(scenario, world.Grid, world.RoadGraph, world.Parcels, world.Transit, world.Economy);
+        world.InitializeDerivedSubsystems();
+        return world;
+    }
 
-        world.TrafficLights.BuildIntersections(world.RoadGraph);
-        world.Cars.Initialize(world.RoadGraph, world.Parcels);
-        world.Pedestrians.Initialize(world.RoadGraph, world.Grid, world.Transit);
+    private void InitializeDerivedSubsystems()
+    {
+        TrafficLights.BuildIntersections(RoadGraph);
+        Cars.Initialize(RoadGraph, Parcels);
+        Pedestrians.Initialize(RoadGraph, Grid, Transit);
 
         // Created after scenario generation so the initial build does not count as a pending change.
         // TAZ invalidation is done by ApplyTopologyChange for both macro-model buffers.
-        world.Topology = new TopologyChangeCoordinator(
-            world.RoadGraph, world.Grid, world.TrafficLights, world.Parcels,
-            world.Transit, world.Cars, world.Pedestrians, tazManager: null, world.Growth);
+        Topology = new TopologyChangeCoordinator(
+            RoadGraph, Grid, TrafficLights, Parcels,
+            Transit, Cars, Pedestrians, tazManager: null, Growth);
+    }
 
+    /// <summary>
+    /// Creates a world containing a generated <see cref="MetropolisCityGenerator"/> city (benchmarks,
+    /// stress tests). The grid is sized to the options.
+    /// </summary>
+    public static SimulationWorld CreateMetropolis(MetropolisOptions options)
+    {
+        var world = new SimulationWorld(new CityGrid(options.GridSize, options.GridSize, DefaultCellSize));
+        world.Parcels.Initialize(world.RoadGraph);
+        MetropolisCityGenerator.Generate(world.Grid, world.RoadGraph, world.Transit, options);
+        world.InitializeDerivedSubsystems();
         return world;
     }
+
+    /// <summary>Wall-clock time of the last macro recalculation part that runs off the main thread (ms).</summary>
+    public double LastMacroComputeMilliseconds { get; private set; }
+
+    /// <summary>Wall-clock time of the last main-thread macro step: full pipeline in sync mode, apply in background mode (ms).</summary>
+    public double LastMacroMainThreadMilliseconds { get; private set; }
 
     /// <summary>
     /// Recalculates the macro model: TAZ refresh/rebuild → OD + mode split → MSA traffic assignment →
@@ -223,6 +245,7 @@ public sealed class SimulationWorld : IDisposable
 
     private void RecalculateSynchronously()
     {
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
         var model = _front;
         model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit);
         model.OdMatrix.Recalculate(model.Taz, RoadGraph, Clock.Hour, GetAverageTicketPrice());
@@ -233,6 +256,9 @@ public sealed class SimulationWorld : IDisposable
 
         Clock.MarkMacroRecalculated();
         FinishMacroRecalculation();
+
+        LastMacroComputeMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+        LastMacroMainThreadMilliseconds = LastMacroComputeMilliseconds;
     }
 
     private void StartMacroJob()
@@ -248,9 +274,11 @@ public sealed class SimulationWorld : IDisposable
         var model = _back;
         _macroJob = Task.Run(() =>
         {
+            long jobStart = System.Diagnostics.Stopwatch.GetTimestamp();
             model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit, refreshRouteTimes: false);
             model.OdMatrix.Recalculate(model.Taz, RoadGraph, hour, ticketPrice);
             model.Engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations, deferPublish: true);
+            LastMacroComputeMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(jobStart).TotalMilliseconds;
         });
     }
 
@@ -260,6 +288,7 @@ public sealed class SimulationWorld : IDisposable
         var job = _macroJob;
         _macroJob = null;
         job.GetAwaiter().GetResult(); // surface worker exceptions on the main thread
+        long applyStart = System.Diagnostics.Stopwatch.GetTimestamp();
 
         var model = _back;
         model.Engine.PublishPendingVolumes(RoadGraph);
@@ -270,6 +299,7 @@ public sealed class SimulationWorld : IDisposable
 
         (_front, _back) = (_back, _front);
         FinishMacroRecalculation();
+        LastMacroMainThreadMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(applyStart).TotalMilliseconds;
 
         if (startFollowUp && _macroRecalculationRequested)
         {
