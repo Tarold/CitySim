@@ -40,12 +40,13 @@ public readonly struct CityStatsSnapshot
         OptimizedODMatrix odMatrix,
         TrafficEngine trafficEngine,
         RoadGraph roadGraph,
-        TransitManager transitManager)
+        TransitManager transitManager,
+        float? precomputedTransitCoverage = null)
     {
         var (population, jobs) = CountLandUse(grid, parcelManager);
         float trips = odMatrix?.TotalTrips ?? 0f;
         float congestion = (trafficEngine != null && roadGraph != null) ? trafficEngine.GetAverageCongestion(roadGraph) : 0f;
-        float coverage = transitManager?.GetTransitCoverage(grid, roadGraph, parcelManager) ?? 0f;
+        float coverage = precomputedTransitCoverage ?? transitManager?.GetTransitCoverage(grid, roadGraph, parcelManager) ?? 0f;
         return new CityStatsSnapshot(population, jobs, trips, congestion, coverage);
     }
 

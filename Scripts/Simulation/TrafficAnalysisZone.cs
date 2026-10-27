@@ -22,6 +22,21 @@ public readonly struct TazConnector
 }
 
 /// <summary>
+/// Transit stop within walking catchment of a TAZ centroid, ordered by walking distance.
+/// </summary>
+public readonly struct TazStopAccess
+{
+    public readonly int StopNodeId;
+    public readonly float DistanceMeters;
+
+    public TazStopAccess(int stopNodeId, float distanceMeters)
+    {
+        StopNodeId = stopNodeId;
+        DistanceMeters = distanceMeters;
+    }
+}
+
+/// <summary>
 /// Traffic Analysis Zone (TAZ) macro-district aggregating discrete grid zones and continuous ribbon parcels.
 /// Compresses the origin-destination trip matrix from O(N^2) to stable O(K^2).
 /// </summary>
@@ -48,7 +63,8 @@ public sealed class TrafficAnalysisZone
     /// </summary>
     public List<int> InternalEdgeIds { get; } = new();
 
-    // Public transit catchment metrics (routes with stops within 350m)
+    // Public transit catchment metrics (stops and routes within 350m)
+    public List<TazStopAccess> TransitStops { get; } = new(4);
     public HashSet<int> AccessibleTransitRoutes { get; } = new();
     public float AvgTransitAccessDistance { get; set; } = float.MaxValue;
     public float BestTransitWaitTime { get; set; } = 15.0f;
@@ -109,6 +125,7 @@ public sealed class TrafficAnalysisZone
         MaxCongestion = 0.0f;
         Connectors.Clear();
         InternalEdgeIds.Clear();
+        TransitStops.Clear();
         AccessibleTransitRoutes.Clear();
         Zones.Clear();
         Parcels.Clear();

@@ -55,6 +55,8 @@ public class MacroPipelineBenchmark
         var taz = new TazManager();
         var od = new OptimizedODMatrix();
         var engine = new TrafficEngine();
+        var snapshot = new TransitNetworkSnapshot();
+        var transitEngine = new TransitEngine();
         var sw = new Stopwatch();
 
         for (int rep = 0; rep < Repetitions; rep++)
@@ -65,9 +67,9 @@ public class MacroPipelineBenchmark
             bool rebuilt = taz.RefreshOrRebuild(grid, parcels, graph, transit); long tTaz = sw.ElapsedMilliseconds;
             od.Recalculate(taz, graph, 8f, 12f); long tOd = sw.ElapsedMilliseconds;
             engine.AssignFlowsFromTazMsa(taz, od, graph, SimulationWorld.MsaIterations); long tMsa = sw.ElapsedMilliseconds;
-            taz.UpdateTransitConnectionMatrix(transit, graph); long tTransit = sw.ElapsedMilliseconds;
-            od.UpdateAccessibilityScores(taz, graph); long tAccess = sw.ElapsedMilliseconds;
-            transit.AssignPassengerDemandFromTaz(taz, od, graph); long tDemand = sw.ElapsedMilliseconds;
+            snapshot.Rebuild(transit, graph); transitEngine.ComputeSkim(taz, snapshot); long tTransit = sw.ElapsedMilliseconds;
+            od.UpdateAccessibilityScores(taz, graph, transitSkim: transitEngine.Skim); long tAccess = sw.ElapsedMilliseconds;
+            transitEngine.AssignFlows(taz, od, snapshot, graph, transit); long tDemand = sw.ElapsedMilliseconds;
 
             TestContext.Progress.WriteLine(
                 $"n={n} nodes={graph.Nodes.Count} edges={graph.Edges.Count} taz={taz.ActiveZones.Count} | " +

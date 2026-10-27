@@ -74,14 +74,19 @@ public class RoadEdge
     /// Returns the travel time for a public transit bus on this edge.
     /// If a dedicated bus lane is active, the bus bypasses private car congestion and travels at free-flow speed.
     /// </summary>
-    public float GetBusTravelTime()
+    public float GetBusTravelTime() => ComputeBusTravelTime(Length, FreeFlowSpeed, CurrentVolume, Capacity, HasBusLane);
+
+    /// <summary>
+    /// Bus travel time for an arbitrary car volume (used by <see cref="TransitNetworkSnapshot"/> with unpublished
+    /// worker-thread volumes). Dedicated bus lanes run at free-flow speed regardless of car volume.
+    /// </summary>
+    public static float ComputeBusTravelTime(float length, float freeFlowSpeed, float carVolume, float capacity, bool hasBusLane)
     {
-        float freeFlowTime = Length / Mathf.Max(FreeFlowSpeed, 1f);
-        if (HasBusLane)
+        if (hasBusLane)
         {
-            return freeFlowTime;
+            return length / Mathf.Max(freeFlowSpeed, 1f);
         }
-        return GetTravelTime();
+        return ComputeTravelTime(length, freeFlowSpeed, carVolume, capacity);
     }
 
     public float GetCongestionRatio()

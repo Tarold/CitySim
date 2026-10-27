@@ -138,8 +138,13 @@ public class TazClusteringAndOptimizedODTests
         var originTaz = _tazManager.ActiveZones[0];
         var destTaz = _tazManager.ActiveZones[_tazManager.ActiveZones.Count - 1];
 
-        int connType = _tazManager.GetTransitConnectionType(originTaz, destTaz);
-        Assert.That(connType, Is.GreaterThan(0), "TAZs must have a transit connection (direct or 1 transfer)");
+        var snapshot = new TransitNetworkSnapshot();
+        snapshot.Rebuild(_transitManager, _graph);
+        var engine = new TransitEngine();
+        engine.ComputeSkim(_tazManager, snapshot);
+
+        var conn = engine.Skim.GetConnection(originTaz.Id, destTaz.Id);
+        Assert.That(conn.IsConnected, Is.True, "TAZs must have a transit connection (direct or transfer)");
     }
 
     [Test]

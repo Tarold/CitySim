@@ -403,8 +403,8 @@ public class TransitManager
     private int _nextRouteId = 0;
     private int _nextVehicleId = 0;
     private bool _hasTazDemandAssignment = false;
-    private readonly List<int> _directRouteBuffer = new List<int>();
-    private readonly List<(int FirstRouteId, int SecondRouteId, int TransferStopNodeId)> _transferRouteBuffer = new List<(int, int, int)>();
+    private TransitNetworkSnapshot _standaloneSnapshot;
+    private TransitEngine _standaloneEngine;
 
     /// <summary>Next available route ID counter.</summary>
     public int NextRouteId => _nextRouteId;
@@ -1056,13 +1056,30 @@ public class TransitManager
     }
 
     /// <summary>
-    /// Assigns macroscopic transit passenger demand from OptimizedODMatrix across direct and 1-transfer routes
-    /// and updates stop arrival rates and route financial turnovers.
+    /// Assigns macroscopic transit passenger demand from <see cref="OptimizedODMatrix"/> across the stop-and-line
+    /// network using <see cref="TransitEngine"/>, and updates stop arrival rates and route financial turnovers.
     /// </summary>
     public void AssignPassengerDemandFromTaz(TazManager tazManager, OptimizedODMatrix matrix, RoadGraph graph)
     {
+        _standaloneSnapshot ??= new TransitNetworkSnapshot();
+        _standaloneEngine ??= new TransitEngine();
+        _standaloneSnapshot.Rebuild(this, graph);
+        _standaloneEngine.AssignFlows(tazManager, matrix, _standaloneSnapshot, graph, this, deferPublish: false);
+    }
+
+    /// <summary>
+    /// Publishes precomputed route demand and stop arrival rate arrays onto <see cref="Routes"/> and <see cref="Stops"/>
+    /// in O(routes + stops) time on the main thread.
+    /// </summary>
+    internal void ApplyPublishedDemand(
+        float[] routeHourlyDemand,
+        float[] routeMaxSegmentVolume,
+        int routeCount,
+        int[] stopNodeIds,
+        float[] stopArrivalRates,
+        int stopCount)
+    {
         _hasTazDemandAssignment = true;
-        UpdateAllRouteTravelTimes(graph);
 
         for (int i = 0; i < Routes.Count; i++)
         {
@@ -1089,121 +1106,21 @@ public class TransitManager
             stop.HourlyArrivalRate = 0f;
         }
 
-        if (tazManager != null && matrix != null && Routes.Count > 0)
+        int rLimit = Math.Min(Routes.Count, routeCount);
+        for (int i = 0; i < rLimit; i++)
         {
-            int k = tazManager.ActiveZones.Count;
-            for (int i = 0; i < k; i++)
+            Routes[i].AssignedHourlyDemand = routeHourlyDemand[i];
+        }
+
+        for (int s = 0; s < stopCount; s++)
+        {
+            int stopNodeId = stopNodeIds[s];
+            if (Stops.TryGetValue(stopNodeId, out var stop))
             {
-                var origTaz = tazManager.GetTaz(i);
-                if (origTaz == null) continue;
-
-                for (int j = 0; j < k; j++)
-                {
-                    if (i == j) continue;
-                    float transitTrips = matrix.GetTransitTrips(i, j);
-                    if (transitTrips <= 0.001f) continue;
-
-                    var destTaz = tazManager.GetTaz(j);
-                    if (destTaz == null) continue;
-
-                    int connType = tazManager.GetTransitConnectionType(origTaz, destTaz);
-                    if (connType == 1)
-                    {
-                        tazManager.GetDirectRouteIds(origTaz, destTaz, _directRouteBuffer);
-                        if (_directRouteBuffer.Count > 0)
-                        {
-                            float weightSum = 0f;
-                            for (int m = 0; m < _directRouteBuffer.Count; m++)
-                            {
-                                var r = FindRouteById(_directRouteBuffer[m]);
-                                if (r == null) continue;
-                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r, graph);
-                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r, graph);
-                                float ivt = (sOrig != -1 && sDest != -1) ? r.GetInVehicleTimeBetweenStops(sOrig, sDest, graph) : 10f;
-                                float effCost = Mathf.Max(1.0f, r.HeadwayMinutes * 0.5f + ivt);
-                                weightSum += 1.0f / effCost;
-                            }
-
-                            for (int m = 0; m < _directRouteBuffer.Count; m++)
-                            {
-                                var r = FindRouteById(_directRouteBuffer[m]);
-                                if (r == null) continue;
-
-                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r, graph);
-                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r, graph);
-                                float ivt = (sOrig != -1 && sDest != -1) ? r.GetInVehicleTimeBetweenStops(sOrig, sDest, graph) : 10f;
-                                float effCost = Mathf.Max(1.0f, r.HeadwayMinutes * 0.5f + ivt);
-                                float w = 1.0f / effCost;
-                                float flowShare = weightSum > 0f
-                                    ? transitTrips * (w / weightSum)
-                                    : (transitTrips / _directRouteBuffer.Count);
-
-                                r.AssignedHourlyDemand += flowShare;
-
-                                if (sOrig != -1 && Stops.TryGetValue(sOrig, out var boardStop))
-                                {
-                                    boardStop.HourlyArrivalRate += flowShare;
-                                }
-                            }
-                        }
-                    }
-                    else if (connType == 2)
-                    {
-                        tazManager.GetTransferRoutes(origTaz, destTaz, this, graph, _transferRouteBuffer);
-                        if (_transferRouteBuffer.Count > 0)
-                        {
-                            float weightSum = 0f;
-                            for (int c = 0; c < _transferRouteBuffer.Count; c++)
-                            {
-                                var chain = _transferRouteBuffer[c];
-                                var r1 = FindRouteById(chain.FirstRouteId);
-                                var r2 = FindRouteById(chain.SecondRouteId);
-                                if (r1 == null || r2 == null) continue;
-
-                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r1, graph);
-                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r2, graph);
-                                float ivt1 = (sOrig != -1 && chain.TransferStopNodeId != -1) ? r1.GetInVehicleTimeBetweenStops(sOrig, chain.TransferStopNodeId, graph) : 8f;
-                                float ivt2 = (chain.TransferStopNodeId != -1 && sDest != -1) ? r2.GetInVehicleTimeBetweenStops(chain.TransferStopNodeId, sDest, graph) : 8f;
-                                float combinedCost = Mathf.Max(1.0f, (r1.HeadwayMinutes + r2.HeadwayMinutes) * 0.5f + ivt1 + ivt2);
-                                weightSum += 1.0f / combinedCost;
-                            }
-
-                            for (int c = 0; c < _transferRouteBuffer.Count; c++)
-                            {
-                                var chain = _transferRouteBuffer[c];
-                                var r1 = FindRouteById(chain.FirstRouteId);
-                                var r2 = FindRouteById(chain.SecondRouteId);
-                                if (r1 == null || r2 == null) continue;
-
-                                int sOrig = tazManager.FindClosestStopOnRoute(origTaz, r1, graph);
-                                int sDest = tazManager.FindClosestStopOnRoute(destTaz, r2, graph);
-                                float ivt1 = (sOrig != -1 && chain.TransferStopNodeId != -1) ? r1.GetInVehicleTimeBetweenStops(sOrig, chain.TransferStopNodeId, graph) : 8f;
-                                float ivt2 = (chain.TransferStopNodeId != -1 && sDest != -1) ? r2.GetInVehicleTimeBetweenStops(chain.TransferStopNodeId, sDest, graph) : 8f;
-                                float combinedCost = Mathf.Max(1.0f, (r1.HeadwayMinutes + r2.HeadwayMinutes) * 0.5f + ivt1 + ivt2);
-                                float w = 1.0f / combinedCost;
-                                float flowShare = weightSum > 0f
-                                    ? transitTrips * (w / weightSum)
-                                    : (transitTrips / _transferRouteBuffer.Count);
-
-                                r1.AssignedHourlyDemand += flowShare;
-                                if (sOrig != -1 && Stops.TryGetValue(sOrig, out var boardStop))
-                                {
-                                    boardStop.HourlyArrivalRate += flowShare;
-                                }
-
-                                r2.AssignedHourlyDemand += flowShare;
-                                if (chain.TransferStopNodeId != -1 && Stops.TryGetValue(chain.TransferStopNodeId, out var transferStop))
-                                {
-                                    transferStop.HourlyArrivalRate += flowShare;
-                                }
-                            }
-                        }
-                    }
-                }
+                stop.HourlyArrivalRate = stopArrivalRates[s];
             }
         }
 
-        // Update route daily projections and stop queues
         for (int i = 0; i < Routes.Count; i++)
         {
             var route = Routes[i];
@@ -1219,7 +1136,10 @@ public class TransitManager
                 route.DailyPassengers = route.AssignedHourlyDemand * 24.0f;
                 route.DailyRevenue = route.DailyPassengers * route.TicketPrice;
                 float hourlyCapacity = (60.0f / Mathf.Max(1.0f, route.HeadwayMinutes)) * 75.0f;
-                route.AverageOccupancy = Mathf.Clamp((route.AssignedHourlyDemand / Mathf.Max(1.0f, hourlyCapacity)) * 100.0f, 5.0f, 100.0f);
+                float loadForOccupancy = i < rLimit && routeMaxSegmentVolume != null
+                    ? Math.Max(route.AssignedHourlyDemand, routeMaxSegmentVolume[i])
+                    : route.AssignedHourlyDemand;
+                route.AverageOccupancy = Mathf.Clamp((loadForOccupancy / Mathf.Max(1.0f, hourlyCapacity)) * 100.0f, 5.0f, 100.0f);
             }
 
             if (route.DailyOperatingCost <= 0f)
@@ -1236,16 +1156,6 @@ public class TransitManager
                 stop.WaitingPassengers = 0f;
             }
         }
-    }
-
-    private TransitRoute FindRouteById(int routeId)
-    {
-        for (int i = 0; i < Routes.Count; i++)
-        {
-            if (Routes[i].Id == routeId)
-                return Routes[i];
-        }
-        return null;
     }
 
     private void DeployLineVehicles(TransitRoute route, int count)
@@ -1619,9 +1529,75 @@ public class TransitManager
         float cellSize = grid?.CellSize ?? 64f;
         float maxWalkDist = 3f * cellSize;
 
+        // Stop positions are bucketed by walk distance so each query is O(1) instead of O(stops)
+        Dictionary<(int, int), List<Vector2>> BucketStops(bool zoneFallback)
+        {
+            var cells = new Dictionary<(int, int), List<Vector2>>();
+            foreach (var stop in Stops.Values)
+            {
+                Vector2 stopPos = Vector2.Zero;
+                bool hasPos = false;
+
+                if (graph != null)
+                {
+                    var stopNode = graph.GetNode(stop.NodeId);
+                    if (stopNode != null)
+                    {
+                        stopPos = stopNode.WorldPosition;
+                        hasPos = true;
+                    }
+                }
+
+                if (!hasPos && grid != null && stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount &&
+                    (zoneFallback || graph == null))
+                {
+                    stopPos = grid.GetWorldCenter(stop.ZoneId);
+                    hasPos = true;
+                }
+
+                if (!hasPos) continue;
+
+                var key = ((int)MathF.Floor(stopPos.X / maxWalkDist), (int)MathF.Floor(stopPos.Y / maxWalkDist));
+                if (!cells.TryGetValue(key, out var cell))
+                {
+                    cell = new List<Vector2>(2);
+                    cells[key] = cell;
+                }
+                cell.Add(stopPos);
+            }
+            return cells;
+        }
+
+        bool IsNearStop(Dictionary<(int, int), List<Vector2>> cells, Vector2 p)
+        {
+            int cx = (int)MathF.Floor(p.X / maxWalkDist);
+            int cy = (int)MathF.Floor(p.Y / maxWalkDist);
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    if (!cells.TryGetValue((cx + dx, cy + dy), out var cell)) continue;
+                    for (int i = 0; i < cell.Count; i++)
+                    {
+                        if (p.DistanceTo(cell[i]) <= maxWalkDist) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         // 1. Grid residential zones
         if (grid != null)
         {
+            var worldCells = BucketStops(zoneFallback: false);
+            var stopGridCells = new HashSet<(int, int)>();
+            foreach (var stop in Stops.Values)
+            {
+                if (stop.ZoneId < 0 || stop.ZoneId >= grid.ZoneCount) continue;
+                var stopZone = grid.GetZone(stop.ZoneId);
+                if (stopZone != null) stopGridCells.Add((stopZone.GridPos.X, stopZone.GridPos.Y));
+            }
+
             for (int i = 0; i < grid.ZoneCount; i++)
             {
                 var zone = grid.GetZone(i);
@@ -1630,55 +1606,31 @@ public class TransitManager
                 totalResidential++;
                 bool isCovered = false;
 
-                foreach (var stop in Stops.Values)
+                // Manhattan distance <= 3 to the grid cell of any stop
+                for (int dx = -3; dx <= 3 && !isCovered; dx++)
                 {
-                    // Guard: only query grid zone if stop.ZoneId is within valid grid array bounds
-                    if (stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
+                    int rem = 3 - Mathf.Abs(dx);
+                    for (int dy = -rem; dy <= rem; dy++)
                     {
-                        var stopZone = grid.GetZone(stop.ZoneId);
-                        if (stopZone != null)
+                        if (stopGridCells.Contains((zone.GridPos.X + dx, zone.GridPos.Y + dy)))
                         {
-                            int dist = Mathf.Abs(zone.GridPos.X - stopZone.GridPos.X) + Mathf.Abs(zone.GridPos.Y - stopZone.GridPos.Y);
-                            if (dist <= 3)
-                            {
-                                isCovered = true;
-                                break;
-                            }
+                            isCovered = true;
+                            break;
                         }
-                    }
-
-                    // Vector stop fallback or world-position distance
-                    Vector2 stopPos = Vector2.Zero;
-                    bool hasPos = false;
-                    if (graph != null)
-                    {
-                        var stopNode = graph.GetNode(stop.NodeId);
-                        if (stopNode != null)
-                        {
-                            stopPos = stopNode.WorldPosition;
-                            hasPos = true;
-                        }
-                    }
-                    else if (stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
-                    {
-                        stopPos = grid.GetWorldCenter(stop.ZoneId);
-                        hasPos = true;
-                    }
-
-                    if (hasPos && stopPos.DistanceTo(grid.GetWorldCenter(i)) <= maxWalkDist)
-                    {
-                        isCovered = true;
-                        break;
                     }
                 }
+
+                if (!isCovered && IsNearStop(worldCells, grid.GetWorldCenter(i))) isCovered = true;
 
                 if (isCovered) coveredResidential++;
             }
         }
 
-        // 2. Roadside residential parcels from ParcelManager
+        // 2. Roadside residential parcels from ParcelManager (stop positions bucketed: O(parcels) instead of O(parcels x stops))
         if (parcelManager != null && parcelManager.Parcels != null)
         {
+            var stopCells = BucketStops(zoneFallback: true);
+
             var parcels = parcelManager.Parcels;
             for (int i = 0; i < parcels.Count; i++)
             {
@@ -1686,40 +1638,10 @@ public class TransitManager
                 if (parcel.ZoneType != ZoneType.Residential) continue;
 
                 totalResidential++;
-                bool isCovered = false;
-
-                foreach (var stop in Stops.Values)
+                if (IsNearStop(stopCells, parcel.Center) || IsNearStop(stopCells, parcel.AccessPoint))
                 {
-                    Vector2 stopPos = Vector2.Zero;
-                    bool hasPos = false;
-
-                    if (graph != null)
-                    {
-                        var stopNode = graph.GetNode(stop.NodeId);
-                        if (stopNode != null)
-                        {
-                            stopPos = stopNode.WorldPosition;
-                            hasPos = true;
-                        }
-                    }
-
-                    if (!hasPos && grid != null && stop.ZoneId >= 0 && stop.ZoneId < grid.ZoneCount)
-                    {
-                        stopPos = grid.GetWorldCenter(stop.ZoneId);
-                        hasPos = true;
-                    }
-
-                    if (!hasPos) continue;
-
-                    if (parcel.Center.DistanceTo(stopPos) <= maxWalkDist ||
-                        parcel.AccessPoint.DistanceTo(stopPos) <= maxWalkDist)
-                    {
-                        isCovered = true;
-                        break;
-                    }
+                    coveredResidential++;
                 }
-
-                if (isCovered) coveredResidential++;
             }
         }
 

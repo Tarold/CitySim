@@ -596,7 +596,7 @@ public class TransitDesignerTests
             }
         }
 
-        tazManager.UpdateTransitConnectionMatrix(transit, roadGraph);
+        transit.UpdateAllRouteTravelTimes(roadGraph);
         float ivtBusLane = route.GetInVehicleTimeBetweenStops(sWest, sEast, roadGraph);
         Assert.That(ivtBusLane, Is.LessThan(ivtMixedTraffic * 0.5f), "Bus on dedicated Bus Lane must travel at free-flow speed, bypassing congestion");
 

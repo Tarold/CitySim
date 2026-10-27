@@ -21,6 +21,10 @@ public sealed class OptimizedODMatrix
     private float[] _rowScoreSums = Array.Empty<float>();
     private float[] _hansenPotentials = Array.Empty<float>();
     private float[] _accessibilityScores = Array.Empty<float>();
+    private float[] _rowTripSums = Array.Empty<float>();
+    private float[] _rowCarSums = Array.Empty<float>();
+    private float[] _rowTransitSums = Array.Empty<float>();
+    private float[] _rowWalkSums = Array.Empty<float>();
 
     /// <summary>Intra-zonal car travel time (minutes) used on the matrix diagonal.</summary>
     public const float IntraZonalTravelTime = 1.8f;
@@ -31,9 +35,11 @@ public sealed class OptimizedODMatrix
     /// <summary>On-demand trees kept for commute-path queries (cleared on every recalculation).</summary>
     private const int MaxCachedPathTrees = 8;
 
-    // Fallback skim when no up-to-date skim is supplied (first cycle, topology change, standalone use)
+    // Fallback skims when no up-to-date skim is supplied (first cycle, topology change, standalone use)
     private readonly TravelTimeSkim _ownSkim = new TravelTimeSkim();
     private readonly RoutingSnapshot _routing = new RoutingSnapshot();
+    private TransitNetworkSnapshot _ownTransitSnapshot;
+    private TransitEngine _ownTransitEngine;
 
     // On-demand shortest-path trees for commute path reconstruction (main thread, front matrix only)
     private readonly Dictionary<int, ShortestPathTreeBuffer> _pathTrees = new();
@@ -91,6 +97,10 @@ public sealed class OptimizedODMatrix
             _rowScoreSums = new float[rowAlloc];
             _hansenPotentials = new float[rowAlloc];
             _accessibilityScores = new float[rowAlloc];
+            _rowTripSums = new float[rowAlloc];
+            _rowCarSums = new float[rowAlloc];
+            _rowTransitSums = new float[rowAlloc];
+            _rowWalkSums = new float[rowAlloc];
         }
     }
 
@@ -177,6 +187,58 @@ public sealed class OptimizedODMatrix
         _pathTreeOrder.Clear();
     }
 
+    private TransitSkim EnsureTransitSkim(TazManager tazManager, RoadGraph roadGraph, TransitSkim transitSkim)
+    {
+        if (transitSkim != null && transitSkim.TazCount == tazManager.ActiveZones.Count)
+        {
+            return transitSkim;
+        }
+
+        var transit = tazManager.LastTransitManager;
+        if (transit != null && transit.Routes.Count > 0 && roadGraph != null)
+        {
+            _ownTransitSnapshot ??= new TransitNetworkSnapshot();
+            _ownTransitEngine ??= new TransitEngine();
+            _ownTransitSnapshot.Rebuild(transit, roadGraph);
+            _ownTransitEngine.ComputeSkim(tazManager, _ownTransitSnapshot);
+            return _ownTransitEngine.Skim;
+        }
+
+        return transitSkim;
+    }
+
+    private static TransitConnectionInfo ResolveTransitConnection(
+        TransitSkim transitSkim,
+        bool hasAuthoritativeTransitSkim,
+        TrafficAnalysisZone origin,
+        TrafficAnalysisZone dest,
+        int pairIndex,
+        float fallbackCarTime)
+    {
+        if (origin == null || dest == null || origin.Id == dest.Id)
+            return TransitConnectionInfo.Unconnected;
+
+        if (transitSkim != null && transitSkim.TazCount > 0)
+        {
+            var conn = transitSkim.GetConnectionByIndex(pairIndex);
+            if (conn.IsConnected || hasAuthoritativeTransitSkim)
+                return conn;
+        }
+
+        if (!hasAuthoritativeTransitSkim &&
+            origin.AccessibleTransitRoutes.Count > 0 &&
+            dest.AccessibleTransitRoutes.Count > 0 &&
+            origin.AccessibleTransitRoutes.Overlaps(dest.AccessibleTransitRoutes))
+        {
+            return new TransitConnectionInfo(
+                inVehicleTime: fallbackCarTime * 1.15f,
+                waitTime: origin.BestTransitWaitTime,
+                transfers: 0);
+        }
+
+        return TransitConnectionInfo.Unconnected;
+    }
+
     /// <summary>
     /// Full parallel recalculation of travel demand, shortest trees, gravity distribution, and 3-mode split.
     /// </summary>
@@ -184,12 +246,23 @@ public sealed class OptimizedODMatrix
     /// Car travel times from the previous traffic assignment. Used when it covers the current TAZs and road
     /// topology; otherwise one search round computes a fresh skim (published volumes).
     /// </param>
+    /// <param name="transitSkim">
+    /// Public transit stop-and-line skim from <see cref="TransitEngine"/>. When null in standalone tests,
+    /// computed on demand from <see cref="TazManager.LastTransitManager"/>.
+    /// </param>
+    /// <param name="propagateAccessibility">
+    /// True (default) propagates normalized TAZ accessibility scores to zones and parcels immediately.
+    /// False skips land-use propagation during worker-thread execution so <see cref="PropagateAccessibilityToLandUse"/>
+    /// can be called on the main thread during job apply.
+    /// </param>
     public void Recalculate(
         TazManager tazManager,
         RoadGraph roadGraph,
         float currentHour,
         float ticketFare = 12.0f,
-        TravelTimeSkim skim = null)
+        TravelTimeSkim skim = null,
+        TransitSkim transitSkim = null,
+        bool propagateAccessibility = true)
     {
         _graph = roadGraph;
         CurrentHour = currentHour;
@@ -222,14 +295,18 @@ public sealed class OptimizedODMatrix
         for (int i = 0; i < k; i++)
             totalCityPop += tazList[i].TotalPopulation;
 
-        // 1 & 2. Car travel times from the assignment skim (or a fresh search round)
+        // 1 & 2. Car travel times from the assignment skim (or a fresh search round into targetSkim)
         if (skim == null || !skim.Covers(tazManager, roadGraph))
         {
             _routing.Rebuild(roadGraph);
-            _ownSkim.Compute(roadGraph, _routing, TravelTimeSkim.CollectAccessNodes(tazManager));
-            skim = _ownSkim;
+            var targetSkim = skim ?? _ownSkim;
+            targetSkim.Compute(roadGraph, _routing, TravelTimeSkim.CollectAccessNodes(tazManager));
+            skim = targetSkim;
         }
         ApplySkim(tazManager, skim);
+
+        transitSkim = EnsureTransitSkim(tazManager, roadGraph, transitSkim);
+        bool hasAuthoritativeTransitSkim = transitSkim != null && transitSkim.TazCount == k;
 
         // 3. Gravity Model Trip Distribution & Hansen Accessibility Index
         Array.Clear(_rowScoreSums, 0, k);
@@ -249,10 +326,11 @@ public sealed class OptimizedODMatrix
             float localSum = 0f;
             for (int j = 0; j < k; j++)
             {
-                float tCar = _travelTimes[rowOffset + j];
+                int idx = rowOffset + j;
+                float tCar = _travelTimes[idx];
                 if (tCar >= float.MaxValue * 0.5f)
                 {
-                    _walkTrips[rowOffset + j] = 0f;
+                    _walkTrips[idx] = 0f;
                     continue;
                 }
 
@@ -263,22 +341,22 @@ public sealed class OptimizedODMatrix
                 float attraction = destJobs * morningBias + destPop * (1.0f - morningBias);
                 if (attraction <= 0.01f)
                 {
-                    _walkTrips[rowOffset + j] = 0f;
+                    _walkTrips[idx] = 0f;
                     continue;
                 }
 
                 float effectiveTime = tCar;
-                var connForGravity = tazManager.GetTransitConnectionInfo(origin, dest, tCar);
+                var connForGravity = ResolveTransitConnection(transitSkim, hasAuthoritativeTransitSkim, origin, dest, idx, tCar);
                 if (connForGravity.IsConnected)
                 {
-                    float transitEquivTime = connForGravity.InVehicleTime + connForGravity.WaitTime * 0.5f;
+                    float transitEquivTime = connForGravity.PerceivedInVehicleTime + connForGravity.WaitTime * 0.5f;
                     effectiveTime = MathF.Min(tCar, transitEquivTime);
                 }
 
                 float impedance = 1.0f / MathF.Pow(effectiveTime + 2.0f, 1.25f);
                 float score = production * attraction * impedance;
                 // Raw gravity score parked in the walk-trip slot until the mode split below overwrites it
-                _walkTrips[rowOffset + j] = score;
+                _walkTrips[idx] = score;
                 localSum += score;
             }
 
@@ -286,7 +364,11 @@ public sealed class OptimizedODMatrix
         });
 
         // Compute normalized Hansen AccessibilityScore (0.0..2.0) and congestion metrics for all TAZs
-        UpdateAccessibilityScores(tazManager, roadGraph, morningBias);
+        ComputeTazAccessibilityScores(tazManager, roadGraph, morningBias, transitSkim);
+        if (propagateAccessibility)
+        {
+            PropagateAccessibilityToLandUse(tazManager, roadGraph);
+        }
 
         float targetHourlyDemand = 1.5f * totalCityPop * diurnalMultiplier;
         float globalScoreSum = 0f;
@@ -303,16 +385,19 @@ public sealed class OptimizedODMatrix
         const float lambda = 0.08f;
         const float walkSpeedMetersPerMin = 80.0f; // ~4.8 km/h
 
-        float accTotalTrips = 0f;
-        float accTotalCar = 0f;
-        float accTotalTransit = 0f;
-        float accTotalWalk = 0f;
-        object lockObj = new object();
+        Array.Clear(_rowTripSums, 0, k);
+        Array.Clear(_rowCarSums, 0, k);
+        Array.Clear(_rowTransitSums, 0, k);
+        Array.Clear(_rowWalkSums, 0, k);
 
-        Parallel.For(0, k, () => (trips: 0f, car: 0f, transit: 0f, walk: 0f), (i, state, localAcc) =>
+        Parallel.For(0, k, i =>
         {
             var origin = tazList[i];
             int rowOffset = i * k;
+            float rowTrips = 0f;
+            float rowCar = 0f;
+            float rowTransit = 0f;
+            float rowWalk = 0f;
 
             for (int j = 0; j < k; j++)
             {
@@ -340,13 +425,13 @@ public sealed class OptimizedODMatrix
                 float cCar = (tCar * 1.4f) + 22.0f;
 
                 float cTransit = 500.0f;
-                var transitConn = tazManager.GetTransitConnectionInfo(origin, dest, tCar);
+                var transitConn = ResolveTransitConnection(transitSkim, hasAuthoritativeTransitSkim, origin, dest, idx, tCar);
                 if (transitConn.IsConnected)
                 {
                     float accessWalkTime = (origin.AvgTransitAccessDistance + dest.AvgTransitAccessDistance) / walkSpeedMetersPerMin;
                     float waitTime = transitConn.WaitTime;
                     float transferPenalty = transitConn.Transfers * 8.0f;
-                    cTransit = ticketFare + 0.8f * accessWalkTime + 1.2f * waitTime + transferPenalty + transitConn.InVehicleTime;
+                    cTransit = ticketFare + 0.8f * accessWalkTime + 1.2f * waitTime + transferPenalty + transitConn.PerceivedInVehicleTime;
                 }
 
                 float uWalk = -lambda * cWalk;
@@ -371,29 +456,32 @@ public sealed class OptimizedODMatrix
                 _carTrips[idx] = cTrips;
                 _transitTrips[idx] = tTrips;
 
-                localAcc.trips += totalTrips;
-                localAcc.car += cTrips;
-                localAcc.transit += tTrips;
-                localAcc.walk += wTrips;
+                rowTrips += totalTrips;
+                rowCar += cTrips;
+                rowTransit += tTrips;
+                rowWalk += wTrips;
             }
 
-            return localAcc;
-        },
-        localAcc =>
-        {
-            lock (lockObj)
-            {
-                accTotalTrips += localAcc.trips;
-                accTotalCar += localAcc.car;
-                accTotalTransit += localAcc.transit;
-                accTotalWalk += localAcc.walk;
-            }
+            _rowTripSums[i] = rowTrips;
+            _rowCarSums[i] = rowCar;
+            _rowTransitSums[i] = rowTransit;
+            _rowWalkSums[i] = rowWalk;
         });
 
-        TotalTrips = accTotalTrips;
-        TotalCarTrips = accTotalCar;
-        TotalTransitTrips = accTotalTransit;
-        TotalWalkTrips = accTotalWalk;
+        // Deterministic sequential summation in TAZ index order
+        float sumTrips = 0f, sumCar = 0f, sumTransit = 0f, sumWalk = 0f;
+        for (int i = 0; i < k; i++)
+        {
+            sumTrips += _rowTripSums[i];
+            sumCar += _rowCarSums[i];
+            sumTransit += _rowTransitSums[i];
+            sumWalk += _rowWalkSums[i];
+        }
+
+        TotalTrips = sumTrips;
+        TotalCarTrips = sumCar;
+        TotalTransitTrips = sumTransit;
+        TotalWalkTrips = sumWalk;
     }
 
     /// <summary>
@@ -401,7 +489,26 @@ public sealed class OptimizedODMatrix
     /// and multimodal travel impedances, normalizes AccessibilityScore into [0.0, 2.0] for each TAZ,
     /// and propagates accessibility and congestion ratios (R_congestion) to child zones and parcels.
     /// </summary>
-    public void UpdateAccessibilityScores(TazManager tazManager, RoadGraph roadGraph, float morningBias = -1f)
+    public void UpdateAccessibilityScores(
+        TazManager tazManager,
+        RoadGraph roadGraph,
+        float morningBias = -1f,
+        TransitSkim transitSkim = null)
+    {
+        ComputeTazAccessibilityScores(tazManager, roadGraph, morningBias, transitSkim);
+        PropagateAccessibilityToLandUse(tazManager, roadGraph);
+    }
+
+    /// <summary>
+    /// Computes normalized Hansen AccessibilityScore (0.0..2.0) and congestion metrics on every TAZ in parallel.
+    /// Safe to run on the worker thread using <paramref name="carVolumes"/> before publishing to <see cref="RoadGraph"/>.
+    /// </summary>
+    internal void ComputeTazAccessibilityScores(
+        TazManager tazManager,
+        RoadGraph roadGraph,
+        float morningBias = -1f,
+        TransitSkim transitSkim = null,
+        float[] carVolumes = null)
     {
         if (tazManager == null || roadGraph == null) return;
 
@@ -416,6 +523,9 @@ public sealed class OptimizedODMatrix
             morningBias = DemandCurve.GetDirectionalBias(CurrentHour);
         }
 
+        transitSkim = EnsureTransitSkim(tazManager, roadGraph, transitSkim);
+        bool hasAuthoritativeTransitSkim = transitSkim != null && transitSkim.TazCount == k;
+
         float totalCityOpportunity = 0f;
         for (int j = 0; j < k; j++)
         {
@@ -424,12 +534,12 @@ public sealed class OptimizedODMatrix
         }
         if (totalCityOpportunity <= 1e-4f) totalCityOpportunity = 1f;
 
-        for (int i = 0; i < k; i++)
+        Parallel.For(0, k, i =>
         {
             var origin = tazList[i];
 
             // 1. Evaluate local road congestion (R_congestion) in and around this TAZ
-            var (avgCong, maxCong, hasBusLane) = EvaluateTazCongestion(origin, roadGraph);
+            var (avgCong, maxCong, hasBusLane) = EvaluateTazCongestion(origin, roadGraph, carVolumes);
             origin.AverageCongestion = avgCong;
             origin.MaxCongestion = maxCong;
 
@@ -444,7 +554,8 @@ public sealed class OptimizedODMatrix
 
             for (int j = 0; j < k; j++)
             {
-                float tCar = _travelTimes[rowOffset + j];
+                int idx = rowOffset + j;
+                float tCar = _travelTimes[idx];
                 if (tCar >= float.MaxValue * 0.5f) continue;
 
                 var dest = tazList[j];
@@ -457,10 +568,10 @@ public sealed class OptimizedODMatrix
                 float carImpedance = 1.0f / MathF.Pow(tCar + 2.0f, 1.25f);
                 float multimodalImpedance = carImpedance;
 
-                var conn = tazManager.GetTransitConnectionInfo(origin, dest, tCar);
+                var conn = ResolveTransitConnection(transitSkim, hasAuthoritativeTransitSkim, origin, dest, idx, tCar);
                 if (conn.IsConnected)
                 {
-                    float transitEquivTime = conn.InVehicleTime + conn.WaitTime * 0.5f;
+                    float transitEquivTime = conn.PerceivedInVehicleTime + conn.WaitTime * 0.5f;
                     effectiveTime = MathF.Min(tCar, transitEquivTime);
                     float transitImpedance = 1.0f / MathF.Pow(transitEquivTime + 2.0f, 1.25f);
                     multimodalImpedance = MathF.Max(carImpedance, transitImpedance) + 0.45f * MathF.Min(carImpedance, transitImpedance);
@@ -507,7 +618,7 @@ public sealed class OptimizedODMatrix
             _hansenPotentials[i] = reachableDestinations > 0
                 ? (baseHansen * transitHubBonus * congestionFactor)
                 : 0f;
-        }
+        });
 
         // Normalize Hansen potentials into [0.0, 2.0] combining city-relative and absolute impedance benchmarks
         float sumPotentials = 0f;
@@ -545,8 +656,24 @@ public sealed class OptimizedODMatrix
                 taz.AccessibilityScore = clamped;
                 _accessibilityScores[i] = clamped;
             }
+        }
+    }
 
-            // Propagate LUTI AccessibilityScore and LocalCongestion to parcels and grid zones in this TAZ
+    /// <summary>
+    /// Propagates precomputed TAZ accessibility and congestion scores to member parcels and grid zones.
+    /// </summary>
+    internal void PropagateAccessibilityToLandUse(TazManager tazManager, RoadGraph roadGraph)
+    {
+        if (tazManager == null || roadGraph == null) return;
+
+        var tazList = tazManager.ActiveZones;
+        int k = tazList.Count;
+        if (k == 0) return;
+
+        Parallel.For(0, k, i =>
+        {
+            var taz = tazList[i];
+
             for (int p = 0; p < taz.Parcels.Count; p++)
             {
                 var parcel = taz.Parcels[p];
@@ -564,10 +691,13 @@ public sealed class OptimizedODMatrix
                 float nodeCong = GetNodeCongestion(zone.Id, roadGraph);
                 zone.LocalCongestion = MathF.Max(nodeCong, taz.AverageCongestion);
             }
-        }
+        });
     }
 
-    private static (float avgCong, float maxCong, bool hasBusLane) EvaluateTazCongestion(TrafficAnalysisZone taz, RoadGraph graph)
+    private static (float avgCong, float maxCong, bool hasBusLane) EvaluateTazCongestion(
+        TrafficAnalysisZone taz,
+        RoadGraph graph,
+        float[] carVolumes = null)
     {
         if (taz == null || graph == null) return (0f, 0f, false);
 
@@ -581,7 +711,10 @@ public sealed class OptimizedODMatrix
             var e = graph.GetEdge(edgeId);
             if (e == null || e.FromId == -1 || e.ToId == -1) return;
             if (e.HasBusLane) hasBusLane = true;
-            float r = e.GetCongestionRatio();
+            float vol = (carVolumes != null && edgeId >= 0 && edgeId < carVolumes.Length)
+                ? carVolumes[edgeId]
+                : e.CurrentVolume;
+            float r = vol / MathF.Max(e.Capacity, 1f);
             sumRatio += r;
             if (r > maxRatio) maxRatio = r;
             edgeCount++;

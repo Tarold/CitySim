@@ -36,6 +36,16 @@ public sealed class SimulationWorld : IDisposable
     // cycle, whichever buffer is in front. Only one recalculation runs at a time.
     private readonly TrafficEngine _engine = new TrafficEngine { WarmStart = true };
 
+    // Stop-and-line transit model: snapshot, warm-started assignment and the single shared transit skim
+    private readonly TransitNetworkSnapshot _transitSnapshot = new TransitNetworkSnapshot();
+    private readonly TransitEngine _transitEngine = new TransitEngine { WarmStart = true };
+
+    /// <summary>Transit engine (stop-and-line assignment with crowding and the shared transit skim).</summary>
+    public TransitEngine TransitEngine => _transitEngine;
+
+    /// <summary>Shared public transit skim of the last macro recalculation.</summary>
+    public TransitSkim TransitSkim => _transitEngine.Skim;
+
     private MacroModelBuffers _front = new MacroModelBuffers();
     private MacroModelBuffers _back = new MacroModelBuffers();
     private Task _macroJob;
@@ -254,12 +264,8 @@ public sealed class SimulationWorld : IDisposable
     {
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         var model = _front;
-        model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit);
-        model.OdMatrix.Recalculate(model.Taz, RoadGraph, Clock.Hour, GetAverageTicketPrice(), _engine.Skim);
-        _engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations);
-        model.Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
-        model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
-        Transit.AssignPassengerDemandFromTaz(model.Taz, model.OdMatrix, RoadGraph);
+        ComputeMacroModel(model, Clock.Hour, GetAverageTicketPrice());
+        PublishMacroModel(model);
 
         Clock.MarkMacroRecalculated();
         FinishMacroRecalculation();
@@ -268,12 +274,48 @@ public sealed class SimulationWorld : IDisposable
         LastMacroMainThreadMilliseconds = LastMacroComputeMilliseconds;
     }
 
+    /// <summary>
+    /// Heavy part of a macro recalculation. Reads the world and writes only into <paramref name="model"/> and the
+    /// engines' pending buffers (never into RoadEdge, TransitRoute, TransitStop, zones or parcels), so it can run
+    /// on the worker thread. Must be followed by <see cref="PublishMacroModel"/> on the main thread.
+    /// </summary>
+    // Transit coverage is computed on the worker (O(parcels)) so the main-thread apply stays cheap
+    private float? _pendingTransitCoverage;
+
+    private void ComputeMacroModel(MacroModelBuffers model, float hour, float ticketPrice)
+    {
+        bool rebuilt = model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit);
+
+        // Stop-and-line snapshot on the currently published road volumes (worker never touches TransitRoute)
+        _transitSnapshot.Rebuild(Transit, RoadGraph, carVolumes: null, updateRoutePrefixSums: false);
+        _transitSnapshot.UpdateTravelTimes(RoadGraph);
+        if (rebuilt || !_transitEngine.Skim.Covers(model.Taz, _transitSnapshot))
+        {
+            // Cold start or structural change: otherwise the skim of the previous assignment is reused (one cycle lag)
+            _transitEngine.ComputeSkim(model.Taz, _transitSnapshot);
+        }
+
+        model.OdMatrix.Recalculate(model.Taz, RoadGraph, hour, ticketPrice, _engine.Skim, _transitEngine.Skim, propagateAccessibility: false);
+        _engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations, deferPublish: true);
+
+        // Transit assignment and accessibility on the freshly assigned (still unpublished) car volumes
+        var carVolumes = _engine.PendingCarVolumes;
+        _transitSnapshot.UpdateTravelTimes(RoadGraph, carVolumes);
+        _transitEngine.AssignFlows(model.Taz, model.OdMatrix, _transitSnapshot, RoadGraph, Transit, deferPublish: true);
+        model.OdMatrix.ComputeTazAccessibilityScores(model.Taz, RoadGraph, -1f, _transitEngine.Skim, carVolumes);
+        _pendingTransitCoverage = Transit.GetTransitCoverage(Grid, RoadGraph, Parcels);
+    }
+
+    /// <summary>Main-thread publication of a computed model: O(edges + routes + stops + parcels).</summary>
+    private void PublishMacroModel(MacroModelBuffers model)
+    {
+        _engine.PublishPendingVolumes(RoadGraph);
+        _transitEngine.PublishPendingDemand(Transit, RoadGraph);
+        model.OdMatrix.PropagateAccessibilityToLandUse(model.Taz, RoadGraph);
+    }
+
     private void StartMacroJob()
     {
-        // Main-thread part of what TAZ rebuild would do: refresh bus travel times from the published volumes,
-        // so the worker only reads TransitRoute state.
-        Transit.UpdateAllRouteTravelTimes(RoadGraph);
-
         float hour = Clock.Hour;
         float ticketPrice = GetAverageTicketPrice();
         Clock.MarkMacroRecalculated();
@@ -282,9 +324,7 @@ public sealed class SimulationWorld : IDisposable
         _macroJob = Task.Run(() =>
         {
             long jobStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            model.Taz.RefreshOrRebuild(Grid, Parcels, RoadGraph, Transit, refreshRouteTimes: false);
-            model.OdMatrix.Recalculate(model.Taz, RoadGraph, hour, ticketPrice, _engine.Skim);
-            _engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations, deferPublish: true);
+            ComputeMacroModel(model, hour, ticketPrice);
             LastMacroComputeMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(jobStart).TotalMilliseconds;
         });
     }
@@ -297,12 +337,7 @@ public sealed class SimulationWorld : IDisposable
         job.GetAwaiter().GetResult(); // surface worker exceptions on the main thread
         long applyStart = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        var model = _back;
-        _engine.PublishPendingVolumes(RoadGraph);
-        model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
-        model.Taz.UpdateTransitConnectionMatrix(Transit, RoadGraph);
-        model.OdMatrix.UpdateAccessibilityScores(model.Taz, RoadGraph);
-        Transit.AssignPassengerDemandFromTaz(model.Taz, model.OdMatrix, RoadGraph);
+        PublishMacroModel(_back);
 
         (_front, _back) = (_back, _front);
         FinishMacroRecalculation();
@@ -318,7 +353,8 @@ public sealed class SimulationWorld : IDisposable
     private void FinishMacroRecalculation()
     {
         Cars.RefreshBusyEdges(RoadGraph);
-        Stats = CityStatsSnapshot.Capture(Grid, Parcels, OdMatrix, TrafficEngine, RoadGraph, Transit);
+        Stats = CityStatsSnapshot.Capture(Grid, Parcels, OdMatrix, TrafficEngine, RoadGraph, Transit, _pendingTransitCoverage);
+        _pendingTransitCoverage = null;
         MacroModelRecalculated?.Invoke();
     }
 

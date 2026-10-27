@@ -83,6 +83,8 @@ public class TrafficEngine
     /// True after a deferred assignment (<c>deferPublish: true</c>) until <see cref="PublishPendingVolumes"/>.
     /// </summary>
     public bool HasPendingVolumes { get; private set; }
+
+    internal float[] PendingCarVolumes => _carVolumes;
     private readonly List<int> _msaActiveOrigins = new(256);
     private readonly RoutingSnapshot _msaRouting = new RoutingSnapshot();
 

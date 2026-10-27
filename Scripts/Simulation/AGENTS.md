@@ -6,7 +6,7 @@
 ## Ключові підсистеми та еталони
 - **Граф та геометрія доріг:** `RoadGraph.cs`, `CurveSegment.cs` (квадратичні криві Безьє), `RoadSnappingEngine.cs`, `SpatialGridIndex.cs` ($O(1)$ просторовий хеш).
 - **Землекористування та LUTI:** `ParcelManager.cs`, `RoadsideParcel.cs` (придорожні ділянки, динамічна щільність `Low`/`Medium`/`High` від індексу доступності Гансена).
-- **Макромодель попиту і трафіку:** `TazManager.cs` (кластеризація у 320px макрозони, пересадки ГТ) → `OptimizedODMatrix.cs` (плоскі `float[]`, `Parallel.For`, Logit-спліт Car/Transit/Walk) → `TrafficEngine.cs` (MSA-рівновага, BPR-імпеданс, `ShortestPathTreeBuffer`).
+- **Макромодель попиту і трафіку:** `TazManager.cs` (кластеризація у 320px макрозони, охоплення зупинок `TazStopAccess`) → `Transit/` (`TransitNetworkSnapshot` → `TransitSkim` → `TransitEngine`: ГТ на рівні зупинок і ліній, будь-яка кількість пересадок, переповненість) → `OptimizedODMatrix.cs` (плоскі `float[]`, `Parallel.For`, Logit-спліт Car/Transit/Walk) → `TrafficEngine.cs` (MSA-рівновага, BPR-імпеданс, `ShortestPathTreeBuffer`).
 - **Мікроскопічний шар (DOD):** `CarTrafficManager.cs` (`CarAgent` struct pool, до 2000 авто), `PedestrianManager.cs` (`PedestrianAgent` struct pool, до 5000 пішоходів), `TransitManager.cs`, `TrafficLightManager.cs`.
 - **Економіка та сценарії:** `EconomyManager.cs`, генератори сценаріїв `*CityGenerator.cs` (еталон: `TutorialCityGenerator.cs`).
 
