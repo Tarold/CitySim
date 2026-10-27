@@ -72,6 +72,11 @@ public class MetropolisBudgetBenchmark
         TestContext.Progress.WriteLine(
             $"  steady: worker={_warmWorkerMs:F0}ms (budget {WorkerCycleBudgetMs}) | " +
             $"main-thread apply={_warmApplyMs:F1}ms (budget {MainThreadApplyBudgetMs}) | macro memory={_macroMemoryMb:F0}MB (budget {MacroMemoryBudgetMb})");
+
+        TestContext.Progress.WriteLine(
+            $"  step breakdown (last warm): od={_world.LastOdRecalculateMilliseconds:F0}ms | car={_world.LastCarAssignmentMilliseconds:F0}ms | transit={_world.LastTransitAssignmentMilliseconds:F0}ms");
+        TestContext.Progress.WriteLine(
+            $"  compact graph: compactNodes={_world.TrafficEngine.RoutingSnapshot.CompactNodeCount:N0} superedges={_world.TrafficEngine.RoutingSnapshot.AdjacencyCount:N0}");
     }
 
     [OneTimeTearDown]

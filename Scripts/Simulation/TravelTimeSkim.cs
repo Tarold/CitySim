@@ -12,9 +12,6 @@ namespace CitySim.Simulation;
 /// </summary>
 public sealed class TravelTimeSkim
 {
-    [ThreadStatic]
-    private static ShortestPathTreeBuffer _tlsTree;
-
     private int[] _nodeIds = Array.Empty<int>();
     private int[] _indexByNode = Array.Empty<int>();
     private float[] _times = Array.Empty<float>();
@@ -40,6 +37,44 @@ public sealed class TravelTimeSkim
         }
         var result = new int[nodes.Count];
         nodes.CopyTo(result);
+        return result;
+    }
+
+    /// <summary>
+    /// Collects all road nodes that must be preserved during compact graph contraction:
+    /// all TAZ primary access nodes and all public transit stop nodes.
+    /// </summary>
+    public static List<int> CollectProtectedNodes(TazManager tazManager)
+    {
+        var set = new HashSet<int>();
+        if (tazManager == null) return new List<int>();
+
+        var zones = tazManager.ActiveZones;
+        for (int i = 0; i < zones.Count; i++)
+        {
+            int nodeId = zones[i].PrimaryRoadNodeId;
+            if (nodeId >= 0) set.Add(nodeId);
+        }
+
+        var transit = tazManager.LastTransitManager;
+        if (transit != null)
+        {
+            foreach (var stop in transit.Stops.Values)
+            {
+                if (stop.NodeId >= 0) set.Add(stop.NodeId);
+            }
+            for (int r = 0; r < transit.Routes.Count; r++)
+            {
+                var route = transit.Routes[r];
+                foreach (int stopNode in route.StopNodeIds)
+                {
+                    if (stopNode >= 0) set.Add(stopNode);
+                }
+            }
+        }
+
+        var result = new List<int>(set.Count);
+        result.AddRange(set);
         return result;
     }
 
@@ -117,6 +152,17 @@ public sealed class TravelTimeSkim
         }
     }
 
+    /// <summary>Writes a skim row directly from dense distances using precomputed dense access indices.</summary>
+    public void WriteRowFromDense(int row, float[] denseDist, int[] accessDenseIndices)
+    {
+        int offset = row * NodeCount;
+        for (int col = 0; col < NodeCount; col++)
+        {
+            int dIdx = accessDenseIndices[col];
+            _times[offset + col] = dIdx >= 0 && dIdx < denseDist.Length ? denseDist[dIdx] : float.MaxValue;
+        }
+    }
+
     /// <summary>
     /// Fills the skim with one parallel search round on <paramref name="routing"/> (built from
     /// <paramref name="graph"/>), without keeping any tree.
@@ -124,11 +170,11 @@ public sealed class TravelTimeSkim
     public void Compute(RoadGraph graph, RoutingSnapshot routing, int[] accessNodes)
     {
         Reset(accessNodes, graph, routing.NodeCapacity);
+        routing.PrepareAccessNodes(accessNodes);
         Parallel.For(0, accessNodes.Length, row =>
         {
-            var tree = _tlsTree ??= new ShortestPathTreeBuffer();
-            routing.ComputeShortestPathTree(accessNodes[row], tree);
-            WriteRow(row, tree.Distances);
+            routing.ComputeShortestPathTree(accessNodes[row], null, populateAllDistances: false);
+            routing.WriteSkimRow(this, row);
         });
     }
 }

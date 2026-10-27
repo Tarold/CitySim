@@ -40,6 +40,7 @@ public sealed class SimulationWorld : IDisposable
     private readonly TransitNetworkSnapshot _transitSnapshot = new TransitNetworkSnapshot();
     private readonly TransitEngine _transitEngine = new TransitEngine { WarmStart = true };
 
+
     /// <summary>Transit engine (stop-and-line assignment with crowding and the shared transit skim).</summary>
     public TransitEngine TransitEngine => _transitEngine;
 
@@ -184,6 +185,15 @@ public sealed class SimulationWorld : IDisposable
     /// <summary>Wall-clock time of the last main-thread macro step: full pipeline in sync mode, apply in background mode (ms).</summary>
     public double LastMacroMainThreadMilliseconds { get; private set; }
 
+    /// <summary>Time spent in OD matrix distribution and mode split during the last macro calculation (ms).</summary>
+    public double LastOdRecalculateMilliseconds { get; private set; }
+
+    /// <summary>Time spent in car traffic assignment during the last macro calculation (ms).</summary>
+    public double LastCarAssignmentMilliseconds { get; private set; }
+
+    /// <summary>Time spent in transit assignment during the last macro calculation (ms).</summary>
+    public double LastTransitAssignmentMilliseconds { get; private set; }
+
     /// <summary>
     /// Recalculates the macro model: TAZ refresh/rebuild → OD + mode split → MSA traffic assignment →
     /// transit connections → accessibility → transit demand, then refreshes <see cref="Stats"/> and raises
@@ -295,13 +305,21 @@ public sealed class SimulationWorld : IDisposable
             _transitEngine.ComputeSkim(model.Taz, _transitSnapshot);
         }
 
+        long tStart = System.Diagnostics.Stopwatch.GetTimestamp();
         model.OdMatrix.Recalculate(model.Taz, RoadGraph, hour, ticketPrice, _engine.Skim, _transitEngine.Skim, propagateAccessibility: false);
+        LastOdRecalculateMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(tStart).TotalMilliseconds;
+
+        tStart = System.Diagnostics.Stopwatch.GetTimestamp();
         _engine.AssignFlowsFromTazMsa(model.Taz, model.OdMatrix, RoadGraph, MsaIterations, deferPublish: true);
+        LastCarAssignmentMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(tStart).TotalMilliseconds;
 
         // Transit assignment and accessibility on the freshly assigned (still unpublished) car volumes
         var carVolumes = _engine.PendingCarVolumes;
         _transitSnapshot.UpdateTravelTimes(RoadGraph, carVolumes);
+        tStart = System.Diagnostics.Stopwatch.GetTimestamp();
         _transitEngine.AssignFlows(model.Taz, model.OdMatrix, _transitSnapshot, RoadGraph, Transit, deferPublish: true);
+        LastTransitAssignmentMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(tStart).TotalMilliseconds;
+
         model.OdMatrix.ComputeTazAccessibilityScores(model.Taz, RoadGraph, -1f, _transitEngine.Skim, carVolumes);
         _pendingTransitCoverage = Transit.GetTransitCoverage(Grid, RoadGraph, Parcels);
     }

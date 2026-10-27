@@ -88,6 +88,9 @@ public class TrafficEngine
     private readonly List<int> _msaActiveOrigins = new(256);
     private readonly RoutingSnapshot _msaRouting = new RoutingSnapshot();
 
+    /// <summary>Routing snapshot used for shortest-path trees and traffic assignment.</summary>
+    public RoutingSnapshot RoutingSnapshot => _msaRouting;
+
     /// <summary>MSA iterations per macro cycle once a warm equilibrium exists (day-to-day adjustment).</summary>
     public const int WarmStartIterationsPerCycle = 1;
 
@@ -108,12 +111,6 @@ public class TrafficEngine
 
     /// <summary>Flow below which a node's accumulated demand is not propagated further.</summary>
     private const float MinPropagatedFlow = 1e-4f;
-
-    [ThreadStatic]
-    private static ShortestPathTreeBuffer _tlsTree;
-
-    [ThreadStatic]
-    private static float[] _tlsNodeFlow;
 
     private float[][] _chunkVolumes = Array.Empty<float[]>();
     private int _iterationCount;
@@ -200,12 +197,17 @@ public class TrafficEngine
         Array.Clear(_msaTransitBoardings, 0, k);
         Array.Clear(_msaTransitAlightings, 0, k);
 
+        var carTrips = matrix.CarTripsSpan;
+        var transitTrips = matrix.TransitTripsSpan;
+        var walkTrips = matrix.WalkTripsSpan;
+
         // 1. Aggregate transit access and egress pedestrian trips per TAZ
         for (int i = 0; i < k; i++)
         {
+            int rowOffset = i * k;
             for (int j = 0; j < k; j++)
             {
-                float t = matrix.GetTransitTrips(i, j);
+                float t = transitTrips[rowOffset + j];
                 if (t <= 0f) continue;
                 _msaTransitBoardings[i] += t;
                 _msaTransitAlightings[j] += t;
@@ -215,10 +217,11 @@ public class TrafficEngine
         // 2. Assign internal trips (i == j) and transit boarding/alighting pedestrian flows
         for (int i = 0; i < k; i++)
         {
+            int idx = i * k + i;
             AddLocalTazFlow(
                 tazList[i],
-                matrix.GetCarTrips(i, i),
-                matrix.GetWalkTrips(i, i) + _msaTransitBoardings[i] + _msaTransitAlightings[i],
+                carTrips[idx],
+                walkTrips[idx] + _msaTransitBoardings[i] + _msaTransitAlightings[i],
                 roadGraph,
                 edgeCount);
         }
@@ -232,26 +235,26 @@ public class TrafficEngine
             var origTaz = tazList[i];
             int u = origTaz.PrimaryRoadNodeId;
             if (u < 0) continue;
+            int rowOffset = i * k;
 
             for (int j = 0; j < k; j++)
             {
                 if (i == j) continue;
 
+                int pairIdx = rowOffset + j;
+                float carFlow = carTrips[pairIdx];
+                float walkFlow = walkTrips[pairIdx];
+                if (carFlow < 0.05f && walkFlow < 0.05f) continue;
+
                 var destTaz = tazList[j];
                 int v = destTaz.PrimaryRoadNodeId;
                 if (v < 0) continue;
 
-                float carFlow = matrix.GetCarTrips(i, j);
-                float walkFlow = matrix.GetWalkTrips(i, j);
-
                 // Preserve local flow when adjacent TAZs (i != j) share the same primary node (u == v)
                 if (u == v)
                 {
-                    if (carFlow >= 0.05f || walkFlow >= 0.05f)
-                    {
-                        AddLocalTazFlow(origTaz, carFlow * 0.5f, walkFlow * 0.5f, roadGraph, edgeCount);
-                        AddLocalTazFlow(destTaz, carFlow * 0.5f, walkFlow * 0.5f, roadGraph, edgeCount);
-                    }
+                    AddLocalTazFlow(origTaz, carFlow * 0.5f, walkFlow * 0.5f, roadGraph, edgeCount);
+                    AddLocalTazFlow(destTaz, carFlow * 0.5f, walkFlow * 0.5f, roadGraph, edgeCount);
                     continue;
                 }
 
@@ -292,13 +295,14 @@ public class TrafficEngine
         }
 
         int[] accessNodes = TravelTimeSkim.CollectAccessNodes(tazManager);
+        var protectedNodes = TravelTimeSkim.CollectProtectedNodes(tazManager);
 
         if (_msaActiveOrigins.Count == 0)
         {
             // Only local traffic: no equilibrium to iterate, but refresh the skim for the next cycle
             Array.Copy(_msaBaseInternalCarVolumes, _carVolumes, edgeCount);
             _iterationCount = 0;
-            _msaRouting.Rebuild(roadGraph, _carVolumes);
+            _msaRouting.Rebuild(roadGraph, _carVolumes, protectedNodes);
             Skim.Compute(roadGraph, _msaRouting, accessNodes);
             FinishAssignment(tazManager, matrix, roadGraph, edgeCount, deferPublish);
             return;
@@ -311,7 +315,7 @@ public class TrafficEngine
         {
             // Cold start routes the first all-or-nothing round on the published volumes (previous cycle)
             bool usePublishedVolumes = !warm && iter == 0;
-            _msaRouting.Rebuild(roadGraph, usePublishedVolumes ? null : _carVolumes);
+            _msaRouting.Rebuild(roadGraph, usePublishedVolumes ? null : _carVolumes, protectedNodes);
             RunAssignmentRound(roadGraph, accessNodes, edgeCount);
 
             _iterationCount++;
@@ -338,28 +342,22 @@ public class TrafficEngine
         int nodeCapacity = _msaRouting.NodeCapacity;
         int originCount = accessNodes.Length;
         Skim.Reset(accessNodes, roadGraph, nodeCapacity);
+        _msaRouting.PrepareAccessNodes(accessNodes);
 
         Parallel.For(0, AccumulationChunks, chunk =>
         {
             var volumes = _chunkVolumes[chunk];
-            var tree = _tlsTree ??= new ShortestPathTreeBuffer();
-            var nodeFlow = _tlsNodeFlow;
-            if (nodeFlow == null || nodeFlow.Length < nodeCapacity)
-            {
-                nodeFlow = _tlsNodeFlow = new float[Math.Max(nodeCapacity * 2, 256)];
-            }
-
             int start = (int)((long)originCount * chunk / AccumulationChunks);
             int end = (int)((long)originCount * (chunk + 1) / AccumulationChunks);
             for (int row = start; row < end; row++)
             {
                 int origin = accessNodes[row];
-                _msaRouting.ComputeShortestPathTree(origin, tree);
-                Skim.WriteRow(row, tree.Distances);
+                _msaRouting.ComputeShortestPathTree(origin, null, populateAllDistances: false);
+                _msaRouting.WriteSkimRow(Skim, row);
 
                 if (_msaDemandsByOrigin.TryGetValue(origin, out var destList) && destList.Count > 0)
                 {
-                    AccumulateOriginFlows(origin, destList, tree, nodeFlow, volumes, edgeCount, nodeCapacity);
+                    _msaRouting.AccumulateOriginFlows(origin, destList, volumes, edgeCount);
                 }
             }
         });
@@ -381,60 +379,6 @@ public class TrafficEngine
                 _msaAuxCarVolumes[e] = sum;
             }
         });
-    }
-
-    /// <summary>
-    /// Leaf-to-root accumulation of one origin's demand along its shortest-path tree. Uses and resets the
-    /// touched entries of <paramref name="nodeFlow"/> so the scratch array stays zero between origins.
-    /// </summary>
-    private static void AccumulateOriginFlows(
-        int origin,
-        List<(int DestNodeId, float Flow)> destList,
-        ShortestPathTreeBuffer tree,
-        float[] nodeFlow,
-        float[] volumes,
-        int edgeCount,
-        int nodeCapacity)
-    {
-        for (int d = 0; d < destList.Count; d++)
-        {
-            var (destNodeId, flow) = destList[d];
-            if (destNodeId >= 0 && destNodeId < nodeCapacity)
-            {
-                nodeFlow[destNodeId] += flow;
-            }
-        }
-
-        // Traverse nodes in reverse settle order (from farthest leaves back to the origin)
-        int[] visitedOrder = tree.VisitedNodesOrder;
-        int[] parentEdges = tree.ParentEdgeIds;
-        int[] parentNodes = tree.ParentNodeIds;
-
-        for (int vIdx = tree.VisitedCount - 1; vIdx >= 0; vIdx--)
-        {
-            int curr = visitedOrder[vIdx];
-            if (curr == origin) continue;
-
-            float accumulatedFlow = nodeFlow[curr];
-            nodeFlow[curr] = 0f;
-            if (accumulatedFlow <= MinPropagatedFlow) continue;
-
-            int edgeId = parentEdges[curr];
-            int parentNode = parentNodes[curr];
-            if (edgeId >= 0 && edgeId < edgeCount && parentNode >= 0 && parentNode < nodeCapacity)
-            {
-                volumes[edgeId] += accumulatedFlow;
-                nodeFlow[parentNode] += accumulatedFlow;
-            }
-        }
-
-        // Reset the root and unreachable destinations (not in the settle order)
-        nodeFlow[origin] = 0f;
-        for (int d = 0; d < destList.Count; d++)
-        {
-            int destNodeId = destList[d].DestNodeId;
-            if (destNodeId >= 0 && destNodeId < nodeCapacity) nodeFlow[destNodeId] = 0f;
-        }
     }
 
     /// <summary>Publishes or defers the volumes, stores the warm state and refreshes OD travel times.</summary>

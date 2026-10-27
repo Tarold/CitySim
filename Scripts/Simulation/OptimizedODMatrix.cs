@@ -53,6 +53,10 @@ public sealed class OptimizedODMatrix
     public float TotalTransitTrips { get; private set; }
     public float TotalWalkTrips { get; private set; }
 
+    public ReadOnlySpan<float> CarTripsSpan => _carTrips.AsSpan(0, _tazCount * _tazCount);
+    public ReadOnlySpan<float> TransitTripsSpan => _transitTrips.AsSpan(0, _tazCount * _tazCount);
+    public ReadOnlySpan<float> WalkTripsSpan => _walkTrips.AsSpan(0, _tazCount * _tazCount);
+
     public float GetCarTrips(int originTaz, int destTaz) =>
         (originTaz >= 0 && originTaz < _tazCount && destTaz >= 0 && destTaz < _tazCount)
             ? _carTrips[originTaz * _tazCount + destTaz] : 0f;
@@ -298,9 +302,11 @@ public sealed class OptimizedODMatrix
         // 1 & 2. Car travel times from the assignment skim (or a fresh search round into targetSkim)
         if (skim == null || !skim.Covers(tazManager, roadGraph))
         {
-            _routing.Rebuild(roadGraph);
+            var accessNodes = TravelTimeSkim.CollectAccessNodes(tazManager);
+            var protectedNodes = TravelTimeSkim.CollectProtectedNodes(tazManager);
+            _routing.Rebuild(roadGraph, null, protectedNodes);
             var targetSkim = skim ?? _ownSkim;
-            targetSkim.Compute(roadGraph, _routing, TravelTimeSkim.CollectAccessNodes(tazManager));
+            targetSkim.Compute(roadGraph, _routing, accessNodes);
             skim = targetSkim;
         }
         ApplySkim(tazManager, skim);
